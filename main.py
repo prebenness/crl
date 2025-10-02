@@ -4,75 +4,14 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import random, value_and_grad
-from flax.training import train_state
-import optax
+from jax import random
 from tqdm import tqdm
 
+from src.models.mlps import SimpleMLP
+from src.jitted.train_eval import train_step, create_train_state, make_eval_step
 from src.utils.cfg import CFG
 from src.utils.data.load_data import make_dataloaders, benchmark_dataloader, to_jax_batch
-from src.models.mlps import SimpleMLP
-
-
-# =========================
-# Train state (Flax+Optax)
-# =========================
-def create_train_state(rng, model, learning_rate, weight_decay, batch_size, input_dim):
-    dummy = jnp.ones((batch_size, input_dim), jnp.float32)
-    variables = model.init(rng, dummy)
-    params = variables["params"]
-    tx = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
-    return train_state.TrainState(
-        step=0,
-        apply_fn=model.apply,
-        params=params,
-        tx=tx,
-        opt_state=tx.init(params),
-    )
-
-
-# =========================
-# Loss & metrics (pure fns)
-# =========================
-def cross_entropy_loss(logits, labels):
-    onehot = jax.nn.one_hot(labels, num_classes=CFG.num_classes)
-    log_probs = jax.nn.log_softmax(logits)
-    return -jnp.mean(jnp.sum(onehot * log_probs, axis=-1))
-
-
-def accuracy(logits, labels):
-    preds = jnp.argmax(logits, axis=-1)
-    return jnp.mean((preds == labels).astype(jnp.float32))
-
-
-# =========================
-# JIT-compiled steps
-# =========================
-@jax.jit
-def train_step(state, batch_x, batch_y):
-    def loss_fn(params):
-        logits = state.apply_fn({"params": params}, batch_x, train=True)
-        loss = cross_entropy_loss(logits, batch_y)
-        return loss, logits
-
-    (loss, logits), grads = value_and_grad(loss_fn, has_aux=True)(state.params)
-    updates, new_opt_state = state.tx.update(grads, state.opt_state, params=state.params)
-    new_params = optax.apply_updates(state.params, updates)
-    new_state = state.replace(step=state.step + 1, params=new_params, opt_state=new_opt_state)
-    acc = accuracy(logits, batch_y)
-    return new_state, loss, acc
-
-
-def make_eval_step(apply_fn):
-    """
-    Factory to avoid passing Python callables into jitted fns.
-    Captures apply_fn in a closure; the jitted function only takes arrays.
-    """
-    @jax.jit
-    def eval_step(params, batch_x, batch_y):
-        logits = apply_fn({"params": params}, batch_x, train=False)
-        return accuracy(logits, batch_y)
-    return eval_step
+from src.utils.utils import jax_mean
 
 
 # =========================
@@ -88,7 +27,6 @@ def train_and_eval():
         batch_size=CFG.batch_size,
         num_workers=CFG.num_workers,
         drop_last=True,
-        seed=CFG.seed,
         dataset=CFG.dataset,
     )
 
@@ -127,16 +65,13 @@ def train_and_eval():
         for images_t, labels_t in test_loader:
             xb, yb = to_jax_batch(images_t, labels_t)
             eval_accs.append(eval_step(state.params, xb, yb))
-        
-        # Compute mean accuracy more efficiently
-        # test_acc = float(jnp.mean(jnp.array(eval_accs)))
 
         dt = time.time() - t0
         print(
             f"Epoch {epoch:02d} | "
-            f"train loss {np.mean(train_losses):.4f} | "
-            f"train acc {np.mean(train_accs):.4f} | "
-            f"test acc  {np.mean(eval_accs):.4f} | "
+            f"train loss {jax_mean(train_losses):.4f} | "
+            f"train acc {jax_mean(train_accs):.4f} | "
+            f"test acc  {jax_mean(eval_accs):.4f} | "
             f"time {dt:.2f}s"
         )
 

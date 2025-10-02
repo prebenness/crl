@@ -27,6 +27,7 @@ class Config:
     # Data and dataloaders
     num_workers: int = 4  # Increase for better parallel data loading
     dataset: DatasetEnum = DatasetEnum.MNIST
+    data_root: str = "./input_data"
 
     # Model
     hidden_sizes: tuple[int, ...] = (512, 256)
