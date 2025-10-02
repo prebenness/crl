@@ -1,6 +1,6 @@
 from enum import Enum
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Mapping
 
 
 class DatasetEnum(Enum):
@@ -53,5 +53,32 @@ class Config:
     def num_classes(self) -> int:
         """Number of classes for the selected dataset."""
         return DATASET_SPECS[self.dataset]["num_classes"]
+
+
+def update_cfg(overrides: Mapping[str, str] | None) -> None:
+    """Mutate the global CFG with key=value strings from .env."""
+    if not overrides:
+        return
+
+    def _cast(cur, val: str):
+        if isinstance(cur, bool):
+            return val.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(cur, int):
+            return int(val)
+        if isinstance(cur, float):
+            return float(val)
+        if isinstance(cur, tuple):
+            # assume comma-separated ints
+            return tuple(int(x) for x in val.split(",") if x.strip() != "")
+        if isinstance(cur, DatasetEnum):
+            return DatasetEnum(val.strip().lower())
+
+        raise TypeError(f'Unsupported type: {type(cur)}')
+
+    for k, v in overrides.items():
+        name = k.lower()
+        if hasattr(CFG, name):
+            cur = getattr(CFG, name)
+            setattr(CFG, name, _cast(cur, v))
 
 CFG = Config()

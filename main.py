@@ -1,7 +1,9 @@
 # main.py
 import time
+import argparse
+from pathlib import Path
+from dotenv import dotenv_values
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random
@@ -9,10 +11,25 @@ from tqdm import tqdm
 
 from src.models.mlps import SimpleMLP
 from src.jitted.train_eval import train_step, create_train_state, make_eval_step
-from src.utils.cfg import CFG
+from src.utils.cfg import CFG, update_cfg
 from src.utils.data.load_data import make_dataloaders, benchmark_dataloader, to_jax_batch
 from src.utils.utils import jax_mean
 
+
+def main():
+    # Parse args
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cfg", type=str, default="./cfg.env",
+                        help="Path to .env config file")
+    args = parser.parse_args()
+
+    # main reads the .env and passes parsed values to CFG
+    env_path = Path(args.cfg)
+    env_cfg = dotenv_values(env_path) if env_path.exists() else None
+    update_cfg(overrides=env_cfg)  # <-- mutates the global CFG in-place
+
+    # Train
+    _ = train_and_eval()
 
 # =========================
 # Training loop
@@ -39,7 +56,7 @@ def train_and_eval():
 
     # Benchmark dataloader performance
     print("Benchmarking data pipeline...")
-    benchmark_dataloader(train_loader, num_batches=5)
+    _ = benchmark_dataloader(train_loader, num_batches=5)
     
     # Warmup compile to exclude JIT time from epoch stats
     print("Warming up JAX compilation...")
@@ -49,6 +66,7 @@ def train_and_eval():
 
     eval_step = make_eval_step(state.apply_fn)
 
+    print("Starting training...")
     for epoch in range(1, CFG.epochs + 1):
         t0 = time.time()
         train_losses, train_accs = [], []
@@ -79,4 +97,4 @@ def train_and_eval():
 
 
 if __name__ == "__main__":
-    _ = train_and_eval()
+    main()
