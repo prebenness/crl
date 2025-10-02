@@ -1,83 +1,24 @@
 # main.py
 import time
-from dataclasses import dataclass
-from functools import partial
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random, value_and_grad
-from flax import linen as nn
 from flax.training import train_state
 import optax
 from tqdm import tqdm
 
-import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-
-from src.utils.cfg import CFG, Config
-
-
-# =========================
-# Data pipeline (PyTorch)
-# =========================
-def make_dataloaders(batch_size=128, num_workers=2, drop_last=True, seed=0):
-    """
-    Returns (train_loader, test_loader). Uses pinned memory and workers.
-    """
-    g = torch.Generator()
-    g.manual_seed(seed)
-
-    tfm = transforms.ToTensor()  # -> float32 in [0,1], shape [1,28,28]
-    train_ds = datasets.MNIST(root="./data", train=True, download=True, transform=tfm)
-    test_ds  = datasets.MNIST(root="./data", train=False, download=True, transform=tfm)
-
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0), generator=g, drop_last=drop_last
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=(num_workers > 0), drop_last=drop_last
-    )
-    return train_loader, test_loader
-
-
-def to_jax_batch(images_t, labels_t):
-    """
-    Convert CPU torch tensors to JAX device arrays with static shapes.
-    images_t: [B,1,28,28] float32 in [0,1]; labels_t: [B] int64
-    """
-    # DataLoader yields CPU tensors (pinned). .numpy() is zero-copy view on CPU.
-    x_np = images_t.numpy().reshape(images_t.shape[0], -1).astype(np.float32)  # [B,784]
-    y_np = labels_t.numpy().astype(np.int32)
-    return jnp.asarray(x_np), jnp.asarray(y_np)
-
-
-# =========================
-# Model (Flax)
-# =========================
-class MLP(nn.Module):
-    hidden_sizes: tuple[int, ...] = (512, 256)
-
-    @nn.compact
-    def __call__(self, x, train: bool = True):
-        # x: [B, 784]
-        for h in self.hidden_sizes:
-            x = nn.Dense(h)(x)
-            x = nn.gelu(x)
-        x = nn.Dense(10)(x)  # logits
-        return x
+from src.utils.cfg import CFG
+from src.utils.data.load_data import make_dataloaders, benchmark_dataloader, to_jax_batch
+from src.models.mlps import SimpleMLP
 
 
 # =========================
 # Train state (Flax+Optax)
 # =========================
-def create_train_state(rng, model, learning_rate, weight_decay, batch_size):
-    dummy = jnp.ones((batch_size, 784), jnp.float32)
+def create_train_state(rng, model, learning_rate, weight_decay, batch_size, input_dim):
+    dummy = jnp.ones((batch_size, input_dim), jnp.float32)
     variables = model.init(rng, dummy)
     params = variables["params"]
     tx = optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
@@ -94,7 +35,7 @@ def create_train_state(rng, model, learning_rate, weight_decay, batch_size):
 # Loss & metrics (pure fns)
 # =========================
 def cross_entropy_loss(logits, labels):
-    onehot = jax.nn.one_hot(labels, num_classes=10)
+    onehot = jax.nn.one_hot(labels, num_classes=CFG.num_classes)
     log_probs = jax.nn.log_softmax(logits)
     return -jnp.mean(jnp.sum(onehot * log_probs, axis=-1))
 
@@ -139,18 +80,31 @@ def make_eval_step(apply_fn):
 # =========================
 def train_and_eval():
     print("JAX devices:", jax.devices())
+    
+    # Enable JAX memory optimization
+    jax.config.update('jax_platform_name', 'gpu' if jax.devices()[0].platform == 'gpu' else 'cpu')
+    
     train_loader, test_loader = make_dataloaders(
         batch_size=CFG.batch_size,
         num_workers=CFG.num_workers,
         drop_last=True,
         seed=CFG.seed,
+        dataset=CFG.dataset,
     )
 
+    model = SimpleMLP(hidden_sizes=CFG.hidden_sizes, num_classes=CFG.num_classes)
+    dummy_input = jnp.ones((CFG.batch_size, CFG.input_dim))
+    print(model.tabulate(jax.random.PRNGKey(0), dummy_input, compute_flops=True))
+    
     rng = random.PRNGKey(CFG.seed)
-    model = MLP(hidden_sizes=CFG.hidden_sizes)
-    state = create_train_state(rng, model, CFG.lr, CFG.wd, CFG.batch_size)
+    state = create_train_state(rng, model, CFG.lr, CFG.wd, CFG.batch_size, CFG.input_dim)
 
+    # Benchmark dataloader performance
+    print("Benchmarking data pipeline...")
+    benchmark_dataloader(train_loader, num_batches=5)
+    
     # Warmup compile to exclude JIT time from epoch stats
+    print("Warming up JAX compilation...")
     images_t, labels_t = next(iter(train_loader))
     xb, yb = to_jax_batch(images_t, labels_t)
     state, _, _ = train_step(state, xb, yb)
@@ -168,18 +122,21 @@ def train_and_eval():
             train_losses.append(float(loss))
             train_accs.append(float(acc))
 
-        # ---- Eval
-        accs = []
+        # ---- Eval (vectorized for better performance)
+        eval_accs = []
         for images_t, labels_t in test_loader:
             xb, yb = to_jax_batch(images_t, labels_t)
-            accs.append(float(eval_step(state.params, xb, yb)))
+            eval_accs.append(eval_step(state.params, xb, yb))
+        
+        # Compute mean accuracy more efficiently
+        # test_acc = float(jnp.mean(jnp.array(eval_accs)))
 
         dt = time.time() - t0
         print(
             f"Epoch {epoch:02d} | "
             f"train loss {np.mean(train_losses):.4f} | "
             f"train acc {np.mean(train_accs):.4f} | "
-            f"test acc  {np.mean(accs):.4f} | "
+            f"test acc  {np.mean(eval_accs):.4f} | "
             f"time {dt:.2f}s"
         )
 
