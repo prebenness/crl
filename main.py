@@ -2,18 +2,22 @@
 import time
 import argparse
 from pathlib import Path
-from dotenv import dotenv_values
+import multiprocessing as mp
 
 import jax
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from jax import random
 from tqdm import tqdm
+from dotenv import dotenv_values
 
 from src.models.mlps import SimpleMLP
-from src.jitted.train_eval import train_step, create_train_state, make_eval_step
+from src.jitted.train_eval import train_step, create_train_state
 from src.utils.cfg import CFG, update_cfg
 from src.utils.data.load_data import make_dataloaders, benchmark_dataloader, to_jax_batch
+from src.utils.train_eval import evaluate_model
 from src.utils.utils import jax_mean
+
 
 
 def main():
@@ -62,34 +66,31 @@ def train_and_eval():
     print("Warming up JAX compilation...")
     images_t, labels_t = next(iter(train_loader))
     xb, yb = to_jax_batch(images_t, labels_t)
-    state, _, _ = train_step(state, xb, yb)
-
-    eval_step = make_eval_step(state.apply_fn)
+    state, _ = train_step(state, xb, yb)
 
     print("Starting training...")
     for epoch in range(1, CFG.epochs + 1):
         t0 = time.time()
-        train_losses, train_accs = [], []
+        train_losses = []
 
         # ---- Train
         for images_t, labels_t in tqdm(train_loader, desc=f"Epoch {epoch:02d}", leave=False):
             xb, yb = to_jax_batch(images_t, labels_t)
-            state, loss, acc = train_step(state, xb, yb)
+
+            state, loss = train_step(state, xb, yb)
             train_losses.append(float(loss))
-            train_accs.append(float(acc))
 
         # ---- Eval (vectorized for better performance)
-        eval_accs = []
-        for images_t, labels_t in test_loader:
-            xb, yb = to_jax_batch(images_t, labels_t)
-            eval_accs.append(eval_step(state.params, xb, yb))
+        m_test = evaluate_model(state, test_loader, tqdm_str='test')
+        I_ry, H_y = m_test['I_ry'], m_test['H_y']
+        I_norm = I_ry / H_y
 
         dt = time.time() - t0
         print(
             f"Epoch {epoch:02d} | "
             f"train loss {jax_mean(train_losses):.4f} | "
-            f"train acc {jax_mean(train_accs):.4f} | "
-            f"test acc  {jax_mean(eval_accs):.4f} | "
+            f"test acc  {jax_mean(m_test['acc']):.4f} | "
+            f"test I(R;Y)/H(Y) ≈ {I_norm:.4f} H(Y)={H_y:.3f} CE={m_test['loss']:.3f} "
             f"time {dt:.2f}s"
         )
 
@@ -97,4 +98,6 @@ def train_and_eval():
 
 
 if __name__ == "__main__":
+    if mp.get_start_method(allow_none=True) != "spawn":
+        mp.set_start_method("spawn", force=True)
     main()

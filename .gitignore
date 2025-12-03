@@ -2,3 +2,5 @@ venv/
 input_data/
 __pycache__/
 cfg.env
+.vscode
+data/

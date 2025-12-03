@@ -17,24 +17,12 @@ def train_step(state, batch_x, batch_y):
         loss = cross_entropy_loss(logits, batch_y)
         return loss, logits
 
-    (loss, logits), grads = value_and_grad(loss_fn, has_aux=True)(state.params)
+    (loss, _), grads = value_and_grad(loss_fn, has_aux=True)(state.params)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params=state.params)
     new_params = optax.apply_updates(state.params, updates)
     new_state = state.replace(step=state.step + 1, params=new_params, opt_state=new_opt_state)
-    acc = accuracy(logits, batch_y)
-    return new_state, loss, acc
+    return new_state, loss
 
-
-def make_eval_step(apply_fn):
-    """
-    Factory to avoid passing Python callables into jitted fns.
-    Captures apply_fn in a closure; the jitted function only takes arrays.
-    """
-    @jax.jit
-    def eval_step(params, batch_x, batch_y):
-        logits = apply_fn({"params": params}, batch_x, train=False)
-        return accuracy(logits, batch_y)
-    return eval_step
 
 # =========================
 # Train state (Flax+Optax)
