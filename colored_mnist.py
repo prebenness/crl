@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 import jax.lax as lax
+from jax.scipy.special import logsumexp
+
 
 import flax.linen as nn
 from flax.training import train_state
@@ -36,10 +38,21 @@ import matplotlib.pyplot as plt
 # Generate a unique ID for this entire execution (The "Experiment")
 # We use timestamp so all models in this script share it.
 WANDB_ENTITY='prebenness-crl'
-WANDB_PROJECT='colored-mnist-ib'
-LAMBDA_RANGE = (0, 2, 20)      # (a, b, N) -> N lambda values, evenly logspaced in 10**a to 10**b
+WANDB_PROJECT='colored-mnist-vib'
+LAMBDA_RANGE = (0, 1, 10)         # (a, b, N) -> N lambda values, evenly logspaced in 10**a to 10**b or linspaced
+LOG_SWEEP = False                   # Logspaced or linspaced sweep
 timestamp = time.strftime("%Y-%m-%d-T%H-%M-%S", time.gmtime())
-experiment_group_id = f"sweep-lambda-{LAMBDA_RANGE[0]}-{LAMBDA_RANGE[1]}-{LAMBDA_RANGE[2]}-{timestamp}"
+experiment_group_id = f"{timestamp}-sweep-lambda-{LAMBDA_RANGE[0]}-{LAMBDA_RANGE[1]}-{LAMBDA_RANGE[2]}"
+
+TRAIN_MC_SAMPLES = 2
+EVAL_MC_SAMPLES = 8
+
+# ControlVAE controller gains (tune these; defaults chosen for this classifier/KL scale)
+BETA_MIN = 0.0
+BETA_MAX = 1e3
+CTRL_KP = 10.0
+CTRL_KI = 1e-2
+
 
 @dataclass
 class TrainConfig:
@@ -50,7 +63,8 @@ class TrainConfig:
     epochs: int = 50
     batch_size: int = 128
     seed: int = 0
-    lambdas = jnp.logspace(*LAMBDA_RANGE)
+    lambdas = jnp.linspace(*LAMBDA_RANGE) if not LOG_SWEEP else jnp.logspace(*LAMBDA_RANGE)
+
 
 print("JAX devices:", jax.devices())
 jax.config.update("jax_default_matmul_precision", "high")
@@ -348,13 +362,86 @@ class IBClassifier(nn.Module):
         # --- Classifier ---
         logits = nn.Dense(self.num_classes)(z)
         
-        # Return z for logging
-        return logits, z
+
+        # Aux dict: keeps z for loss/logging
+        aux = {
+            "z": z,
+        }
+
+        return logits, aux
+
+
+class VIBClassifier(nn.Module):
+    bottleneck_width: int
+    num_classes: int
+
+    # Optional numeric-stability knobs (defaults are sane)
+    min_logvar: float = -10.0
+    max_logvar: float =  10.0
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        # --- Encoder (same as IBClassifier for apples-to-apples) ---
+        x = nn.Conv(features=32, kernel_size=(3, 3))(x)
+        x = nn.relu(x)
+        x = nn.avg_pool(x, (2, 2), (2, 2))
+
+        x = nn.Conv(features=64, kernel_size=(3, 3))(x)
+        x = nn.relu(x)
+        x = nn.avg_pool(x, (2, 2), (2, 2))
+
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(128)(x)
+        x = nn.relu(x)
+
+        # --- Variational bottleneck: q(z|x) = N(mu, diag(var)) ---
+        mu = nn.Dense(self.bottleneck_width, name="z_mu")(x)
+        logvar = nn.Dense(self.bottleneck_width, name="z_logvar")(x)
+        logvar = jnp.clip(logvar, self.min_logvar, self.max_logvar)
+
+        std = jnp.exp(0.5 * logvar)
+
+        if train:
+            eps = jrandom.normal(self.make_rng("noise"), mu.shape)
+            z = mu + std * eps
+        else:
+            # Deterministic at eval for lower-variance metrics
+            z = mu
+
+        # --- Classifier head ---
+        logits = nn.Dense(self.num_classes)(z)
+
+        # --- KL(q(z|x) || N(0, I)) ---
+        # Per-example KL: 0.5 * sum(mu^2 + exp(logvar) - 1 - logvar)
+        kl_per_example = 0.5 * jnp.sum(
+            (mu * mu) + jnp.exp(logvar) - 1.0 - logvar,
+            axis=-1
+        )
+        kl = jnp.mean(kl_per_example)
+
+        # Aux dict: keeps z plus VIB stats for loss/logging
+        aux = {
+            "z": z,
+            "mu": mu,
+            "logvar": logvar,
+            "kl": kl,
+            "kl_per_example": kl_per_example,
+        }
+
+        return logits, aux
+
 
 
 # ============================================================
 # 5) Training / eval (epoch-scanned, donated state)
 # ============================================================
+
+
+# ---- ControlVAE controller fixed bounds (not swept) ----
+
+class ControlTrainState(train_state.TrainState):
+    beta: jnp.ndarray
+    int_err: jnp.ndarray
 
 
 def create_state(rng, model, input_shape, cfg):
@@ -364,63 +451,129 @@ def create_state(rng, model, input_shape, cfg):
         train=True,
     )["params"]
     tx = optax.adamw(cfg.lr, cfg.weight_decay)
-    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+    opt_state = tx.init(params)
+
+    beta0 = jnp.array(BETA_MIN, dtype=jnp.float32)
+    int0  = jnp.array(0.0, dtype=jnp.float32)
+
+    return ControlTrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
+        beta=beta0,
+        int_err=int0,
+    )
 
 
 @jax.jit
-def train_step(state, batch, rng):
+def train_step(state, batch, rng, lamb):
     x, y = batch
+    lamb = jnp.asarray(lamb, jnp.float32)  # capacity target C
+
+    beta_min = jnp.array(BETA_MIN, dtype=jnp.float32)
+    beta_max = jnp.array(BETA_MAX, dtype=jnp.float32)
 
     def loss_fn(params):
-        # 1. Forward pass returns logits AND z
-        logits, z = state.apply_fn(
-            {"params": params},
-            x,
-            train=True,
-            rngs={"noise": rng},  # <- key for self.make_rng("noise")
-        )
-        
-        # 2. Main Task Loss
-        ce_loss = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
-        
-        # Total Loss
-        total_loss = ce_loss
-        
-        return total_loss, (logits, ce_loss)
+        # ---- Training MC: average CE over K samples of z ~ q(z|x) ----
+        keys = jrandom.split(rng, TRAIN_MC_SAMPLES)
 
-    # Gradient update
-    (loss, (logits, ce_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        def one_sample(k):
+            logits, aux = state.apply_fn(
+                {"params": params},
+                x,
+                train=True,
+                rngs={"noise": k},
+            )
+            kl_raw = aux.get("kl", 0.0)
+            return logits, kl_raw
+
+        logits_K, kl_K = jax.vmap(one_sample)(keys)  # logits_K: [K,B,C], kl_K: [K]
+
+        # Average cross-entropy across samples (same objective as K=1, lower variance)
+        def ce_from_logits(lgts):
+            return optax.softmax_cross_entropy_with_integer_labels(lgts, y).mean()
+
+        ce_loss = jnp.mean(jax.vmap(ce_from_logits)(logits_K))
+
+        # KL doesn't depend on eps (same across samples), so take first.
+        kl = (kl_K[0]).astype(jnp.float32)
+
+        # Use mean logits for reporting acc (cheap, stable)
+        logits = jnp.mean(logits_K, axis=0)
+
+        total_loss = ce_loss + state.beta * kl
+        return total_loss, (logits, ce_loss, kl)
+
+
+    (loss, (logits, ce_loss, kl)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    
+
+    # ---- ControlVAE-style PI control to track KL -> lamb ----
+    # error e = C - KL  (positive => KL too low => decrease beta to allow KL to rise)
+    e = lamb - lax.stop_gradient(kl)
+
+    int_candidate = state.int_err + e
+
+    # Nonlinear bounded "P" term + integral term (ControlVAE-style)
+    beta_unclipped = beta_min + (CTRL_KP / (1.0 + jnp.exp(e))) - (CTRL_KI * int_candidate)
+    beta_new = jnp.clip(beta_unclipped, beta_min, beta_max)
+
+    # Simple anti-windup: only integrate if not saturating
+    in_bounds = (beta_unclipped >= beta_min) & (beta_unclipped <= beta_max)
+    int_new = jnp.where(in_bounds, int_candidate, state.int_err)
+
+    state = state.replace(beta=beta_new, int_err=int_new)
+
     acc = (jnp.argmax(logits, -1) == y).mean()
-    
-    # Return metrics for logging
-    metrics = {"loss": loss, "ce": ce_loss, "acc": acc}
+    metrics = {
+        "loss": loss,
+        "ce": ce_loss,
+        "kl": kl,
+        "beta": beta_new,
+        "acc": acc,
+    }
     return state, metrics
 
 
 @jax.jit
-def eval_step(state, batch):
-    x, y = batch
-    # Model now returns (logits, z), we only need logits for eval
-    logits, _ = state.apply_fn(
-        {"params": state.params},
-        x,
-        train=False
-    )
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
-    acc = (jnp.argmax(logits, -1) == y).mean()
-    return loss, acc
+def eval_step(state, batch, rng):
+    x, y = batch  # y: [B]
+    keys = jrandom.split(rng, EVAL_MC_SAMPLES)
+
+    def one_sample(k):
+        # IMPORTANT: use train=True so VIB samples z via rngs["noise"]
+        logits, _ = state.apply_fn(
+            {"params": state.params},
+            x,
+            train=True,
+            rngs={"noise": k},
+        )
+        return logits  # [B, C]
+
+    logits_K = jax.vmap(one_sample)(keys)  # [K, B, C]
+
+    # log p(y|x) = log mean_k softmax(logits_k)
+    log_probs_K = jax.nn.log_softmax(logits_K, axis=-1)          # [K, B, C]
+    log_probs = logsumexp(log_probs_K, axis=0) - jnp.log(EVAL_MC_SAMPLES)  # [B, C]
+
+    # NLL / CE under the mixture predictive distribution
+    nll = -jnp.take_along_axis(log_probs, y[:, None], axis=-1).mean()
+
+    probs = jnp.exp(log_probs)
+    acc = (jnp.argmax(probs, axis=-1) == y).mean()
+    return nll, acc
 
 
-def train_epoch(state, xb, yb, rng):
+def train_epoch(state, xb, yb, rng, lamb):
     n_batches = xb.shape[0]
     rngs = jrandom.split(rng, n_batches)   # [n_batches, 2]
 
     def body(carry, inputs):
         st = carry
         x, y, r = inputs                   # unpack one batch + one key
-        st, metrics = train_step(st, (x, y), r)
+        st, metrics = train_step(st, (x, y), r, lamb)
         return st, metrics
 
     state, metrics_history = lax.scan(
@@ -436,19 +589,22 @@ def train_epoch(state, xb, yb, rng):
 train_epoch = jax.jit(train_epoch, donate_argnums=(0,))
 
 
-def eval_epoch(state, xb, yb):
+def eval_epoch(state, xb, yb, rng):
+    n_batches = xb.shape[0]
+    rngs = jrandom.split(rng, n_batches)
+
     def body(carry, batch):
-        x, y = batch
-        loss, acc = eval_step(state, (x, y))
+        x, y, r = batch
+        loss, acc = eval_step(state, (x, y), r)
         return carry, (loss, acc)
 
-    _, (losses, accs) = lax.scan(body, None, (xb, yb))
+    _, (losses, accs) = lax.scan(body, None, (xb, yb, rngs))
     return losses.mean(), accs.mean()
 
 eval_epoch = jax.jit(eval_epoch)
 
 
-def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, wandb_run):
+def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run):
     rng = jrandom.PRNGKey(cfg.seed)
     input_shape = (cfg.batch_size,) + x_train.shape[1:]
     rng, rng_init = jrandom.split(rng)
@@ -468,17 +624,24 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, wandb_run):
         xt, yt = make_epoch_batches(x_test,  y_test,  cfg.batch_size, seed_te)
 
 
-        state, metrics = train_epoch(state, xb, yb, rng_epoch)
+        state, metrics = train_epoch(state, xb, yb, rng_epoch, lamb)
 
-        te_loss, te_acc = eval_epoch(state, xt, yt)
+        rng, rng_eval = jrandom.split(rng)
+        te_loss, te_acc = eval_epoch(state, xt, yt, rng_eval)
+
+        # TODO: fix this lambda meaning. Lammbda 0 means that reg is off, not that capacity is 0
 
         # --- WANDB: Log Metrics ---
         results = {
             "epoch": ep + 1,
             "train_loss": float(metrics["loss"]),
             "train_acc": float(metrics["acc"]),
+            "train_kl": float(metrics["kl"]),   # KL in nats
+            "train_beta": float(metrics["beta"]),   # controller output
             "test_loss": float(te_loss),
             "test_acc": float(te_acc),
+            "cap": float(lamb),
+            "kl_err": float(lamb - metrics["kl"]),
         }
         wandb_run.log(results)
 
@@ -486,6 +649,7 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, wandb_run):
             f"  Epoch {ep+1}/{cfg.epochs}"
             f"  Acc. Train: {float(metrics['acc']):.4f} Test: {float(te_acc):.4f}"
             f"  Loss Train: {float(metrics['loss']):.4f} Test: {float(te_loss):.4f}"
+            f"  KL: {float(metrics['kl']):.4e}  Beta: {float(metrics['beta']):.3e}"
             f"      Time: {time.time()-t0:.2f}s"
         )
 
@@ -501,62 +665,80 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, wandb_run):
 def wandb_summary_plot(all_data, wandb_run):
     """
     Log a summary chart: accuracy vs lambda for
-    ColoredMNIST / MNIST, train / test.
+    ColoredMNIST sweep (train/test) + horizontal baseline refs.
 
     all_data: list of dicts with keys including
               ["dataset", "lambda", "train_acc", "test_acc", ...]
     """
-
     if not all_data:
         return
 
     df = pd.DataFrame(all_data)
+    df["lambda"] = df["lambda"].map(float)
 
-    df["lambda"] = df["lambda"].map(float)      # Convert from logspace array to floats
-
-    # Map to nicer names
-    ds_map = {
-        "colored_mnist": "ColoredMNIST",
-        "mnist": "MNIST",
-    }
-    df["ds_name"] = df["dataset"].map(ds_map)
-
-    # Sort lambdas once; we assume each dataset/split has one point per lambda
+    # X axis: use all lambdas we observed (includes 0.0 baseline)
     lambdas = sorted(df["lambda"].unique())
-
-    # Define the four curves we want
-    curves = [
-        ("ColoredMNIST – train", "colored_mnist", "train_acc"),
-        ("ColoredMNIST – test",  "colored_mnist", "test_acc"),
-        ("MNIST – train",        "mnist",         "train_acc"),
-        ("MNIST – test",         "mnist",         "test_acc"),
-    ]
-
     xs = lambdas
+
+    def _baseline_value(ds_code: str, acc_key: str):
+        # Baseline runs are identified by lambda == 0.0 in this script
+        row = df[(df["dataset"] == ds_code) & (np.isclose(df["lambda"], 0.0))]
+        if len(row) == 0:
+            return np.nan
+        return float(row[acc_key].iloc[0])
+
+    def _sweep_series(ds_code: str, acc_key: str):
+        # For the sweep curve, we intentionally skip the baseline point at lambda==0
+        series = []
+        for lmb in xs:
+            if np.isclose(lmb, 0.0):
+                series.append(np.nan)  # gap at baseline
+                continue
+            row = df[(df["dataset"] == ds_code) & (np.isclose(df["lambda"], lmb))]
+            if len(row) == 0:
+                series.append(np.nan)
+            else:
+                series.append(float(row[acc_key].iloc[0]))
+        return series
+
+    # ---- Build curves ----
     ys = []
     keys = []
 
-    for label, ds_code, acc_key in curves:
-        keys.append(label)
-        series = []
-        for lamb in lambdas:
-            row = df[(df["dataset"] == ds_code) & (df["lambda"] == lamb)]
-            if len(row) == 0:
-                # In case some combination is missing; show a gap
-                series.append(None)
-            else:
-                series.append(float(row[acc_key].iloc[0]))
-        ys.append(series)
+    # ColoredMNIST sweep (train/test)
+    keys += ["ColoredMNIST sweep – train", "ColoredMNIST sweep – test"]
+    ys += [
+        _sweep_series("colored_mnist", "train_acc"),
+        _sweep_series("colored_mnist", "test_acc"),
+    ]
+
+    # ColoredMNIST baselines as horizontal reference lines
+    c_tr0 = _baseline_value("colored_mnist", "train_acc")
+    c_te0 = _baseline_value("colored_mnist", "test_acc")
+    keys += ["ColoredMNIST baseline (λ=0) – train", "ColoredMNIST baseline (λ=0) – test"]
+    ys += [
+        [c_tr0] * len(xs),
+        [c_te0] * len(xs),
+    ]
+
+    # MNIST baselines as horizontal reference lines (optional but handy)
+    m_tr0 = _baseline_value("mnist", "train_acc")
+    m_te0 = _baseline_value("mnist", "test_acc")
+    keys += ["MNIST baseline (λ=0) – train", "MNIST baseline (λ=0) – test"]
+    ys += [
+        [m_tr0] * len(xs),
+        [m_te0] * len(xs),
+    ]
 
     chart = wandb.plot.line_series(
         xs=xs,
         ys=ys,
         keys=keys,
-        title="Accuracy vs λ (ColoredMNIST & MNIST)",
+        title="Accuracy vs λ (ColoredMNIST sweep + baselines)",
         xname="lambda",
     )
-
     wandb_run.log({"final_accuracy_plot": chart})
+
 
 
 def main():
@@ -572,15 +754,17 @@ def main():
     print("Loading PyTorch datasets and converting to JAX arrays once...")
     t0 = time.time()
 
-    train_col = IRMColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
-    test_col  = IRMColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
+    # train_col = IRMColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
+    # test_col  = IRMColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
+    train_col = ColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
+    test_col  = ColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
     train_std = StandardMNISTBin(train=True)
     test_std  = StandardMNISTBin(train=False)
 
-    x_train_col, y_train = dataset_to_jax_arrays(train_col)
-    x_test_col,  y_test  = dataset_to_jax_arrays(test_col)
-    x_train_std, _       = dataset_to_jax_arrays(train_std)
-    x_test_std,  _       = dataset_to_jax_arrays(test_std)
+    x_train_col, y_train_col = dataset_to_jax_arrays(train_col)
+    x_test_col,  y_test_col  = dataset_to_jax_arrays(test_col)
+    x_train_std, y_train_std = dataset_to_jax_arrays(train_std)
+    x_test_std,  y_test_std  = dataset_to_jax_arrays(test_std)
 
     print(f"Data ready in {time.time()-t0:.2f}s")
 
@@ -589,18 +773,94 @@ def main():
 
     sweep_start = time.time()
 
+    # ==========================================================
+    # 1) Baseline: Standard MNIST (lambda = 0 => no constraint)
+    # ==========================================================
+    lamb0 = 0.0
+    model = VIBClassifier(
+        bottleneck_width=cfg.bottleneck_width,
+        num_classes=cfg.num_classes,
+    )
+
+    print(f"\n--- MNIST Baseline (lamb={lamb0:.1e}) ---")
+    run_config = asdict(cfg)
+    run_config.update({"lambda": lamb0, "dataset": "mnist", "type": "baseline"})
+
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group=experiment_group_id,
+        name="mnist-baseline",
+        config=run_config,
+        reinit=True
+    )
+
+    t_start = time.time()
+    res_std = run_train_eval(
+        x_train_std, y_train_std, x_test_std, y_test_std,
+        model, cfg, lamb0, wandb_run=run
+    )
+    res_std["run_time"] = time.time() - t_start
+    res_std["dataset"] = "mnist"
+    res_std["lambda"] = lamb0
+
+    run.summary["final_test_acc"] = res_std["test_acc"]
+    run.summary["final_train_acc"] = res_std["train_acc"]
+    run.finish()
+
+    results_mnist.append(res_std)
+    all_summary_data.append(res_std)
+
+    # ==========================================================
+    # 2) Baseline: ColoredMNIST (lambda = 0 => no constraint)
+    # ==========================================================
+    model = VIBClassifier(
+        bottleneck_width=cfg.bottleneck_width,
+        num_classes=cfg.num_classes,
+    )
+
+    print(f"\n--- Colored Baseline (lamb={lamb0:.1e}) ---")
+    run_config = asdict(cfg)
+    run_config.update({"lambda": lamb0, "dataset": "colored_mnist", "type": "baseline"})
+
+    run = wandb.init(
+        entity=WANDB_ENTITY,
+        project=WANDB_PROJECT,
+        group=experiment_group_id,
+        name="cmnist-baseline",
+        config=run_config,
+        reinit=True
+    )
+
+    t_start = time.time()
+    res_col0 = run_train_eval(
+        x_train_col, y_train_col, x_test_col, y_test_col,
+        model, cfg, lamb0, wandb_run=run
+    )
+    res_col0["run_time"] = time.time() - t_start
+    res_col0["dataset"] = "colored_mnist"
+    res_col0["lambda"] = lamb0
+
+    run.summary["final_test_acc"] = res_col0["test_acc"]
+    run.summary["final_train_acc"] = res_col0["train_acc"]
+    run.finish()
+
+    results_colored.append(res_col0)
+    all_summary_data.append(res_col0)
+
+    # ==========================================================
+    # 3) Sweep: ColoredMNIST lambda sweep (experiment)
+    # ==========================================================
     for lamb in cfg.lambdas:
-        model = IBClassifier(
-            bottleneck_width=cfg.bottleneck_width, num_classes=cfg.num_classes,
-            lamb=lamb
+        lamb = float(lamb)
+        model = VIBClassifier(
+            bottleneck_width=cfg.bottleneck_width,
+            num_classes=cfg.num_classes,
         )
 
-        # ---------------------------------------------------------
-        # 1. ColoredMNIST Run
-        # ---------------------------------------------------------
-        print(f"\n--- Colored Run (lamb={lamb:.1e}) ---")
+        print(f"\n--- Colored Sweep (lamb={lamb:.1e}) ---")
         run_config = asdict(cfg)
-        run_config.update({"lambda": lamb, "dataset": "colored_mnist", "type": "noisy"})
+        run_config.update({"lambda": lamb, "dataset": "colored_mnist", "type": "sweep"})
 
         run = wandb.init(
             entity=WANDB_ENTITY,
@@ -613,56 +873,21 @@ def main():
 
         t_start = time.time()
         res_col = run_train_eval(
-            x_train_col, y_train, x_test_col, y_test,
-            model, cfg, 
-            wandb_run=run  # Passing the specific run object
+            x_train_col, y_train_col, x_test_col, y_test_col,
+            model, cfg, lamb,
+            wandb_run=run
         )
         res_col["run_time"] = time.time() - t_start
         res_col["dataset"] = "colored_mnist"
         res_col["lambda"] = lamb
-        
-        # Log summary to WandB
+
         run.summary["final_test_acc"] = res_col["test_acc"]
         run.summary["final_train_acc"] = res_col["train_acc"]
         run.finish()
 
-        # Append to local lists (for plotting code later)
         results_colored.append(res_col)
         all_summary_data.append(res_col)
 
-        # ---------------------------------------------------------
-        # 2. Standard MNIST Run
-        # ---------------------------------------------------------
-        print(f"--- MNIST Run (lamb={lamb:.1e}) ---")
-        run_config = asdict(cfg)
-        run_config.update({"lambda": lamb, "dataset": "mnist", "type": "noisy"})
-
-        run = wandb.init(
-            entity=WANDB_ENTITY,
-            project=WANDB_PROJECT,
-            group=experiment_group_id,
-            name=f"mnist-lamb_{lamb:.1e}",
-            config=run_config,
-            reinit=True
-        )
-
-        t_start = time.time()
-        res_std = run_train_eval(
-            x_train_std, y_train, x_test_std, y_test,
-            model, cfg, wandb_run=run
-        )
-        res_std["run_time"] = time.time() - t_start
-        res_std["dataset"] = "mnist"
-        res_std["lambda"] = lamb
-
-        # Log summary to WandB
-        run.summary["final_test_acc"] = res_std["test_acc"]
-        run.summary["final_train_acc"] = res_std["train_acc"]
-        run.finish()
-
-        # Append to local lists
-        results_mnist.append(res_std)
-        all_summary_data.append(res_std)
 
     total_time = time.time() - sweep_start
     print("\n" + "#" * 70)
@@ -701,26 +926,28 @@ def main():
     plt.figure()
     plt.scatter(xs_c, tr_c, label="ColoredMNIST train", marker="o")
     plt.scatter(xs_c, te_c, label="ColoredMNIST test", marker="x")
-    plt.xscale("symlog", linthresh=0.01) # Better for 0.0 values
-    plt.xlabel("Noise STD")
+    if LOG_SWEEP:
+        plt.xscale("symlog", linthresh=0.01) # Better for 0.0 values
+    plt.xlabel("Lambda")
     plt.ylabel("Accuracy")
-    plt.title("ColoredMNIST accuracy vs Information Penalty")
+    plt.title("ColoredMNIST accuracy vs Information capacity")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("coloredmnist_ib_sweep.png", dpi=300)
+    plt.savefig("coloredmnist_sweep.png", dpi=300)
 
     plt.figure()
     plt.scatter(xs_m, tr_m, label="MNIST train", marker="o")
     plt.scatter(xs_m, te_m, label="MNIST test", marker="x")
-    plt.xscale("symlog", linthresh=0.01)
-    plt.xlabel("Noise STD")
+    if LOG_SWEEP:
+        plt.xscale("symlog", linthresh=0.01)
+    plt.xlabel("Lambda")
     plt.ylabel("Accuracy")
-    plt.title("Standard MNIST accuracy vs Information Penalty")
+    plt.title("Standard MNIST accuracy vs Information capacity")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("mnist_ib_sweep.png", dpi=300)
+    plt.savefig("mnist_sweep.png", dpi=300)
 
     print("Saved plots: coloredmnist_ib_sweep.png, mnist_ib_sweep.png")
     
