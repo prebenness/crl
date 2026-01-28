@@ -1,4 +1,4 @@
-# Run with: python colored_mnist_masked_fast.py
+# Run with: python colored_mnist.py
 # Requirements:
 #   pip install jax jaxlib flax optax torch torchvision matplotlib tqdm
 
@@ -13,34 +13,31 @@ import numpy as np
 import wandb
 import pandas as pd
 
-from torch.utils.data import Dataset
-from torchvision.datasets import MNIST
-from torchvision import transforms
-
 import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 import jax.lax as lax
 from jax.scipy.special import logsumexp
 
-
-import flax.linen as nn
 from flax.training import train_state
 import optax
 
 import matplotlib.pyplot as plt
 
+from src.models.ib_classifiers import VIBClassifier
+from src.utils.data.datasets import ColoredMNIST, StandardMNISTBin, make_epoch_batches, dataset_to_jax_arrays
+from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 
 # ============================================================
-# 0) Global settings (safe on RTX 3080)
+# Global settings (safe on RTX 3080)
 # ============================================================
 
 # Generate a unique ID for this entire execution (The "Experiment")
 # We use timestamp so all models in this script share it.
 WANDB_ENTITY='prebenness-crl'
 WANDB_PROJECT='colored-mnist-vib'
-LAMBDA_RANGE = (0, 1, 10)         # (a, b, N) -> N lambda values, evenly logspaced in 10**a to 10**b or linspaced
-LOG_SWEEP = False                   # Logspaced or linspaced sweep
+LAMBDA_RANGE = (-3, 3, 10)         # (a, b, N) -> N lambda values, evenly logspaced in 10**a to 10**b or linspaced
+LOG_SWEEP = True                    # Logspaced or linspaced sweep
 timestamp = time.strftime("%Y-%m-%d-T%H-%M-%S", time.gmtime())
 experiment_group_id = f"{timestamp}-sweep-lambda-{LAMBDA_RANGE[0]}-{LAMBDA_RANGE[1]}-{LAMBDA_RANGE[2]}"
 
@@ -49,9 +46,9 @@ EVAL_MC_SAMPLES = 8
 
 # ControlVAE controller gains (tune these; defaults chosen for this classifier/KL scale)
 BETA_MIN = 0.0
-BETA_MAX = 1e3
-CTRL_KP = 10.0
-CTRL_KI = 1e-2
+BETA_MAX = 1.0
+# CTRL_KP = 10.0
+CTRL_KI = 1.0
 
 
 @dataclass
@@ -60,9 +57,10 @@ class TrainConfig:
     bottleneck_width = 16
     lr: float = 1e-3
     weight_decay: float = 1e-2
-    epochs: int = 50
+    epochs: int = 5
     batch_size: int = 128
     seed: int = 0
+    alpha: float = 0.01      # Alpha is share of loss from CE. Alpha = 0 -> only recon loss
     lambdas = jnp.linspace(*LAMBDA_RANGE) if not LOG_SWEEP else jnp.logspace(*LAMBDA_RANGE)
 
 
@@ -71,374 +69,10 @@ jax.config.update("jax_default_matmul_precision", "high")
 
 
 # ============================================================
-# 1) PyTorch datasets
+# Training / eval (epoch-scanned, donated state)
 # ============================================================
-
-class ColoredMNIST(Dataset):
-    """
-    Standard ColoredMNIST:
-      - Binary label: y_bin = (digit < 5)
-      - Color correlates with y_bin with prob p_corr
-      - Returns (x_rgb, y_bin) with x_rgb in CHW.
-    """
-    def __init__(self, root="./data", train=True, p_corr=0.9, seed=0):
-        super().__init__()
-        self.rng = np.random.RandomState(seed)
-
-        base = MNIST(
-            root=root,
-            train=train,
-            download=True,
-            transform=transforms.ToTensor(),
-        )
-        images = base.data.numpy().astype(np.float32) / 255.0  # [N,28,28]
-        labels = base.targets.numpy().astype(np.int32)
-
-        y_bin = (labels < 5).astype(np.int32)
-
-        flip = self.rng.rand(len(y_bin)) > p_corr
-        colors = np.where(flip, 1 - y_bin, y_bin).astype(np.int32)
-
-        self.images = images
-        self.y_bin = y_bin
-        self.colors = colors
-
-    def __len__(self):
-        return len(self.y_bin)
-
-    def __getitem__(self, idx):
-        x = self.images[idx]
-        y = self.y_bin[idx]
-        c = self.colors[idx]
-
-        xr = x if c == 0 else np.zeros_like(x)
-        xg = x if c == 1 else np.zeros_like(x)
-        xb = np.zeros_like(x)
-
-        x_rgb = np.stack([xr, xg, xb], axis=0)  # [3,28,28] CHW
-        return x_rgb, y
-
-
-class IRMColoredMNIST(Dataset):
-    """
-    IRM-style ColoredMNIST:
-      - Binary label (clean): y_clean = (digit < 5)
-      - Noisy label: y = y_clean flipped with prob 0.25
-      - Color correlates with *noisy* y with prob p_corr
-      - Returns (x_rgb, y) with x_rgb in CHW.
-    """
-    LABEL_FLIP_PROB = 0.25  # P(y != y_clean)
-
-    def __init__(self, root="./data", train=True, p_corr=0.9, seed=0):
-        super().__init__()
-        self.rng = np.random.RandomState(seed)
-
-        base = MNIST(
-            root=root,
-            train=train,
-            download=True,
-            transform=transforms.ToTensor(),
-        )
-        # [N, 28, 28], float32 in [0, 1]
-        images = base.data.numpy().astype(np.float32) / 255.0
-        labels = base.targets.numpy().astype(np.int32)
-
-        # 1. Clean binary label from digit
-        #    (you can swap <5 / >=5 if you prefer the other convention)
-        y_clean = (labels < 5).astype(np.int32)
-
-        # 2. Add label noise: flip with probability LABEL_FLIP_PROB
-        flip_y = self.rng.rand(len(y_clean)) < self.LABEL_FLIP_PROB
-        y_noisy = np.where(flip_y, 1 - y_clean, y_clean).astype(np.int32)
-
-        # 3. Color correlated with *noisy* label with probability p_corr
-        #    (same semantics as your original: p_corr = P(color == y_noisy))
-        flip_c = self.rng.rand(len(y_noisy)) > p_corr
-        colors = np.where(flip_c, 1 - y_noisy, y_noisy).astype(np.int32)
-
-        self.images = images            # [N, 28, 28], grayscale
-        self.y_clean = y_clean          # optional: clean label (for analysis)
-        self.y_bin = y_noisy            # noisy label used for training
-        self.colors = colors            # color indicator (0=red, 1=green)
-
-    def __len__(self):
-        return len(self.y_bin)
-
-    def __getitem__(self, idx):
-        x = self.images[idx]
-        y = self.y_bin[idx]
-        c = self.colors[idx]
-
-        xr = x if c == 0 else np.zeros_like(x)
-        xg = x if c == 1 else np.zeros_like(x)
-        xb = np.zeros_like(x)
-
-        x_rgb = np.stack([xr, xg, xb], axis=0)  # [3, 28, 28] CHW
-        return x_rgb, y
-
-
-class StandardMNISTBin(Dataset):
-    """Binary MNIST (digit<5), grayscale CHW."""
-    def __init__(self, root="./data", train=True):
-        base = MNIST(root=root, train=train, download=True, transform=transforms.ToTensor())
-        images = base.data.numpy().astype(np.float32) / 255.0
-        labels = base.targets.numpy().astype(np.int32)
-        y_bin = (labels < 5).astype(np.int32)
-
-        self.images = images
-        self.y_bin = y_bin
-
-    def __len__(self):
-        return len(self.y_bin)
-
-    def __getitem__(self, idx):
-        x = self.images[idx]
-        x = np.expand_dims(x, 0)  # [1,28,28]
-        return x, self.y_bin[idx]
-
-
-def dataset_to_jax_arrays(dataset: Dataset):
-    """Load whole PyTorch dataset once, convert to NHWC JAX arrays once."""
-    xs, ys = [], []
-    for x, y in dataset:
-        xs.append(x)
-        ys.append(y)
-    xs = np.stack(xs, axis=0)  # NCHW
-    xs = np.transpose(xs, (0, 2, 3, 1))  # NHWC
-    ys = np.array(ys, dtype=np.int32)
-    return jnp.array(xs), jnp.array(ys)
-
-
-# ============================================================
-# 2) JAX batching (host shuffle + reshape)
-# ============================================================
-
-def make_epoch_batches(x, y, batch_size, seed):
-    """
-    Fast host-side permutation, device-side gather.
-    Avoids jax.random.permutation (slow + sync).
-    """
-    n = x.shape[0]
-    rng = np.random.default_rng(int(seed))
-    perm = rng.permutation(n)
-
-    n_trim = (n // batch_size) * batch_size
-    perm = perm[:n_trim]
-
-    perm = jnp.asarray(perm)  # move indices to device once
-
-    x_shuf = jnp.take(x, perm, axis=0)
-    y_shuf = jnp.take(y, perm, axis=0)
-
-    n_batches = n_trim // batch_size
-    xb = x_shuf.reshape((n_batches, batch_size) + x.shape[1:])
-    yb = y_shuf.reshape((n_batches, batch_size))
-    return xb, yb
-
-
-# ============================================================
-# 3) Regularization Penalties (Spectral / HSIC placeholders)
-# ============================================================
-
-def svd_spectral_penalty(z):
-    """
-    Computes the nuclear norm (sum of singular values) of the batch.
-    Encourages the representation to lie on a low-dimensional manifold.
-    """
-    # Center the batch (conceptually important for covariance rank)
-    z_centered = z - jnp.mean(z, axis=0, keepdims=True)
-    
-    # Compute singular values (SVD)
-    # full_matrices=False is critical for performance
-    _, s, _ = jnp.linalg.svd(z_centered, full_matrices=False)
-    
-    # Minimize the sum of singular values (nuclear norm)
-    return jnp.sum(s)
-
-
-def frobenius_penalty(z):
-    """
-    Fast surrogate for nuclear norm:
-
-    - Center z over the batch
-    - Compute covariance C = (Zᵀ Z) / N
-    - Penalise ||C||_F² = sum_ij C_ij²
-
-    This is cheap (just matmuls) and JAX-friendly,
-    but still encourages low-rank / low-variance embeddings.
-    """
-    # z: [batch, dim]
-    z = z.astype(jnp.float32)
-
-    # Center across the batch
-    z_centered = z - jnp.mean(z, axis=0, keepdims=True)
-
-    # Covariance (up to a constant factor)
-    n = z_centered.shape[0]
-    cov = (z_centered.T @ z_centered) / n  # [dim, dim]
-
-    # Matrix-wide average of squared cov values - essentially a normalised frobenius norm
-    return jnp.mean(cov ** 2)
-
-
-def effective_rank_penalty(z, eps=1e-10):
-    """
-    Scale-invariant, rank-focused penalty for the bottleneck Z.
-
-    z: [batch, dim] representation.
-
-    Computes R_eff = (trace(C)^2 / ||C||_F^2), where C is the
-    centered covariance. R_eff is in [1, dim] and behaves like
-    an "effective rank": 1 when all variance is in one dimension,
-    dim when variance is spread equally.
-
-    Minimizing this encourages low effective rank while being
-    invariant to global rescaling of z.
-    """
-    # Center across batch
-    zc = z - jnp.mean(z, axis=0, keepdims=True)
-
-    # Covariance (up to constant factor)
-    n = zc.shape[0]
-    C = (zc.T @ zc) / n  # [dim, dim]
-
-    # trace and Frobenius norm squared
-    trace = jnp.trace(C)
-    frob_sq = jnp.sum(C ** 2)
-
-    # Effective-rank-like quantity
-    R_eff = (trace ** 2) / (frob_sq + eps)
-
-    return R_eff
-
-
-def linear_barrier(R_eff, eps=1e-10):
-    return R_eff + (1 / (R_eff - 1 + eps))
-
-
-# Placeholder for future HSIC experiments
-def hsic_penalty(x, z, sigma=1.0):
-    # You can implement the kernel logic here later
-    return 0.0
-
-
-
-# ============================================================
-# 4) Deterministic Bottleneck Classifier
-# ============================================================
-
-class IBClassifier(nn.Module):
-    bottleneck_width: int
-    num_classes: int
-    lamb: float      # interpreted as noise std
-
-
-    @nn.compact
-    def __call__(self, x, train=True):
-        # --- Encoder ---
-        x = nn.Conv(features=32, kernel_size=(3, 3))(x)
-        x = nn.relu(x)
-        x = nn.avg_pool(x, (2, 2), (2, 2))
-
-        x = nn.Conv(features=64, kernel_size=(3, 3))(x)
-        x = nn.relu(x)
-        x = nn.avg_pool(x, (2, 2), (2, 2))
-
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(128)(x)
-        x = nn.relu(x)
-
-        # --- The Bottleneck (Z) ---
-        z = nn.Dense(self.bottleneck_width)(x)
-        # Tanh is recommended for IB to bound the embedding space [-1, 1]
-        z = nn.tanh(z)
-
-        # --- Add noise to channel ---
-        # Additive Gaussian noise in the bottleneck
-        if train:
-            noise = jrandom.normal(self.make_rng("noise"), z.shape) * self.lamb
-            z = z + noise
-
-        # --- Classifier ---
-        logits = nn.Dense(self.num_classes)(z)
-        
-
-        # Aux dict: keeps z for loss/logging
-        aux = {
-            "z": z,
-        }
-
-        return logits, aux
-
-
-class VIBClassifier(nn.Module):
-    bottleneck_width: int
-    num_classes: int
-
-    # Optional numeric-stability knobs (defaults are sane)
-    min_logvar: float = -10.0
-    max_logvar: float =  10.0
-
-    @nn.compact
-    def __call__(self, x, train: bool = True):
-        # --- Encoder (same as IBClassifier for apples-to-apples) ---
-        x = nn.Conv(features=32, kernel_size=(3, 3))(x)
-        x = nn.relu(x)
-        x = nn.avg_pool(x, (2, 2), (2, 2))
-
-        x = nn.Conv(features=64, kernel_size=(3, 3))(x)
-        x = nn.relu(x)
-        x = nn.avg_pool(x, (2, 2), (2, 2))
-
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(128)(x)
-        x = nn.relu(x)
-
-        # --- Variational bottleneck: q(z|x) = N(mu, diag(var)) ---
-        mu = nn.Dense(self.bottleneck_width, name="z_mu")(x)
-        logvar = nn.Dense(self.bottleneck_width, name="z_logvar")(x)
-        logvar = jnp.clip(logvar, self.min_logvar, self.max_logvar)
-
-        std = jnp.exp(0.5 * logvar)
-
-        if train:
-            eps = jrandom.normal(self.make_rng("noise"), mu.shape)
-            z = mu + std * eps
-        else:
-            # Deterministic at eval for lower-variance metrics
-            z = mu
-
-        # --- Classifier head ---
-        logits = nn.Dense(self.num_classes)(z)
-
-        # --- KL(q(z|x) || N(0, I)) ---
-        # Per-example KL: 0.5 * sum(mu^2 + exp(logvar) - 1 - logvar)
-        kl_per_example = 0.5 * jnp.sum(
-            (mu * mu) + jnp.exp(logvar) - 1.0 - logvar,
-            axis=-1
-        )
-        kl = jnp.mean(kl_per_example)
-
-        # Aux dict: keeps z plus VIB stats for loss/logging
-        aux = {
-            "z": z,
-            "mu": mu,
-            "logvar": logvar,
-            "kl": kl,
-            "kl_per_example": kl_per_example,
-        }
-
-        return logits, aux
-
-
-
-# ============================================================
-# 5) Training / eval (epoch-scanned, donated state)
-# ============================================================
-
 
 # ---- ControlVAE controller fixed bounds (not swept) ----
-
 class ControlTrainState(train_state.TrainState):
     beta: jnp.ndarray
     int_err: jnp.ndarray
@@ -453,7 +87,7 @@ def create_state(rng, model, input_shape, cfg):
     tx = optax.adamw(cfg.lr, cfg.weight_decay)
     opt_state = tx.init(params)
 
-    beta0 = jnp.array(BETA_MIN, dtype=jnp.float32)
+    beta0 = jnp.array(BETA_MIN, dtype=jnp.float32)      # Start unconstrained
     int0  = jnp.array(0.0, dtype=jnp.float32)
 
     return ControlTrainState(
@@ -468,9 +102,10 @@ def create_state(rng, model, input_shape, cfg):
 
 
 @jax.jit
-def train_step(state, batch, rng, lamb):
+def train_step(state, batch, rng, lamb, alpha):
     x, y = batch
     lamb = jnp.asarray(lamb, jnp.float32)  # capacity target C
+    alpha = jnp.asarray(alpha, jnp.float32)
 
     beta_min = jnp.array(BETA_MIN, dtype=jnp.float32)
     beta_max = jnp.array(BETA_MAX, dtype=jnp.float32)
@@ -487,9 +122,10 @@ def train_step(state, batch, rng, lamb):
                 rngs={"noise": k},
             )
             kl_raw = aux.get("kl", 0.0)
-            return logits, kl_raw
+            x_recon_logits = aux["x_recon_logits"]
+            return logits, kl_raw, x_recon_logits
 
-        logits_K, kl_K = jax.vmap(one_sample)(keys)  # logits_K: [K,B,C], kl_K: [K]
+        logits_K, kl_K, x_recon_logits_K = jax.vmap(one_sample)(keys)   # logits_K: [K,B,C], kl_K: [K], x_recon_logits_K: [K,B,H,W,C]
 
         # Average cross-entropy across samples (same objective as K=1, lower variance)
         def ce_from_logits(lgts):
@@ -497,41 +133,47 @@ def train_step(state, batch, rng, lamb):
 
         ce_loss = jnp.mean(jax.vmap(ce_from_logits)(logits_K))
 
+        # Reconstruction loss across samples (pixelwise BCE on logits; sum pixels, mean batch)
+        def recon_from_logits(xl):
+            bce = optax.sigmoid_binary_cross_entropy(xl, x)  # [B,H,W,C]
+            #return bce.sum(axis=(1, 2, 3)).mean()
+            return bce.mean()
+        recon_loss = jnp.mean(jax.vmap(recon_from_logits)(x_recon_logits_K))
+
+
         # KL doesn't depend on eps (same across samples), so take first.
         kl = (kl_K[0]).astype(jnp.float32)
 
         # Use mean logits for reporting acc (cheap, stable)
         logits = jnp.mean(logits_K, axis=0)
 
-        total_loss = ce_loss + state.beta * kl
-        return total_loss, (logits, ce_loss, kl)
+        # ---- Dual-ascent (inequality) controller, applied immediately ----
+        # Stop-grad so beta update doesn't backprop through kl.
+        kl_sg = lax.stop_gradient(kl)
+
+        beta_candidate = state.beta + (CTRL_KI * (kl_sg - lamb))
+        beta_used = jnp.clip(beta_candidate, beta_min, beta_max)
+
+        # IMPORTANT: use beta_used (interpreted as lambda in [0,1]) inside this step's loss (to avoid one batch lag)
+        lam_sg = lax.stop_gradient(beta_used)
+        task_loss = (ce_loss * alpha) + (recon_loss * (1.0 - alpha))
+        total_loss = task_loss * (1.0 - lam_sg) + lam_sg * kl
+        return total_loss, (logits, ce_loss, recon_loss, kl, beta_used)
 
 
-    (loss, (logits, ce_loss, kl)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    (loss, (logits, ce_loss, recon_loss, kl, beta_used)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
 
-    # ---- ControlVAE-style PI control to track KL -> lamb ----
-    # error e = C - KL  (positive => KL too low => decrease beta to allow KL to rise)
-    e = lamb - lax.stop_gradient(kl)
-
-    int_candidate = state.int_err + e
-
-    # Nonlinear bounded "P" term + integral term (ControlVAE-style)
-    beta_unclipped = beta_min + (CTRL_KP / (1.0 + jnp.exp(e))) - (CTRL_KI * int_candidate)
-    beta_new = jnp.clip(beta_unclipped, beta_min, beta_max)
-
-    # Simple anti-windup: only integrate if not saturating
-    in_bounds = (beta_unclipped >= beta_min) & (beta_unclipped <= beta_max)
-    int_new = jnp.where(in_bounds, int_candidate, state.int_err)
-
-    state = state.replace(beta=beta_new, int_err=int_new)
+    # Commit the beta we used for this step (so next step starts from it)
+    state = state.replace(beta=beta_used)
 
     acc = (jnp.argmax(logits, -1) == y).mean()
     metrics = {
         "loss": loss,
         "ce": ce_loss,
+        "recon": recon_loss,
         "kl": kl,
-        "beta": beta_new,
+        "beta": beta_used,
         "acc": acc,
     }
     return state, metrics
@@ -566,14 +208,14 @@ def eval_step(state, batch, rng):
     return nll, acc
 
 
-def train_epoch(state, xb, yb, rng, lamb):
+def train_epoch(state, xb, yb, rng, lamb, alpha):
     n_batches = xb.shape[0]
     rngs = jrandom.split(rng, n_batches)   # [n_batches, 2]
 
     def body(carry, inputs):
         st = carry
         x, y, r = inputs                   # unpack one batch + one key
-        st, metrics = train_step(st, (x, y), r, lamb)
+        st, metrics = train_step(st, (x, y), r, lamb, alpha)
         return st, metrics
 
     state, metrics_history = lax.scan(
@@ -624,7 +266,7 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run
         xt, yt = make_epoch_batches(x_test,  y_test,  cfg.batch_size, seed_te)
 
 
-        state, metrics = train_epoch(state, xb, yb, rng_epoch, lamb)
+        state, metrics = train_epoch(state, xb, yb, rng_epoch, lamb, cfg.alpha)
 
         rng, rng_eval = jrandom.split(rng)
         te_loss, te_acc = eval_epoch(state, xt, yt, rng_eval)
@@ -637,7 +279,8 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run
             "train_loss": float(metrics["loss"]),
             "train_acc": float(metrics["acc"]),
             "train_kl": float(metrics["kl"]),   # KL in nats
-            "train_beta": float(metrics["beta"]),   # controller output
+            "train_recon": float(metrics["recon"]),
+            "train_beta": float(metrics["beta"]),   # controller output (lambda in [0,1])
             "test_loss": float(te_loss),
             "test_acc": float(te_acc),
             "cap": float(lamb),
@@ -649,7 +292,8 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run
             f"  Epoch {ep+1}/{cfg.epochs}"
             f"  Acc. Train: {float(metrics['acc']):.4f} Test: {float(te_acc):.4f}"
             f"  Loss Train: {float(metrics['loss']):.4f} Test: {float(te_loss):.4f}"
-            f"  KL: {float(metrics['kl']):.4e}  Beta: {float(metrics['beta']):.3e}"
+            f"  Train CE: {float(metrics['ce']):.4f} Recon {float(metrics['recon']):.4f}"
+            f"  KL: {float(metrics['kl']):.4f}  Beta: {float(metrics['beta']):.3f}"
             f"      Time: {time.time()-t0:.2f}s"
         )
 
@@ -658,88 +302,8 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run
 
 
 # ============================================================
-# 6) Sweep + plots + timing
+# Sweep + plots + timing
 # ============================================================
-
-
-def wandb_summary_plot(all_data, wandb_run):
-    """
-    Log a summary chart: accuracy vs lambda for
-    ColoredMNIST sweep (train/test) + horizontal baseline refs.
-
-    all_data: list of dicts with keys including
-              ["dataset", "lambda", "train_acc", "test_acc", ...]
-    """
-    if not all_data:
-        return
-
-    df = pd.DataFrame(all_data)
-    df["lambda"] = df["lambda"].map(float)
-
-    # X axis: use all lambdas we observed (includes 0.0 baseline)
-    lambdas = sorted(df["lambda"].unique())
-    xs = lambdas
-
-    def _baseline_value(ds_code: str, acc_key: str):
-        # Baseline runs are identified by lambda == 0.0 in this script
-        row = df[(df["dataset"] == ds_code) & (np.isclose(df["lambda"], 0.0))]
-        if len(row) == 0:
-            return np.nan
-        return float(row[acc_key].iloc[0])
-
-    def _sweep_series(ds_code: str, acc_key: str):
-        # For the sweep curve, we intentionally skip the baseline point at lambda==0
-        series = []
-        for lmb in xs:
-            if np.isclose(lmb, 0.0):
-                series.append(np.nan)  # gap at baseline
-                continue
-            row = df[(df["dataset"] == ds_code) & (np.isclose(df["lambda"], lmb))]
-            if len(row) == 0:
-                series.append(np.nan)
-            else:
-                series.append(float(row[acc_key].iloc[0]))
-        return series
-
-    # ---- Build curves ----
-    ys = []
-    keys = []
-
-    # ColoredMNIST sweep (train/test)
-    keys += ["ColoredMNIST sweep – train", "ColoredMNIST sweep – test"]
-    ys += [
-        _sweep_series("colored_mnist", "train_acc"),
-        _sweep_series("colored_mnist", "test_acc"),
-    ]
-
-    # ColoredMNIST baselines as horizontal reference lines
-    c_tr0 = _baseline_value("colored_mnist", "train_acc")
-    c_te0 = _baseline_value("colored_mnist", "test_acc")
-    keys += ["ColoredMNIST baseline (λ=0) – train", "ColoredMNIST baseline (λ=0) – test"]
-    ys += [
-        [c_tr0] * len(xs),
-        [c_te0] * len(xs),
-    ]
-
-    # MNIST baselines as horizontal reference lines (optional but handy)
-    m_tr0 = _baseline_value("mnist", "train_acc")
-    m_te0 = _baseline_value("mnist", "test_acc")
-    keys += ["MNIST baseline (λ=0) – train", "MNIST baseline (λ=0) – test"]
-    ys += [
-        [m_tr0] * len(xs),
-        [m_te0] * len(xs),
-    ]
-
-    chart = wandb.plot.line_series(
-        xs=xs,
-        ys=ys,
-        keys=keys,
-        title="Accuracy vs λ (ColoredMNIST sweep + baselines)",
-        xname="lambda",
-    )
-    wandb_run.log({"final_accuracy_plot": chart})
-
-
 
 def main():
     # We will collect results here to log a summary table at the very end
