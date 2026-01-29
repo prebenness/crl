@@ -23,9 +23,13 @@ from flax.training import train_state
 import optax
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 
 from src.models.ib_classifiers import VIBClassifier
-from src.utils.data.datasets import ColoredMNIST, StandardMNISTBin, make_epoch_batches, dataset_to_jax_arrays
+from src.models.classifiers import StdClassifier
+
+from src.loss_fns.reg_loss_fns import hsic_rbf
+from src.data.datasets import ColoredMNIST, IRMColoredMNIST, StandardMNISTBin, make_epoch_batches, dataset_to_jax_arrays
 from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 
 # ============================================================
@@ -36,7 +40,7 @@ from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 # We use timestamp so all models in this script share it.
 WANDB_ENTITY='prebenness-crl'
 WANDB_PROJECT='colored-mnist-vib'
-LAMBDA_RANGE = (-3, 3, 10)         # (a, b, N) -> N lambda values, evenly logspaced in 10**a to 10**b or linspaced
+LAMBDA_RANGE = (0, 2, 1)         # (a, b, N) -> N lambda values, evenly logspaced in 10**a to 10**b or linspaced
 LOG_SWEEP = True                    # Logspaced or linspaced sweep
 timestamp = time.strftime("%Y-%m-%d-T%H-%M-%S", time.gmtime())
 experiment_group_id = f"{timestamp}-sweep-lambda-{LAMBDA_RANGE[0]}-{LAMBDA_RANGE[1]}-{LAMBDA_RANGE[2]}"
@@ -49,6 +53,7 @@ BETA_MIN = 0.0
 BETA_MAX = 1.0
 # CTRL_KP = 10.0
 CTRL_KI = 1.0
+HSIC_WEIGHT = 5e0
 
 
 @dataclass
@@ -56,11 +61,12 @@ class TrainConfig:
     num_classes = 2
     bottleneck_width = 16
     lr: float = 1e-3
-    weight_decay: float = 1e-2
-    epochs: int = 5
+    weight_decay_inner: float = 0e-2
+    weight_decay_outer: float = 0e-2
+    epochs: int = 250
     batch_size: int = 128
     seed: int = 0
-    alpha: float = 0.01      # Alpha is share of loss from CE. Alpha = 0 -> only recon loss
+    alpha: float = 0.05      # Alpha is share of loss from CE. Alpha = 0 -> only recon loss
     lambdas = jnp.linspace(*LAMBDA_RANGE) if not LOG_SWEEP else jnp.logspace(*LAMBDA_RANGE)
 
 
@@ -78,13 +84,13 @@ class ControlTrainState(train_state.TrainState):
     int_err: jnp.ndarray
 
 
-def create_state(rng, model, input_shape, cfg):
+def create_state_inner(rng, model, input_shape, cfg):
     params = model.init(
         rng,
         jnp.ones(input_shape, jnp.float32),
         train=True,
     )["params"]
-    tx = optax.adamw(cfg.lr, cfg.weight_decay)
+    tx = optax.adamw(cfg.lr, cfg.weight_decay_inner)
     opt_state = tx.init(params)
 
     beta0 = jnp.array(BETA_MIN, dtype=jnp.float32)      # Start unconstrained
@@ -98,6 +104,24 @@ def create_state(rng, model, input_shape, cfg):
         opt_state=opt_state,
         beta=beta0,
         int_err=int0,
+    )
+
+
+def create_state_outer(rng, model, input_shape, cfg):
+    params = model.init(
+        rng,
+        jnp.ones(input_shape, jnp.float32),
+        train=True,
+    )["params"]
+    tx = optax.adamw(cfg.lr, cfg.weight_decay_outer)
+    opt_state = tx.init(params)
+
+    return train_state.TrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
     )
 
 
@@ -180,6 +204,91 @@ def train_step(state, batch, rng, lamb, alpha):
 
 
 @jax.jit
+def train_step_pair(state1, state2, batch, rng, lamb, alpha, hsic_w):
+    x, y = batch
+    lamb = jnp.asarray(lamb, jnp.float32)
+    alpha = jnp.asarray(alpha, jnp.float32)
+    hsic_w = jnp.asarray(hsic_w, jnp.float32)
+
+    beta_min = jnp.array(BETA_MIN, dtype=jnp.float32)
+    beta_max = jnp.array(BETA_MAX, dtype=jnp.float32)
+
+    rng1, rng2 = jrandom.split(rng, 2)
+
+    # ------------------------
+    # Model 1 (VIB): same as existing train_step, but also return mu
+    # ------------------------
+    def loss_fn1(params):
+        keys = jrandom.split(rng1, TRAIN_MC_SAMPLES)
+
+        def one_sample(k):
+            logits, aux = state1.apply_fn(
+                {"params": params},
+                x,
+                train=True,
+                rngs={"noise": k},
+            )
+            # mu doesn't depend on eps; safe to take from any sample
+            return logits, aux.get("kl", 0.0), aux["x_recon_logits"], aux["mu"]
+
+        logits_K, kl_K, x_recon_logits_K, mu_K = jax.vmap(one_sample)(keys)
+
+        def ce_from_logits(lgts):
+            return optax.softmax_cross_entropy_with_integer_labels(lgts, y).mean()
+        ce_loss = jnp.mean(jax.vmap(ce_from_logits)(logits_K))
+
+        def recon_from_logits(xl):
+            bce = optax.sigmoid_binary_cross_entropy(xl, x)
+            return bce.mean()
+        recon_loss = jnp.mean(jax.vmap(recon_from_logits)(x_recon_logits_K))
+
+        kl = (kl_K[0]).astype(jnp.float32)
+        mu1 = mu_K[0]  # [B, D]
+        logits = jnp.mean(logits_K, axis=0)
+
+        kl_sg = lax.stop_gradient(kl)
+        beta_candidate = state1.beta + (CTRL_KI * (kl_sg - lamb))
+        beta_used = jnp.clip(beta_candidate, beta_min, beta_max)
+
+        lam_sg = lax.stop_gradient(beta_used)
+        task_loss = (ce_loss * alpha) + (recon_loss * (1.0 - alpha))
+        total_loss = task_loss * (1.0 - lam_sg) + lam_sg * kl
+        return total_loss, (logits, ce_loss, recon_loss, kl, beta_used, mu1)
+
+    (loss1, (logits1, ce1, recon1, kl1, beta1, mu1)), grads1 = jax.value_and_grad(loss_fn1, has_aux=True)(state1.params)
+    state1 = state1.apply_gradients(grads=grads1).replace(beta=beta1)
+
+    mu1_sg = lax.stop_gradient(mu1)
+
+    # ------------------------
+    # Model 2 (StdClassifier): CE + HSIC(mu1, h2)
+    # ------------------------
+    def loss_fn2(params):
+        logits2, aux2 = state2.apply_fn({"params": params}, x, train=True)
+        h2 = aux2["h"]
+
+        ce2 = optax.softmax_cross_entropy_with_integer_labels(logits2, y).mean()
+        hsic = hsic_rbf(mu1_sg, h2)
+
+        total = ce2 + hsic_w * hsic
+        return total, (logits2, ce2, hsic)
+
+    (loss2, (logits2, ce2, hsic_loss)), grads2 = jax.value_and_grad(loss_fn2, has_aux=True)(state2.params)
+    state2 = state2.apply_gradients(grads=grads2)
+
+    acc1 = (jnp.argmax(logits1, -1) == y).mean()
+    acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+    metrics = {
+        "loss1": loss1, "acc1": acc1, "ce1": ce1, "recon1": recon1, "kl1": kl1, "beta1": beta1,
+        "loss2": loss2, "acc2": acc2, "ce2": ce2,
+        "hsic": hsic_loss,
+    }
+    return state1, state2, metrics
+
+
+
+@jax.jit
 def eval_step(state, batch, rng):
     x, y = batch  # y: [B]
     keys = jrandom.split(rng, EVAL_MC_SAMPLES)
@@ -227,8 +336,24 @@ def train_epoch(state, xb, yb, rng, lamb, alpha):
     avg_metrics = {k: jnp.mean(v) for k, v in metrics_history.items()}
     return state, avg_metrics
 
-# IMPORTANT: JIT **after** defining function, using wrapper syntax
 train_epoch = jax.jit(train_epoch, donate_argnums=(0,))
+
+
+def train_epoch_pair(state1, state2, xb, yb, rng, lamb, alpha, hsic_w):
+    n_batches = xb.shape[0]
+    rngs = jrandom.split(rng, n_batches)
+
+    def body(carry, inputs):
+        st1, st2 = carry
+        x, y, r = inputs
+        st1, st2, metrics = train_step_pair(st1, st2, (x, y), r, lamb, alpha, hsic_w)
+        return (st1, st2), metrics
+
+    (state1, state2), metrics_history = lax.scan(body, (state1, state2), (xb, yb, rngs))
+    avg_metrics = {k: jnp.mean(v) for k, v in metrics_history.items()}
+    return state1, state2, avg_metrics
+
+train_epoch_pair = jax.jit(train_epoch_pair, donate_argnums=(0, 1))
 
 
 def eval_epoch(state, xb, yb, rng):
@@ -251,7 +376,7 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run
     input_shape = (cfg.batch_size,) + x_train.shape[1:]
     rng, rng_init = jrandom.split(rng)
 
-    state = create_state(rng_init, model, input_shape, cfg)
+    state = create_state_inner(rng_init, model, input_shape, cfg)
 
     for ep in range(cfg.epochs):
         t0 = time.time()
@@ -301,6 +426,67 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb, wandb_run
     return results
 
 
+def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model, outer_model, cfg, lamb, wandb_run):
+    rng = jrandom.PRNGKey(cfg.seed)
+    input_shape = (cfg.batch_size,) + x_train.shape[1:]
+    rng, r1, r2 = jrandom.split(rng, 3)
+
+    inner_state = create_state_inner(r1, inner_model, input_shape, cfg)       # ControlTrainState
+    outer_state = create_state_outer(r2, outer_model, input_shape, cfg)   # TrainState
+
+    for ep in range(cfg.epochs):
+        t0 = time.time()
+        seed_tr = cfg.seed * 10_000 + ep
+        seed_te = cfg.seed * 20_000 + ep
+        rng, rng_epoch = jrandom.split(rng)
+
+        xb, yb = make_epoch_batches(x_train, y_train, cfg.batch_size, seed_tr)
+        xt, yt = make_epoch_batches(x_test,  y_test,  cfg.batch_size, seed_te)
+
+        inner_state, outer_state, metrics = train_epoch_pair(inner_state, outer_state, xb, yb, rng_epoch, lamb, cfg.alpha, HSIC_WEIGHT)
+
+        rng, rng_eval1, rng_eval2 = jrandom.split(rng, 3)
+        te_loss1, te_acc1 = eval_epoch(inner_state, xt, yt, rng_eval1)
+        te_loss2, te_acc2 = eval_epoch(outer_state, xt, yt, rng_eval2)
+
+        results = {
+            "epoch": ep + 1,
+            # Inner model
+            "train_acc1": float(metrics["acc1"]),
+            "train_loss1": float(metrics["loss1"]),
+            "train_kl1": float(metrics["kl1"]),
+            "train_recon1": float(metrics["recon1"]),
+            "train_beta1": float(metrics["beta1"]),
+            "test_acc1": float(te_acc1),
+            "test_loss1": float(te_loss1),
+            # Outer model
+            "train_acc2": float(metrics["acc2"]),
+            "train_loss2": float(metrics["loss2"]),
+            "train_ce2": float(metrics["ce2"]),
+            "test_acc2": float(te_acc2),
+            "test_loss2": float(te_loss2),
+            # reg
+            "hsic": float(metrics["hsic"]),
+            "cap": float(lamb),
+        }
+        wandb_run.log(results)
+
+        print(
+            f"  Epoch {ep+1}/{cfg.epochs}"
+            f" | Inner acc tr {results['train_acc1']:.4f} te {results['test_acc1']:.4f}"
+            f" | Outer acc tr {results['train_acc2']:.4f} te {results['test_acc2']:.4f}"
+            f" | hsic {results['hsic']:.4f}"
+            f" | {time.time()-t0:.2f}s"
+        )
+
+    # for compatibility with your plotting/table code, return model2 as main acc
+    results["train_acc"] = results["train_acc2"]
+    results["test_acc"] = results["test_acc2"]
+    results["lambda"] = float(lamb)
+    return results
+
+
+
 # ============================================================
 # Sweep + plots + timing
 # ============================================================
@@ -318,10 +504,10 @@ def main():
     print("Loading PyTorch datasets and converting to JAX arrays once...")
     t0 = time.time()
 
-    # train_col = IRMColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
-    # test_col  = IRMColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
-    train_col = ColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
-    test_col  = ColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
+    train_col = IRMColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
+    test_col  = IRMColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
+    # train_col = ColoredMNIST(train=True,  p_corr=p_train, seed=cfg.seed)
+    # test_col  = ColoredMNIST(train=False, p_corr=p_test,  seed=cfg.seed + 1)
     train_std = StandardMNISTBin(train=True)
     test_std  = StandardMNISTBin(train=False)
 
@@ -337,88 +523,92 @@ def main():
 
     sweep_start = time.time()
 
-    # ==========================================================
-    # 1) Baseline: Standard MNIST (lambda = 0 => no constraint)
-    # ==========================================================
-    lamb0 = 0.0
-    model = VIBClassifier(
-        bottleneck_width=cfg.bottleneck_width,
-        num_classes=cfg.num_classes,
-    )
+    # # ==========================================================
+    # # 1) Baseline: Standard MNIST (lambda = 0 => no constraint)
+    # # ==========================================================
+    # lamb0 = 0.0
+    # inner_model = VIBClassifier(
+    #     bottleneck_width=cfg.bottleneck_width,
+    #     num_classes=cfg.num_classes,
+    # )
 
-    print(f"\n--- MNIST Baseline (lamb={lamb0:.1e}) ---")
-    run_config = asdict(cfg)
-    run_config.update({"lambda": lamb0, "dataset": "mnist", "type": "baseline"})
+    # print(f"\n--- MNIST Baseline (lamb={lamb0:.1e}) ---")
+    # run_config = asdict(cfg)
+    # run_config.update({"lambda": lamb0, "dataset": "mnist", "type": "baseline"})
 
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group=experiment_group_id,
-        name="mnist-baseline",
-        config=run_config,
-        reinit=True
-    )
+    # run = wandb.init(
+    #     entity=WANDB_ENTITY,
+    #     project=WANDB_PROJECT,
+    #     group=experiment_group_id,
+    #     name="mnist-baseline",
+    #     config=run_config,
+    #     reinit=True
+    # )
 
-    t_start = time.time()
-    res_std = run_train_eval(
-        x_train_std, y_train_std, x_test_std, y_test_std,
-        model, cfg, lamb0, wandb_run=run
-    )
-    res_std["run_time"] = time.time() - t_start
-    res_std["dataset"] = "mnist"
-    res_std["lambda"] = lamb0
+    # t_start = time.time()
+    # res_std = run_train_eval(
+    #     x_train_std, y_train_std, x_test_std, y_test_std,
+    #     inner_model, cfg, lamb0, wandb_run=run
+    # )
+    # res_std["run_time"] = time.time() - t_start
+    # res_std["dataset"] = "mnist"
+    # res_std["lambda"] = lamb0
 
-    run.summary["final_test_acc"] = res_std["test_acc"]
-    run.summary["final_train_acc"] = res_std["train_acc"]
-    run.finish()
+    # run.summary["final_test_acc"] = res_std["test_acc"]
+    # run.summary["final_train_acc"] = res_std["train_acc"]
+    # run.finish()
 
-    results_mnist.append(res_std)
-    all_summary_data.append(res_std)
+    # results_mnist.append(res_std)
+    # all_summary_data.append(res_std)
 
-    # ==========================================================
-    # 2) Baseline: ColoredMNIST (lambda = 0 => no constraint)
-    # ==========================================================
-    model = VIBClassifier(
-        bottleneck_width=cfg.bottleneck_width,
-        num_classes=cfg.num_classes,
-    )
+    # # ==========================================================
+    # # 2) Baseline: ColoredMNIST (lambda = 0 => no constraint)
+    # # ==========================================================
+    # inner_model = VIBClassifier(
+    #     bottleneck_width=cfg.bottleneck_width,
+    #     num_classes=cfg.num_classes,
+    # )
 
-    print(f"\n--- Colored Baseline (lamb={lamb0:.1e}) ---")
-    run_config = asdict(cfg)
-    run_config.update({"lambda": lamb0, "dataset": "colored_mnist", "type": "baseline"})
+    # print(f"\n--- Colored Baseline (lamb={lamb0:.1e}) ---")
+    # run_config = asdict(cfg)
+    # run_config.update({"lambda": lamb0, "dataset": "colored_mnist", "type": "baseline"})
 
-    run = wandb.init(
-        entity=WANDB_ENTITY,
-        project=WANDB_PROJECT,
-        group=experiment_group_id,
-        name="cmnist-baseline",
-        config=run_config,
-        reinit=True
-    )
+    # run = wandb.init(
+    #     entity=WANDB_ENTITY,
+    #     project=WANDB_PROJECT,
+    #     group=experiment_group_id,
+    #     name="cmnist-baseline",
+    #     config=run_config,
+    #     reinit=True
+    # )
 
-    t_start = time.time()
-    res_col0 = run_train_eval(
-        x_train_col, y_train_col, x_test_col, y_test_col,
-        model, cfg, lamb0, wandb_run=run
-    )
-    res_col0["run_time"] = time.time() - t_start
-    res_col0["dataset"] = "colored_mnist"
-    res_col0["lambda"] = lamb0
+    # t_start = time.time()
+    # res_col0 = run_train_eval(
+    #     x_train_col, y_train_col, x_test_col, y_test_col,
+    #     inner_model, cfg, lamb0, wandb_run=run
+    # )
+    # res_col0["run_time"] = time.time() - t_start
+    # res_col0["dataset"] = "colored_mnist"
+    # res_col0["lambda"] = lamb0
 
-    run.summary["final_test_acc"] = res_col0["test_acc"]
-    run.summary["final_train_acc"] = res_col0["train_acc"]
-    run.finish()
+    # run.summary["final_test_acc"] = res_col0["test_acc"]
+    # run.summary["final_train_acc"] = res_col0["train_acc"]
+    # run.finish()
 
-    results_colored.append(res_col0)
-    all_summary_data.append(res_col0)
+    # results_colored.append(res_col0)
+    # all_summary_data.append(res_col0)
 
     # ==========================================================
     # 3) Sweep: ColoredMNIST lambda sweep (experiment)
     # ==========================================================
     for lamb in cfg.lambdas:
         lamb = float(lamb)
-        model = VIBClassifier(
+        inner_model = VIBClassifier(
             bottleneck_width=cfg.bottleneck_width,
+            num_classes=cfg.num_classes,
+        )
+        outer_model = StdClassifier(
+            rep_dim=cfg.bottleneck_width,
             num_classes=cfg.num_classes,
         )
 
@@ -436,11 +626,25 @@ def main():
         )
 
         t_start = time.time()
-        res_col = run_train_eval(
+
+        ##########################
+        # Train and eval
+        ##########################
+        
+        # Inner model only
+        # res_col = run_train_eval(
+        #     x_train_col, y_train_col, x_test_col, y_test_col,
+        #     inner_model, cfg, lamb,
+        #     wandb_run=run
+        # )
+
+        # Inner and outer model
+        res_col = run_train_eval_pair(
             x_train_col, y_train_col, x_test_col, y_test_col,
-            model, cfg, lamb,
+            inner_model, outer_model, cfg, lamb,
             wandb_run=run
         )
+
         res_col["run_time"] = time.time() - t_start
         res_col["dataset"] = "colored_mnist"
         res_col["lambda"] = lamb
@@ -485,31 +689,62 @@ def main():
     # Log the raw data table too if you want to inspect values
     summary_run.log({"raw_data": wandb.Table(dataframe=pd.DataFrame(all_summary_data))})
 
-
-    # Update Plot labels
     plt.figure()
     plt.scatter(xs_c, tr_c, label="ColoredMNIST train", marker="o")
     plt.scatter(xs_c, te_c, label="ColoredMNIST test", marker="x")
+
     if LOG_SWEEP:
-        plt.xscale("symlog", linthresh=0.01) # Better for 0.0 values
+        plt.xscale("symlog", linthresh=0.01)  # Better for 0.0 values
+
     plt.xlabel("Lambda")
     plt.ylabel("Accuracy")
     plt.title("ColoredMNIST accuracy vs Information capacity")
     plt.legend()
-    plt.grid(True)
+
+    # (a) Make sure 0..1 is clearly visible
+    plt.ylim(-0.02, 1.02)
+
+    ax = plt.gca()
+
+    # Major y ticks at 0.2, 0.4, ...
+    ax.yaxis.set_major_locator(MultipleLocator(0.2))
+
+    # (b) Minor y ticks (and grid) every 0.1
+    ax.yaxis.set_minor_locator(MultipleLocator(0.1))
+
+    # Grid for both major and minor
+    ax.grid(True, which="major")
+    ax.grid(True, which="minor", alpha=0.35)
+
     plt.tight_layout()
     plt.savefig("coloredmnist_sweep.png", dpi=300)
-
+    
     plt.figure()
     plt.scatter(xs_m, tr_m, label="MNIST train", marker="o")
     plt.scatter(xs_m, te_m, label="MNIST test", marker="x")
     if LOG_SWEEP:
-        plt.xscale("symlog", linthresh=0.01)
+        plt.xscale("symlog", linthresh=0.01)  # Better for 0.0 values
+
     plt.xlabel("Lambda")
     plt.ylabel("Accuracy")
-    plt.title("Standard MNIST accuracy vs Information capacity")
+    plt.title("ColoredMNIST accuracy vs Information capacity")
     plt.legend()
-    plt.grid(True)
+
+    # (a) Make sure 0..1 is clearly visible
+    plt.ylim(-0.02, 1.02)
+
+    ax = plt.gca()
+
+    # Major y ticks at 0.2, 0.4, ...
+    ax.yaxis.set_major_locator(MultipleLocator(0.2))
+
+    # (b) Minor y ticks (and grid) every 0.1
+    ax.yaxis.set_minor_locator(MultipleLocator(0.1))
+
+    # Grid for both major and minor
+    ax.grid(True, which="major")
+    ax.grid(True, which="minor", alpha=0.35)
+
     plt.tight_layout()
     plt.savefig("mnist_sweep.png", dpi=300)
 

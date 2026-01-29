@@ -3,6 +3,7 @@
 # ============================================================
 
 import jax.numpy as jnp
+import jax.lax as lax
 
 
 def svd_spectral_penalty(z):
@@ -81,7 +82,37 @@ def linear_barrier(R_eff, eps=1e-10):
     return R_eff + (1 / (R_eff - 1 + eps))
 
 
-# Placeholder for future HSIC experiments
-def hsic_penalty(x, z, sigma=1.0):
-    # You can implement the kernel logic here later
-    return 0.0
+def center_gram(K: jnp.ndarray) -> jnp.ndarray:
+    mean_row = jnp.mean(K, axis=0, keepdims=True)
+    mean_col = jnp.mean(K, axis=1, keepdims=True)
+    mean_all = jnp.mean(K)
+    return K - mean_row - mean_col + mean_all
+
+
+def rbf_gram(X: jnp.ndarray, sigma2: jnp.ndarray | None = None) -> jnp.ndarray:
+    x2 = jnp.sum(X * X, axis=1, keepdims=True)
+    d2 = x2 + x2.T - 2.0 * (X @ X.T)
+    d2 = jnp.maximum(d2, 0.0)
+
+    if sigma2 is None:
+        B = X.shape[0]
+        iu = jnp.triu_indices(B, k=1)
+        med = jnp.median(lax.stop_gradient(d2[iu]))
+        sigma2 = med + 1e-6
+
+    return jnp.exp(-d2 / (2.0 * sigma2))
+
+
+def hsic_rbf(z1: jnp.ndarray, z2: jnp.ndarray) -> jnp.ndarray:
+    z1 = z1.reshape((z1.shape[0], -1))
+    z2 = z2.reshape((z2.shape[0], -1))
+
+    # standardize per-dim for kernel stability
+    z1 = (z1 - z1.mean(axis=0, keepdims=True)) / (z1.std(axis=0, keepdims=True) + 1e-6)
+    z2 = (z2 - z2.mean(axis=0, keepdims=True)) / (z2.std(axis=0, keepdims=True) + 1e-6)
+
+    K = center_gram(rbf_gram(z1))
+    L = center_gram(rbf_gram(z2))
+
+    n = z1.shape[0]
+    return jnp.sum(K * L) / ((n - 1.0) ** 2)

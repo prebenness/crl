@@ -7,7 +7,6 @@ import numpy as np
 
 import jax.numpy as jnp
 from jax import random as jrandom
-from jax.scipy.special import logsumexp
 
 
 import flax.linen as nn
