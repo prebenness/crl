@@ -5,3 +5,4 @@ cfg.env
 .vscode
 data/
 wandb/
+.claude/
