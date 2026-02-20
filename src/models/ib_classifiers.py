@@ -107,8 +107,8 @@ class ULAMLPVarClassifier(nn.Module):
         # uLA: 3 hidden layers, 100 neurons each
         x = nn.Dense(100)(x); x = nn.relu(x)
         
-        mu = nn.Dense(50)(x); mu = nn.relu(mu)
-        logvar = nn.Dense(50)(x); logvar = nn.relu(logvar) 
+        mu = nn.Dense(50)(x)
+        logvar = nn.Dense(50)(x)
         logvar = jnp.clip(logvar, self.min_logvar, self.max_logvar)
 
         # --- Variational "bottleneck": q(z|x) = N(mu, diag(var)) ---
