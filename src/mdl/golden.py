@@ -241,110 +241,118 @@ def golden_forward(params: dict, x: jnp.ndarray) -> jnp.ndarray:
 # MDL hypothesis codelength
 # ---------------------------------------------------------------------------
 
-def _collect_nonzero_rational_weights(p: float = 0.3) -> list[Fraction]:
-    """Collect all non-zero weights from the golden network as exact Fractions.
+def _collect_all_rational_weights(p: float = 0.3) -> list[Fraction]:
+    """Collect ALL weights from the golden network as exact Fractions.
 
-    We reconstruct the exact rational values rather than converting from
-    float, since the golden network weights are defined by exact formulas.
+    Returns a list of Fraction values for every weight/bias entry, in the
+    same order as the LSTM parameter packing in lstm.py (W_ii, W_if, W_ig,
+    W_io, W_hi, W_hf, W_hg, W_ho, b_ii, b_if, b_ig, b_io, b_hi, b_hf,
+    b_hg, b_ho, W_out, b_out).  Zero weights are included so that the
+    MDL codelength accounts for encoding every parameter, matching the
+    Lan et al. (2024) scheme where each weight is encoded sequentially.
+
+    Transcendental output-layer weights (involving log and tanh) are
+    converted to the closest rational with denominator <= 1000, matching
+    the Lan et al. convention (Section 3.2, footnote 3).
 
     Returns:
-        List of Fraction values for every non-zero weight/bias entry.
+        List of 108 Fraction values (one per parameter).
     """
-    L = LARGE  # 127, integer
+    I, H, O = INPUT_SIZE, HIDDEN_SIZE, OUTPUT_SIZE  # 3, 3, 3
+    L = LARGE  # 127
+    ZERO = Fraction(0)
 
-    nonzero = []
+    # Helper: flatten a 2D list of Fractions in row-major order
+    def flat(matrix):
+        return [v for row in matrix for v in row]
 
-    # --- LSTM weights ---
-    # W_ig (code convention, shape I=3 x H=3):
-    #   Wig_paper.T = LARGE * [[1, 1, 0], [0, 0, 1], [0, 0, -1]]
-    # Non-zero entries: LARGE at positions (0,0), (0,1), (1,2), and -LARGE at (2,2)
-    nonzero.extend([Fraction(L), Fraction(L), Fraction(L), Fraction(-L)])
+    # --- LSTM input weights (code convention: shape I x H) ---
+    # W_ii: all zeros (I=3 x H=3 = 9 entries)
+    W_ii = [[ZERO]*H for _ in range(I)]
 
-    # b_ii: LARGE * [1, 1, 1] -- 3 entries
-    nonzero.extend([Fraction(L)] * 3)
+    # W_if: all zeros
+    W_if = [[ZERO]*H for _ in range(I)]
 
-    # b_if: LARGE * [1, 1, 1] -- 3 entries
-    nonzero.extend([Fraction(L)] * 3)
-
-    # W_io (code convention, shape I=3 x H=3):
-    #   LARGE * [[2, 0, 0], [0, 2, 0], [0, 0, 2]]
-    # Non-zero entries: 2*LARGE on diagonal -- 3 entries
-    nonzero.extend([Fraction(2 * L)] * 3)
-
-    # b_io: LARGE * [-1, -1, -1] -- 3 entries
-    nonzero.extend([Fraction(-L)] * 3)
-
-    # --- Output layer ---
-    # These are computed from the target probability table.
-    # We compute them as exact Fractions.
-    epsilon = Fraction(1, 2**14 - 1)
-    p_frac = Fraction(p).limit_denominator(1000)  # p = 0.3 = 3/10 exactly
-
-    # Target probability table rows
-    targets = [
-        [p_frac, 1 - p_frac, Fraction(0)],     # start (#)
-        [Fraction(0), 1 - p_frac, p_frac],      # a phase
-        [Fraction(0), Fraction(0), Fraction(1)], # b phase (not last)
-        [Fraction(1), Fraction(0), Fraction(0)], # last b (balanced)
+    # W_ig: Wig_paper.T where Wig_paper = LARGE * [[1,0,0],[1,0,0],[0,1,-1]]
+    #   Wig_paper.T (I=3 x H=3) = LARGE * [[1, 1, 0], [0, 0, 1], [0, 0, -1]]
+    W_ig = [
+        [Fraction(L), Fraction(L), ZERO],
+        [ZERO, ZERO, Fraction(L)],
+        [ZERO, ZERO, Fraction(-L)],
     ]
 
-    # Wlog = ln(targets + epsilon)
-    # But ln of a rational is irrational -- we need the actual float values
-    # converted back to the closest rational for MDL coding.
-    #
-    # The MDL coding scheme encodes each weight as a rational number.
-    # For the golden network, the output layer weights are defined by:
-    #   Wlog[i,j] = ln(targets[i,j] + epsilon)
-    #   W_out[h,o] = (Wlog[h,o] - Wlog[3,o]) / tanh(1)    for h in {0,1,2}
-    #   b_out[o] = Wlog[3,o]
-    #
-    # These are transcendental numbers. We approximate them as rationals
-    # using high-precision Fraction conversion from the float values.
+    # W_io: Wio_paper.T = LARGE * diag(2,2,2) (symmetric)
+    W_io = [
+        [Fraction(2*L), ZERO, ZERO],
+        [ZERO, Fraction(2*L), ZERO],
+        [ZERO, ZERO, Fraction(2*L)],
+    ]
 
+    # --- LSTM hidden weights (H x H) ---
+    W_hi = [[ZERO]*H for _ in range(H)]
+    W_hf = [[ZERO]*H for _ in range(H)]
+    W_hg = [[ZERO]*H for _ in range(H)]
+    W_ho = [[ZERO]*H for _ in range(H)]
+
+    # --- LSTM biases (H,) ---
+    b_ii = [Fraction(L)] * H
+    b_if = [Fraction(L)] * H
+    b_ig = [ZERO] * H
+    b_io = [Fraction(-L)] * H
+    b_hi = [ZERO] * H
+    b_hf = [ZERO] * H
+    b_hg = [ZERO] * H
+    b_ho = [ZERO] * H
+
+    # --- Output layer ---
+    # Transcendental weights: use limit_denominator(1000) per Lan et al.
+    epsilon_float = 1.0 / (2**14 - 1)
     tanh_1 = math.tanh(1.0)
-    eps_float = float(epsilon)
 
-    # Compute Wlog as floats, then convert to Fractions
-    Wlog = []
-    for row in targets:
-        Wlog_row = []
-        for val in row:
-            Wlog_row.append(math.log(float(val) + eps_float))
-        Wlog.append(Wlog_row)
-
-    bout_floats = Wlog[3]
-    bout_fracs = [Fraction(v).limit_denominator(10**12) for v in bout_floats]
+    targets = [
+        [p,   1 - p, 0.0],
+        [0.0, 1 - p, p  ],
+        [0.0, 0.0,   1.0],
+        [1.0, 0.0,   0.0],
+    ]
+    Wlog = [[math.log(v + epsilon_float) for v in row] for row in targets]
 
     # W_out (code convention H=3 x O=3):
     # W_out[h, o] = (Wlog[h, o] - Wlog[3, o]) / tanh(1)
-    Wout_fracs = []
-    for h in range(3):
-        for o in range(3):
+    W_out = []
+    for h in range(H):
+        row = []
+        for o in range(O):
             val = (Wlog[h][o] - Wlog[3][o]) / tanh_1
-            Wout_fracs.append(Fraction(val).limit_denominator(10**12))
+            row.append(Fraction(val).limit_denominator(1000))
+        W_out.append(row)
 
-    # Collect non-zero output weights
-    for f in Wout_fracs:
-        if f != 0:
-            nonzero.append(f)
+    # b_out[o] = Wlog[3, o]
+    b_out = [Fraction(v).limit_denominator(1000) for v in Wlog[3]]
 
-    # Collect non-zero output biases
-    for f in bout_fracs:
-        if f != 0:
-            nonzero.append(f)
+    # --- Pack in the same order as lstm.py ---
+    all_weights = (
+        flat(W_ii) + flat(W_if) + flat(W_ig) + flat(W_io) +  # input weights
+        flat(W_hi) + flat(W_hf) + flat(W_hg) + flat(W_ho) +  # hidden weights
+        b_ii + b_if + b_ig + b_io +                           # input biases
+        b_hi + b_hf + b_hg + b_ho +                           # hidden biases
+        flat(W_out) + b_out                                    # output layer
+    )
 
-    return nonzero
+    assert len(all_weights) == 4*I*H + 4*H*H + 4*H + 4*H + H*O + O  # 108
+    return all_weights
 
 
 def golden_mdl_score(p: float = 0.3) -> dict:
     """Compute the hypothesis codelength |H| of the golden network.
 
     Uses the coding scheme from coding.py:
-        |H| = |E(hidden_size)| + sum_{w != 0} l(w)
+        |H| = |E(hidden_size)| + sum_i l(w_i)
 
-    where l(w) = 1 + |E(numerator)| + |E(denominator)| for each non-zero
-    rational weight w = +/- n/m, and |E(hidden_size)| encodes the
-    architecture prefix (hidden dimension).
+    where the sum runs over ALL K weights (including zeros), and
+    l(w) = 1 + |E(numerator)| + |E(denominator)| for a weight
+    w = +/- n/m.  This matches Lan et al. (2024), who encode every
+    weight sequentially in their network encoding scheme.
 
     Args:
         p: PCFG termination probability (default 0.3)
@@ -355,21 +363,24 @@ def golden_mdl_score(p: float = 0.3) -> dict:
             arch_bits: architecture encoding bits
             weight_bits: total weight encoding bits
             n_nonzero: number of non-zero weights
-            weights: list of (Fraction, bits) for each non-zero weight
+            weights: list of (Fraction, bits) for each weight
     """
     # Architecture prefix: encode hidden_size
     arch_bits = integer_code_length(HIDDEN_SIZE)
 
-    # Collect all non-zero weights as Fractions
-    nonzero_weights = _collect_nonzero_rational_weights(p)
+    # Collect ALL weights as Fractions (including zeros)
+    all_weights = _collect_all_rational_weights(p)
 
     # Compute per-weight codelengths
     weight_details = []
     total_weight_bits = 0
-    for w in nonzero_weights:
+    n_nonzero = 0
+    for w in all_weights:
         bits = rational_codelength(w)
         weight_details.append((w, bits))
         total_weight_bits += bits
+        if w != 0:
+            n_nonzero += 1
 
     total_bits = arch_bits + total_weight_bits
 
@@ -377,7 +388,7 @@ def golden_mdl_score(p: float = 0.3) -> dict:
         "total_bits": total_bits,
         "arch_bits": arch_bits,
         "weight_bits": total_weight_bits,
-        "n_nonzero": len(nonzero_weights),
+        "n_nonzero": n_nonzero,
         "weights": weight_details,
     }
 

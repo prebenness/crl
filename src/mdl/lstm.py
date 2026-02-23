@@ -35,56 +35,28 @@ class GumbelSoftmaxLSTM(nn.Module):
     grid_values: Any  # (M,) array
     grid_codelengths: Any  # (M,) array
 
-    def _sample_weights(self, logits, tau, rng):
-        """Gumbel-Softmax ST: hard one-hot in forward, soft in backward.
-
-        Args:
-            logits: (..., M) unnormalized log-probabilities
-            tau: temperature (= 1/beta)
-            rng: PRNG key
-
-        Returns:
-            weights: (...) discrete weight values from grid
-            probs: (..., M) softmax probabilities (for computing expected codelength)
-        """
-        M = logits.shape[-1]
-
-        # Gumbel noise
-        gumbel_noise = jrandom.gumbel(rng, shape=logits.shape)
-        perturbed = (logits + gumbel_noise) / tau
-
-        # Soft probabilities
-        y_soft = jax.nn.softmax(perturbed, axis=-1)
-
-        # Hard one-hot (straight-through)
-        idx = jnp.argmax(y_soft, axis=-1)
-        y_hard = jax.nn.one_hot(idx, M)
-
-        # ST trick: hard in forward, soft gradients in backward
-        y_st = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
-
-        # Map to grid values
-        grid = jnp.asarray(self.grid_values)
-        weights = jnp.sum(y_st * grid[None, :], axis=-1) if y_st.ndim == 2 else jnp.dot(y_st, grid)
-
-        # Probabilities for codelength computation (no Gumbel, just softmax of logits)
-        probs = jax.nn.softmax(logits, axis=-1)
-
-        return weights, probs
-
     @nn.compact
-    def __call__(self, x, tau, train=True, rng=None):
+    def __call__(self, x, tau, train=True, rng=None, soft_forward=False):
         """Forward pass through the categorical LSTM.
+
+        Three forward modes:
+            train=True, soft_forward=True:  continuous relaxation (no Gumbel noise)
+                weight_i = sum_m softmax(logits_i / tau)_m * grid_m
+                Exact gradients, zero variance. Used during warmup phase.
+            train=True, soft_forward=False: Gumbel-Softmax straight-through
+                Discrete samples in forward, soft gradients in backward.
+            train=False: deterministic argmax (evaluation)
 
         Args:
             x: int32 (batch, seq_len) input token indices
             tau: Gumbel-Softmax temperature
-            train: whether to use stochastic sampling
-            rng: PRNG key for Gumbel noise
+            train: whether in training mode
+            rng: PRNG key for Gumbel noise (only needed when train=True, soft_forward=False)
+            soft_forward: if True, use continuous relaxation instead of ST
 
         Returns:
             logits: float32 (batch, seq_len, output_size) output logits
-            aux: dict with 'expected_codelength' and 'probs_dict'
+            aux: dict with 'expected_codelength', 'all_probs', etc.
         """
         B, T = x.shape
         H = self.hidden_size
@@ -92,37 +64,31 @@ class GumbelSoftmaxLSTM(nn.Module):
         M = len(self.grid_values)
 
         # --- Define all logit parameters ---
-        # LSTM has 4 gates (i, f, g, o), each with input and hidden weights + biases
-        # W_ii, W_if, W_ig, W_io: (input_size, hidden_size) each
-        # W_hi, W_hf, W_hg, W_ho: (hidden_size, hidden_size) each
-        # b_ii, b_if, b_ig, b_io: (hidden_size,) each
-        # b_hi, b_hf, b_hg, b_ho: (hidden_size,) each
-        # Output layer: W_out (hidden_size, output_size), b_out (output_size,)
-
-        # Total parameters:
-        # Input weights: 4 * I * H
-        # Hidden weights: 4 * H * H
-        # Input biases: 4 * H
-        # Hidden biases: 4 * H
-        # Output weights: H * O
-        # Output bias: O
         n_lstm_w = 4 * I * H + 4 * H * H
         n_lstm_b = 4 * H + 4 * H
         n_out_w = H * self.output_size
         n_out_b = self.output_size
         n_total = n_lstm_w + n_lstm_b + n_out_w + n_out_b
 
-        # Single logit array for all parameters
+        # Single logit array for all parameters.
+        # Random initialization breaks the symmetry that traps the all-zero
+        # LSTM at a saddle point (h=0 always, gradient of data term = 0).
         all_logits = self.param(
             "logits",
-            nn.initializers.zeros_init(),
+            nn.initializers.normal(stddev=0.1),
             (n_total, M),
         )
 
-        if train and rng is not None:
-            # Split RNG for each parameter
+        grid = jnp.asarray(self.grid_values)
+
+        if train and soft_forward:
+            # Continuous relaxation: weight = E[grid | softmax(logits/tau)]
+            y_soft = jax.nn.softmax(all_logits / tau, axis=-1)  # (n_total, M)
+            all_weights = jnp.sum(y_soft * grid[None, :], axis=-1)  # (n_total,)
+        elif train and rng is not None:
+            # Gumbel-Softmax straight-through
             keys = jrandom.split(rng, n_total)
-            # Vectorized Gumbel-Softmax over all parameters
+
             def sample_one(logit_row, key):
                 gumbel_noise = jrandom.gumbel(key, shape=(M,))
                 perturbed = (logit_row + gumbel_noise) / tau
@@ -130,14 +96,12 @@ class GumbelSoftmaxLSTM(nn.Module):
                 idx = jnp.argmax(y_soft, axis=-1)
                 y_hard = jax.nn.one_hot(idx, M)
                 y_st = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
-                grid = jnp.asarray(self.grid_values)
                 w = jnp.dot(y_st, grid)
                 return w
 
             all_weights = jax.vmap(sample_one)(all_logits, keys)
         else:
             # Deterministic: pick argmax
-            grid = jnp.asarray(self.grid_values)
             idx = jnp.argmax(all_logits, axis=-1)
             all_weights = grid[idx]
 

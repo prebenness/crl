@@ -45,7 +45,36 @@ def create_mdl_state(rng, model, seq_len, batch_size, lr, tau_init):
     )
 
 
-def make_loss_fn(mdl_lambda: float):
+def _compute_hyp_and_entropy(model_aux, tau):
+    """Compute hypothesis codelength and entropy terms from model aux outputs.
+
+    These terms depend only on the categorical logits (not Gumbel noise),
+    so they are computed once regardless of n_samples.
+    """
+    expected_hyp_codelength = model_aux["expected_codelength"]
+
+    all_probs = model_aux["all_probs"]  # (n_params, M)
+    log_probs = jnp.log2(all_probs + 1e-10)
+    entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
+    total_entropy = jnp.sum(entropy_per_param)
+
+    # beta = 1/tau, so 1/beta = tau
+    entropy_bonus = tau * total_entropy
+
+    return expected_hyp_codelength, total_entropy, entropy_bonus
+
+
+def _compute_data_codelength(logits, y, mask):
+    """Compute data codelength (cross-entropy in bits) for one forward pass."""
+    ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    ce_bits = ce_nats / jnp.log(2.0)
+    data_codelength = jnp.sum(ce_bits * mask)
+    ce_per_token = jnp.sum(ce_nats * mask) / jnp.sum(mask)
+    return data_codelength, ce_per_token
+
+
+def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
+                 soft_forward: bool = False):
     """Create the MDL loss function.
 
     The loss combines:
@@ -53,59 +82,68 @@ def make_loss_fn(mdl_lambda: float):
     2. Hypothesis term: expected codelength of weights under categorical dist
     3. Entropy bonus: -(1/beta) * H(pi) to encourage exploration
 
+    When n_samples > 1, the data term is averaged over multiple independent
+    Gumbel-Softmax samples to reduce gradient variance.
+
+    When soft_forward=True, uses continuous relaxation (no Gumbel noise)
+    for zero-variance gradients during warmup phase.
+
     Args:
         mdl_lambda: trade-off parameter for hypothesis codelength
+        n_train: total number of training sequences (for batch scaling)
+        n_samples: number of Gumbel samples to average data term over
+        soft_forward: if True, use continuous relaxation (no Gumbel)
     """
     mdl_lambda = float(mdl_lambda)
+    n_train = float(max(n_train, 1))
 
     def loss_fn(params, apply_fn, x, y, mask, tau, rng):
-        """Compute the relaxed MDL objective.
+        B = x.shape[0]
+        batch_scale = B / n_train
 
-        Args:
-            params: model parameters (the logits)
-            apply_fn: model.apply function
-            x: (B, T) input tokens
-            y: (B, T) target tokens
-            mask: (B, T) valid position mask
-            tau: Gumbel-Softmax temperature
-            rng: PRNG key
+        if soft_forward:
+            # Single forward pass with continuous relaxation
+            logits, model_aux = apply_fn(
+                {"params": params}, x, tau=tau, train=True, rng=rng,
+                soft_forward=True,
+            )
+            data_codelength, ce_per_token = _compute_data_codelength(
+                logits, y, mask,
+            )
+        elif n_samples > 1:
+            # Multi-sample: average data_cl over K Gumbel-Softmax passes
+            keys = jrandom.split(rng, n_samples)
 
-        Returns:
-            loss: scalar
-            aux: dict with component losses
-        """
-        logits, model_aux = apply_fn(
-            {"params": params}, x, tau=tau, train=True, rng=rng,
-        )
+            def single_sample(key):
+                logits_k, _ = apply_fn(
+                    {"params": params}, x, tau=tau, train=True, rng=key,
+                )
+                return _compute_data_codelength(logits_k, y, mask)
 
-        # --- Data codelength: cross-entropy in bits ---
-        # logits: (B, T, num_symbols), y: (B, T)
-        ce_nats = optax.softmax_cross_entropy_with_integer_labels(
-            logits, y
-        )  # (B, T)
-        # Mask out padding and convert to bits
-        ce_bits = ce_nats / jnp.log(2.0)
-        # Sum over valid positions (total codelength for the dataset)
-        data_codelength = jnp.sum(ce_bits * mask)
+            data_cls, ce_per_tokens = jax.vmap(single_sample)(keys)
+            data_codelength = jnp.mean(data_cls)
+            ce_per_token = jnp.mean(ce_per_tokens)
 
-        # --- Hypothesis codelength: computed exactly in expectation ---
-        # E[sum_i l(theta_i)] = sum_i sum_m pi_{i,m} * l(s_m)
-        expected_hyp_codelength = model_aux["expected_codelength"]
+            # Get model_aux from a single pass (identical for all samples)
+            _, model_aux = apply_fn(
+                {"params": params}, x, tau=tau, train=True, rng=keys[0],
+            )
+        else:
+            # Single Gumbel-Softmax sample
+            logits, model_aux = apply_fn(
+                {"params": params}, x, tau=tau, train=True, rng=rng,
+            )
+            data_codelength, ce_per_token = _compute_data_codelength(
+                logits, y, mask,
+            )
 
-        # --- Entropy bonus ---
-        all_probs = model_aux["all_probs"]  # (n_params, M)
-        # H(pi_i) = -sum_m pi_{i,m} log2(pi_{i,m})
-        log_probs = jnp.log2(all_probs + 1e-10)
-        entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
-        total_entropy = jnp.sum(entropy_per_param)
+        # Hypothesis and entropy (exact, independent of Gumbel noise)
+        expected_hyp_codelength, total_entropy, entropy_bonus = \
+            _compute_hyp_and_entropy(model_aux, tau)
 
-        # beta = 1/tau, so 1/beta = tau
-        entropy_bonus = tau * total_entropy
-
-        # --- Total relaxed MDL objective ---
-        # J_beta = E[L_D] + lambda * E[sum l(theta_i)] - (1/beta) * H
-        mdl_loss = data_codelength + mdl_lambda * expected_hyp_codelength
-        total_loss = mdl_loss - entropy_bonus
+        # Total relaxed MDL objective with batch scaling
+        mdl_loss = data_codelength + mdl_lambda * batch_scale * expected_hyp_codelength
+        total_loss = mdl_loss - batch_scale * entropy_bonus
 
         aux = {
             "data_codelength": data_codelength,
@@ -113,16 +151,27 @@ def make_loss_fn(mdl_lambda: float):
             "entropy": total_entropy,
             "entropy_bonus": entropy_bonus,
             "mdl_total": mdl_loss,
-            "ce_per_token": jnp.sum(ce_nats * mask) / jnp.sum(mask),
+            "ce_per_token": ce_per_token,
         }
         return total_loss, aux
 
     return loss_fn
 
 
-def make_train_step(mdl_lambda: float):
-    """Create a JIT-compiled training step."""
-    loss_fn = make_loss_fn(mdl_lambda)
+def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
+                    soft_forward: bool = False):
+    """Create a JIT-compiled training step.
+
+    Args:
+        mdl_lambda: MDL trade-off parameter
+        n_train: total training sequences (for batch scaling)
+        n_samples: Gumbel samples for variance reduction (ST phase)
+        soft_forward: use continuous relaxation (warmup phase)
+    """
+    loss_fn = make_loss_fn(
+        mdl_lambda, n_train=n_train, n_samples=n_samples,
+        soft_forward=soft_forward,
+    )
 
     @jax.jit
     def train_step(state, x, y, mask, rng):
@@ -252,9 +301,21 @@ def evaluate_deterministic_accuracy(
     else:
         first_fail = None
 
+    n_perfect = int(jnp.sum(accs_arr > 1.0 - 1e-6))
+
+    # gen_n: largest n such that all strings 1..n have 100% accuracy
+    if all_correct:
+        gen_n = len(test_inputs)
+    elif first_fail is not None:
+        gen_n = first_fail - 1
+    else:
+        gen_n = 0
+
     return {
         "mean_accuracy": float(mean_acc),
         "all_correct": all_correct,
         "first_failure_n": first_fail,
         "per_string_acc": accs_arr,
+        "n_perfect": n_perfect,
+        "gen_n": gen_n,
     }

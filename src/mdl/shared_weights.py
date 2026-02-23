@@ -185,7 +185,17 @@ def create_shared_mdl_state(
 # Loss function
 # ---------------------------------------------------------------------------
 
-def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6):
+def _shared_compute_data_codelength(logits, y, mask):
+    """Compute data codelength (cross-entropy in bits) for one forward pass."""
+    ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    ce_bits = ce_nats / jnp.log(2.0)
+    data_codelength = jnp.sum(ce_bits * mask)
+    ce_per_token = jnp.sum(ce_nats * mask) / jnp.sum(mask)
+    return data_codelength, ce_per_token
+
+
+def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
+                        n_samples=1, soft_forward=False):
     """Create the shared-weight MDL loss function (Section 8.1).
 
     The composite objective is:
@@ -201,73 +211,80 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6):
         lambda1: weight for the per-weight KL term (weight sharing).
         lambda2: weight for the dictionary cost KL term.
         epsilon: minimum probability for each grid element in phi.
-
-    Returns:
-        loss_fn: callable with signature
-            loss_fn(params, apply_fn, x, y, mask, tau, rng, p_base)
-            -> (loss, aux_dict)
+        n_train: total number of training sequences (for batch scaling).
+        n_samples: number of Gumbel samples for variance reduction.
+        soft_forward: if True, use continuous relaxation (no Gumbel).
     """
     lambda1 = float(lambda1)
     lambda2 = float(lambda2)
     epsilon = float(epsilon)
+    n_train = float(max(n_train, 1))
 
     def loss_fn(params, apply_fn, x, y, mask, tau, rng, p_base):
-        """Compute the shared-weight MDL objective.
-
-        Args:
-            params: dict with "logits" (n_params, M) and "phi_logits" (M,).
-            apply_fn: model.apply function.
-            x: int32 (B, T) input tokens.
-            y: int32 (B, T) target tokens.
-            mask: float32 (B, T) valid-position mask.
-            tau: Gumbel-Softmax temperature (= 1/beta).
-            rng: PRNG key.
-            p_base: float32 (M,) fixed hyper-prior.
-
-        Returns:
-            loss: scalar, total composite loss.
-            aux: dict with all component losses for logging.
-        """
-        # The model expects params with just the "logits" key.
         model_params = {"logits": params["logits"]}
 
-        logits, model_aux = apply_fn(
-            {"params": model_params}, x, tau=tau, train=True, rng=rng,
-        )
+        if soft_forward:
+            logits, model_aux = apply_fn(
+                {"params": model_params}, x, tau=tau, train=True, rng=rng,
+                soft_forward=True,
+            )
+            data_codelength, ce_per_token = _shared_compute_data_codelength(
+                logits, y, mask,
+            )
+        elif n_samples > 1:
+            keys = jrandom.split(rng, n_samples)
 
-        # ----- 1. Data codelength: cross-entropy in bits -----
-        ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
-        ce_bits = ce_nats / jnp.log(2.0)
-        data_codelength = jnp.sum(ce_bits * mask)
+            def single_sample(key):
+                logits_k, _ = apply_fn(
+                    {"params": model_params}, x, tau=tau, train=True, rng=key,
+                )
+                return _shared_compute_data_codelength(logits_k, y, mask)
 
-        # ----- 2. Per-weight distributions -----
+            data_cls, ce_per_tokens = jax.vmap(single_sample)(keys)
+            data_codelength = jnp.mean(data_cls)
+            ce_per_token = jnp.mean(ce_per_tokens)
+
+            _, model_aux = apply_fn(
+                {"params": model_params}, x, tau=tau, train=True, rng=keys[0],
+            )
+        else:
+            logits, model_aux = apply_fn(
+                {"params": model_params}, x, tau=tau, train=True, rng=rng,
+            )
+            data_codelength, ce_per_token = _shared_compute_data_codelength(
+                logits, y, mask,
+            )
+
+        # Per-weight distributions
         all_probs = model_aux["all_probs"]  # (n_params, M)
 
-        # ----- 3. Shared adaptive prior (epsilon-bounded) -----
+        # Shared adaptive prior (epsilon-bounded)
         phi = epsilon_bound_simplex(params["phi_logits"], epsilon)  # (M,)
 
-        # ----- 4. KL(pi_i || phi) for each weight, summed -----
-        # all_probs: (n_params, M), phi: (M,) broadcast over weights
-        kl_per_weight = _kl_divergence(all_probs, phi[None, :])  # (n_params,)
+        # KL(pi_i || phi) for each weight, summed
+        kl_per_weight = _kl_divergence(all_probs, phi[None, :])
         kl_weight_sharing = jnp.sum(kl_per_weight)
 
-        # ----- 5. KL(phi || P_base) -----
+        # KL(phi || P_base)
         p_base = jnp.asarray(p_base)
-        kl_dictionary = _kl_divergence(phi, p_base)  # scalar
+        kl_dictionary = _kl_divergence(phi, p_base)
 
-        # ----- 6. Entropy bonus -----
+        # Entropy bonus
         log_probs = jnp.log2(all_probs + 1e-10)
         entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
         total_entropy = jnp.sum(entropy_per_param)
-        # beta = 1/tau, so 1/beta = tau
         entropy_bonus = tau * total_entropy
 
-        # ----- 7. Composite objective -----
+        # Batch scaling
+        B = x.shape[0]
+        batch_scale = B / n_train
+
+        # Composite objective
         total_loss = (
             data_codelength
-            + lambda1 * kl_weight_sharing
-            + lambda2 * kl_dictionary
-            - entropy_bonus
+            + batch_scale * lambda1 * kl_weight_sharing
+            + batch_scale * lambda2 * kl_dictionary
+            - batch_scale * entropy_bonus
         )
 
         aux = {
@@ -277,16 +294,13 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6):
             "entropy": total_entropy,
             "entropy_bonus": entropy_bonus,
             "total_loss": total_loss,
-            # Keep these for compatibility with the existing training loop
-            # which logs "hyp_codelength" and "mdl_total".
             "hyp_codelength": lambda1 * kl_weight_sharing + lambda2 * kl_dictionary,
             "mdl_total": (
                 data_codelength
-                + lambda1 * kl_weight_sharing
-                + lambda2 * kl_dictionary
+                + batch_scale * lambda1 * kl_weight_sharing
+                + batch_scale * lambda2 * kl_dictionary
             ),
-            "ce_per_token": jnp.sum(ce_nats * mask) / jnp.sum(mask),
-            # Phi diagnostics
+            "ce_per_token": ce_per_token,
             "phi_min": jnp.min(phi),
             "phi_max": jnp.max(phi),
             "phi_entropy": -jnp.sum(phi * jnp.log2(phi + 1e-10)),
@@ -300,40 +314,25 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6):
 # Training step
 # ---------------------------------------------------------------------------
 
-def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6):
+def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
+                           n_samples=1, soft_forward=False):
     """Create a JIT-compiled training step for the shared-weight objective.
-
-    Both the per-weight logits (alpha) and the shared prior logits
-    (phi_logits) are optimized jointly via the same Adam optimizer.
 
     Args:
         lambda1: weight for the per-weight KL term.
         lambda2: weight for the dictionary cost KL term.
         epsilon: minimum probability for phi.
-
-    Returns:
-        train_step: JIT-compiled function with signature
-            train_step(state, x, y, mask, rng, p_base) -> (state, loss, aux)
+        n_train: total number of training sequences (for batch scaling).
+        n_samples: Gumbel samples for variance reduction.
+        soft_forward: use continuous relaxation (warmup phase).
     """
-    loss_fn = make_shared_loss_fn(lambda1, lambda2, epsilon)
+    loss_fn = make_shared_loss_fn(
+        lambda1, lambda2, epsilon, n_train=n_train,
+        n_samples=n_samples, soft_forward=soft_forward,
+    )
 
     @jax.jit
     def train_step(state, x, y, mask, rng, p_base):
-        """Single gradient-descent step.
-
-        Args:
-            state: SharedMDLTrainState.
-            x: int32 (B, T) input tokens.
-            y: int32 (B, T) target tokens.
-            mask: float32 (B, T) valid-position mask.
-            rng: PRNG key.
-            p_base: float32 (M,) fixed hyper-prior.
-
-        Returns:
-            state: updated SharedMDLTrainState.
-            loss: scalar loss value.
-            aux: dict with component losses.
-        """
         def _loss(params):
             return loss_fn(
                 params, state.apply_fn, x, y, mask, state.tau, rng, p_base,
