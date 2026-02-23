@@ -6,3 +6,4 @@ cfg.env
 data/
 wandb/
 .claude/
+.pytest_cache/
