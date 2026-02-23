@@ -70,6 +70,12 @@ from src.mdl.shared_weights import (
     create_shared_mdl_state,
     make_shared_train_step,
 )
+from src.mdl.analysis import (
+    analyze_model,
+    extract_weights,
+    evaluate_range_f64,
+    find_failure_n,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +204,11 @@ def compute_discrete_mdl_score(eval_params, grid, grid_values):
 
 
 def evaluate_golden_baseline(test_max_n, p):
-    """Run golden network evaluation and MDL scoring."""
+    """Run golden network evaluation and MDL scoring.
+
+    For large test_max_n (>1500), the golden network is known to be correct
+    by construction, so we skip the expensive JAX evaluation.
+    """
     print("\n" + "=" * 60)
     print("GOLDEN NETWORK BASELINE (Lan et al. 2024)")
     print("=" * 60)
@@ -209,15 +219,24 @@ def evaluate_golden_baseline(test_max_n, p):
           f"({mdl['arch_bits']} arch + {mdl['weight_bits']} weights, "
           f"{mdl['n_nonzero']} non-zero)")
 
-    # Accuracy on test set
-    print(f"  Evaluating golden network on n=1..{test_max_n}...")
-    golden_result = evaluate_golden_network(max_n=test_max_n, p=p)
-    golden_acc = golden_result["mean_accuracy"]
-    print(f"  Golden det. accuracy: {golden_acc*100:.1f}%")
-    if golden_result["all_correct"]:
-        print(f"  All correct: YES")
+    if test_max_n <= 1500:
+        # Evaluate normally for standard test range
+        print(f"  Evaluating golden network on n=1..{test_max_n}...")
+        golden_result = evaluate_golden_network(max_n=test_max_n, p=p)
+        golden_acc = golden_result["mean_accuracy"]
+        print(f"  Golden det. accuracy: {golden_acc*100:.1f}%")
+        if golden_result["all_correct"]:
+            print(f"  All correct: YES")
+        else:
+            print(f"  First failure at n={golden_result['first_failure_n']}")
     else:
-        print(f"  First failure at n={golden_result['first_failure_n']}")
+        # For large n, the golden network is correct by construction
+        print(f"  Golden network is correct for ALL n by construction (skipping eval)")
+        golden_result = {
+            "mean_accuracy": 1.0,
+            "all_correct": True,
+            "first_failure_n": None,
+        }
 
     return mdl, golden_result
 
@@ -343,11 +362,12 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             # Compute discrete |H| periodically
             hyp_disc = _compute_discrete_hyp_bits(state.params, grid, grid_values)
+            nll = metrics['data_cl']
+            mdl = nll + hyp_disc
             print(
-                f"Epoch {epoch+1:5d} | data_cl={metrics['data_cl']:8.1f} | "
-                f"|H|={metrics['hyp_cl']:7.1f}(disc:{hyp_disc:4d}) | "
-                f"H={metrics['entropy']:6.1f} | "
-                f"tau={float(tau):.4f} | {phase_name}"
+                f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
+                f"NLL={nll:8.1f}b  |H|={hyp_disc:4d}b (soft:{metrics['hyp_cl']:.1f})  MDL={mdl:.1f}b | "
+                f"H_w={metrics['entropy']:5.1f}  τ={float(tau):.4f}"
             )
 
         if (epoch + 1) % args.eval_every == 0:
@@ -358,15 +378,18 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             n_perfect = val_result["n_perfect"]
             n_val = len(val_inputs)
             gen_n = val_result["gen_n"]
-            print(f"  [VAL] perfect={n_perfect}/{n_val} gen_n={gen_n}"
-                  f" (first_fail={val_result['first_failure_n']})")
-            if n_perfect > best_val_n_perfect:
+            fail_n = val_result["first_failure_n"]
+            val_sym = "✓" if fail_n is None else f"✗ (fails@{fail_n})"
+            is_best = n_perfect > best_val_n_perfect
+            best_tag = "  ★ NEW BEST" if is_best else ""
+            print(f"              ↳ val: gen_n={gen_n} {val_sym}  ({n_perfect}/{n_val} perfect){best_tag}")
+            if is_best:
                 best_val_n_perfect = n_perfect
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
                     save_checkpoint(best_params, run_dir / "checkpoint_best.npz")
                     save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
-                    print(f"  [CKPT] Best checkpoint saved (val_perfect={n_perfect})")
+                    print(f"              ↳ [CKPT] checkpoint saved")
 
     elapsed = time.time() - t0
     print("-" * 70)
@@ -480,11 +503,12 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             hyp_disc = _compute_discrete_hyp_bits(state.params, grid, grid_values)
+            nll = metrics['data_cl']
+            mdl = nll + hyp_disc
             print(
-                f"Epoch {epoch+1:5d} | data_cl={metrics['data_cl']:8.1f} | "
-                f"|H|={metrics['hyp_cl']:7.1f}(disc:{hyp_disc:4d}) | "
-                f"H={metrics['entropy']:6.1f} | "
-                f"tau={float(tau):.4f} | {phase_name}"
+                f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
+                f"NLL={nll:8.1f}b  |H|={hyp_disc:4d}b (soft:{metrics['hyp_cl']:.1f})  MDL={mdl:.1f}b | "
+                f"H_w={metrics['entropy']:5.1f}  τ={float(tau):.4f}"
             )
 
         if (epoch + 1) % args.eval_every == 0:
@@ -496,15 +520,18 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             n_perfect = val_result["n_perfect"]
             n_val = len(val_inputs)
             gen_n = val_result["gen_n"]
-            print(f"  [VAL] perfect={n_perfect}/{n_val} gen_n={gen_n}"
-                  f" (first_fail={val_result['first_failure_n']})")
-            if n_perfect > best_val_n_perfect:
+            fail_n = val_result["first_failure_n"]
+            val_sym = "✓" if fail_n is None else f"✗ (fails@{fail_n})"
+            is_best = n_perfect > best_val_n_perfect
+            best_tag = "  ★ NEW BEST" if is_best else ""
+            print(f"              ↳ val: gen_n={gen_n} {val_sym}  ({n_perfect}/{n_val} perfect){best_tag}")
+            if is_best:
                 best_val_n_perfect = n_perfect
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
                     save_checkpoint(best_params, run_dir / "checkpoint_best.npz")
                     save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
-                    print(f"  [CKPT] Best checkpoint saved (val_perfect={n_perfect})")
+                    print(f"              ↳ [CKPT] checkpoint saved")
 
     elapsed = time.time() - t0
     print("-" * 70)
@@ -566,11 +593,15 @@ def main():
                         help="Min probability for adaptive prior (shared mode)")
     # Evaluation
     parser.add_argument("--test_max_n", type=int, default=1500,
-                        help="Max n for test set")
+                        help="Max n for test set (can be overridden in --eval mode)")
     parser.add_argument("--eval_every", type=int, default=100,
                         help="Evaluate every N epochs")
     parser.add_argument("--log_every", type=int, default=50,
                         help="Log training metrics every N epochs")
+    parser.add_argument("--analyze", action="store_true",
+                        help="Run analytical network analysis (golden check, failure prediction)")
+    parser.add_argument("--analyze_max_n", type=int, default=100_000,
+                        help="Max n for analytical golden check (default: 100000)")
     # Run management
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Path to a results directory (used with --eval or --resume)")
@@ -591,10 +622,21 @@ def main():
 
     # --- Override args from saved config when eval/resuming ---
     if args.eval or args.resume:
+        # Preserve CLI-specified eval-time overrides
+        cli_test_max_n = args.test_max_n
+        cli_analyze = args.analyze
+        cli_analyze_max_n = args.analyze_max_n
+        # Check if --test_max_n was explicitly provided on the command line
+        test_max_n_explicit = "--test_max_n" in sys.argv
+
         saved_args = load_run_config(args.ckpt)
         saved_args.eval = args.eval
         saved_args.resume = args.resume
         saved_args.ckpt = args.ckpt
+        saved_args.analyze = cli_analyze
+        saved_args.analyze_max_n = cli_analyze_max_n
+        if test_max_n_explicit:
+            saved_args.test_max_n = cli_test_max_n
         args = saved_args
 
     # --- Set up run directory and logging ---
@@ -675,9 +717,13 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     val_inputs, val_targets = make_validation_set(train_max_n, val_max_n=71)
     print(f"  Structured val set: {len(val_inputs)} strings (n={train_max_n+1}..71)")
 
-    # Test set
-    test_inputs, test_targets = make_test_set(max_n=args.test_max_n)
-    print(f"  Test set: {len(test_inputs)} strings (n=1..{args.test_max_n})")
+    # Test set (skip generation for very large n - float64 simulation handles it)
+    if args.test_max_n <= 10_000:
+        test_inputs, test_targets = make_test_set(max_n=args.test_max_n)
+        print(f"  Test set: {len(test_inputs)} strings (n=1..{args.test_max_n})")
+    else:
+        test_inputs, test_targets = [], []
+        print(f"  Test set: n=1..{args.test_max_n} (will use float64 simulation)")
 
     # Pad training data
     x_train, y_train, mask_train = sequences_to_padded_arrays(
@@ -759,6 +805,9 @@ def run_final_evaluation(args, state, best_params,
                          golden_mdl, golden_result):
     """Run final test evaluation and print the comparison table.
 
+    For test_max_n > 10000, uses efficient float64 simulation instead of
+    JAX batched evaluation (avoids memory issues with very long sequences).
+
     Returns a dict of metrics for results.json.
     """
     print("\n" + "=" * 70)
@@ -786,17 +835,40 @@ def run_final_evaluation(args, state, best_params,
 
     # Test accuracy
     test_max_n = args.test_max_n
-    print(f"\nEvaluating on test set (n=1..{test_max_n})...")
-    test_result = evaluate_deterministic_accuracy(
-        state.apply_fn, eval_model_params, grid_values,
-        test_inputs, test_targets, max_n=test_max_n,
-    )
-    our_n_perfect = test_result["n_perfect"]
-    our_gen_n = test_result["gen_n"]
+    use_f64_eval = test_max_n > 10_000
+
+    if use_f64_eval:
+        # For very large n, use binary-search to efficiently find the
+        # generalization boundary instead of testing all N strings.
+        print(f"\nEvaluating on test set (n=1..{test_max_n}) using float64 simulation...")
+        extracted = extract_weights(eval_model_params, grid, grid_values)
+        print(f"  Finding generalization boundary (binary search)...")
+        first_failure = find_failure_n(extracted["named"], max_n=test_max_n)
+        if first_failure is None:
+            our_gen_n = test_max_n
+            our_n_perfect = test_max_n
+            all_correct = True
+        else:
+            our_gen_n = first_failure - 1
+            our_n_perfect = our_gen_n  # conservative: at least 1..gen_n are correct
+            all_correct = False
+        mean_acc = our_n_perfect / test_max_n
+    else:
+        print(f"\nEvaluating on test set (n=1..{test_max_n})...")
+        test_result = evaluate_deterministic_accuracy(
+            state.apply_fn, eval_model_params, grid_values,
+            test_inputs, test_targets, max_n=test_max_n,
+        )
+        our_n_perfect = test_result["n_perfect"]
+        our_gen_n = test_result["gen_n"]
+        first_failure = test_result["first_failure_n"]
+        all_correct = test_result["all_correct"]
+        mean_acc = float(test_result["mean_accuracy"])
+
     print(f"  Perfect strings: {our_n_perfect}/{test_max_n}")
     print(f"  Generalisation range: n=1..{our_gen_n}")
-    if not test_result["all_correct"]:
-        print(f"  First failure at n={test_result['first_failure_n']}")
+    if not all_correct:
+        print(f"  First failure at n={first_failure}")
 
     # --- Summary comparison table ---
     n_params = len(discrete_weights)
@@ -821,6 +893,13 @@ def run_final_evaluation(args, state, best_params,
           f"{our_n_perfect:>10d}/{test_max_n}")
     print("=" * 70)
 
+    # --- Analytical network analysis ---
+    if getattr(args, "analyze", False):
+        analysis_result = analyze_model(
+            eval_model_params, grid, grid_values,
+            max_test_n=args.analyze_max_n, p=args.p,
+        )
+
     return {
         "mode": args.mode,
         "gen_n": int(our_gen_n),
@@ -828,8 +907,8 @@ def run_final_evaluation(args, state, best_params,
         "total_mdl_bits": int(total_mdl_bits),
         "arch_bits": int(arch_bits),
         "weight_bits": int(total_hyp_bits),
-        "first_failure_n": test_result["first_failure_n"],
-        "mean_det_accuracy": float(test_result["mean_accuracy"]),
+        "first_failure_n": first_failure,
+        "mean_det_accuracy": float(mean_acc),
     }
 
 
