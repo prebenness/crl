@@ -26,8 +26,13 @@ Usage:
 """
 
 import argparse
+import json
+import os
+import sys
 import time
+from datetime import datetime
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 import jax
@@ -65,6 +70,95 @@ from src.mdl.shared_weights import (
     create_shared_mdl_state,
     make_shared_train_step,
 )
+
+
+# ---------------------------------------------------------------------------
+# Run management: directories, logging, checkpointing
+# ---------------------------------------------------------------------------
+
+class TeeLogger:
+    """Mirrors stdout to both the terminal and a log file simultaneously."""
+
+    def __init__(self, log_path, mode="w"):
+        self._log_path = log_path
+        self._mode = mode
+        self._file = None
+        self._orig = None
+
+    def __enter__(self):
+        self._file = open(self._log_path, self._mode)
+        self._orig = sys.stdout
+        sys.stdout = self
+        return self
+
+    def __exit__(self, *_):
+        sys.stdout = self._orig
+        self._file.close()
+
+    def write(self, data):
+        self._orig.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._orig.flush()
+        self._file.flush()
+
+    def fileno(self):
+        return self._orig.fileno()
+
+
+def make_run_dir(args):
+    """Create a timestamped results directory and write config.json.
+
+    Name format:
+        results/YYYYMMDD_HHMMSS_MODE_eEPOCHS_lrLR_lamLAMBDA_gNxM_sSEED/
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    lam = args.mdl_lambda if args.mode == "basic" else args.lambda1
+    name = (
+        f"{ts}_{args.mode}_e{args.epochs}"
+        f"_lr{args.lr}_lam{lam}"
+        f"_g{args.n_max}x{args.m_max}_s{args.seed}"
+    )
+    run_dir = Path("results") / name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "config.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
+    return run_dir
+
+
+def load_run_config(run_dir):
+    """Load config.json from a run directory into an argparse.Namespace."""
+    with open(Path(run_dir) / "config.json") as f:
+        return argparse.Namespace(**json.load(f))
+
+
+def save_checkpoint(params, path):
+    """Save a params dict (JAX/numpy arrays) to a .npz file."""
+    np.savez(str(path), **{k: np.array(v) for k, v in params.items()})
+
+
+def load_checkpoint(path):
+    """Load a params dict from a .npz file. Returns dict of jnp arrays."""
+    data = np.load(str(path))
+    return {k: jnp.array(data[k]) for k in data.files}
+
+
+def save_checkpoint_meta(run_dir, epoch, best_val_n_perfect):
+    """Write a small JSON sidecar recording the last completed epoch."""
+    meta = {"last_epoch": int(epoch), "best_val_n_perfect": int(best_val_n_perfect)}
+    with open(Path(run_dir) / "checkpoint_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def save_results(run_dir, results_dict):
+    """Write final test metrics to results.json."""
+    clean = {
+        k: (v.item() if hasattr(v, "item") else v)
+        for k, v in results_dict.items()
+    }
+    with open(Path(run_dir) / "results.json", "w") as f:
+        json.dump(clean, f, indent=2)
 
 
 def get_train_max_n(inputs):
@@ -168,11 +262,17 @@ def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
 
 def run_training_basic(args, model, grid_values, grid_codelengths,
                        x_train, y_train, mask_train,
-                       val_inputs, val_targets, rng, grid):
+                       val_inputs, val_targets, rng, grid,
+                       run_dir=None, start_epoch=0, init_params=None):
     """Run two-phase training with the basic MDL objective.
 
     Phase 1 (warmup): Continuous soft relaxation, zero-variance gradients.
     Phase 2 (ST):     Gumbel-Softmax straight-through, multi-sample variance reduction.
+
+    Args:
+        run_dir: Path to results directory for checkpointing (None = no saving).
+        start_epoch: Epoch to start from (>0 when resuming).
+        init_params: If provided, replace state params after init (for resume/eval).
     """
     rng, init_rng = jrandom.split(rng)
     N = x_train.shape[0]
@@ -186,6 +286,9 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         lr=args.lr,
         tau_init=args.tau_start,
     )
+    if init_params is not None:
+        state = state.replace(params=init_params)
+        print(f"  Loaded params from checkpoint (resuming from epoch {start_epoch})")
 
     print(f"  Number of LSTM+output parameters: {state.params['logits'].shape[0]}")
     print(f"  Logit array shape: {state.params['logits'].shape}")
@@ -219,7 +322,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     best_params = None
 
     t0 = time.time()
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
         phase_name = "warmup" if is_warmup else "ST"
 
@@ -260,10 +363,18 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             if n_perfect > best_val_n_perfect:
                 best_val_n_perfect = n_perfect
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
+                if run_dir is not None:
+                    save_checkpoint(best_params, run_dir / "checkpoint_best.npz")
+                    save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
+                    print(f"  [CKPT] Best checkpoint saved (val_perfect={n_perfect})")
 
     elapsed = time.time() - t0
     print("-" * 70)
     print(f"Training complete in {elapsed:.1f}s")
+
+    if run_dir is not None:
+        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        print(f"  [CKPT] Final checkpoint saved")
 
     return state, best_params, best_val_n_perfect
 
@@ -299,7 +410,8 @@ def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
 
 def run_training_shared(args, model, grid_values, grid_codelengths,
                         x_train, y_train, mask_train,
-                        val_inputs, val_targets, rng, grid):
+                        val_inputs, val_targets, rng, grid,
+                        run_dir=None, start_epoch=0, init_params=None):
     """Run two-phase training with the shared-weight MDL objective."""
     rng, init_rng = jrandom.split(rng)
     N = x_train.shape[0]
@@ -313,6 +425,9 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         lr=args.lr,
         tau_init=args.tau_start,
     )
+    if init_params is not None:
+        state = state.replace(params=init_params)
+        print(f"  Loaded params from checkpoint (resuming from epoch {start_epoch})")
 
     print(f"  Number of LSTM+output parameters: {state.params['logits'].shape[0]}")
     print(f"  Logit array shape: {state.params['logits'].shape}")
@@ -344,7 +459,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     best_params = None
 
     t0 = time.time()
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
         phase_name = "warmup" if is_warmup else "ST"
 
@@ -386,10 +501,18 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             if n_perfect > best_val_n_perfect:
                 best_val_n_perfect = n_perfect
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
+                if run_dir is not None:
+                    save_checkpoint(best_params, run_dir / "checkpoint_best.npz")
+                    save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
+                    print(f"  [CKPT] Best checkpoint saved (val_perfect={n_perfect})")
 
     elapsed = time.time() - t0
     print("-" * 70)
     print(f"Training complete in {elapsed:.1f}s")
+
+    if run_dir is not None:
+        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        print(f"  [CKPT] Final checkpoint saved")
 
     return state, best_params, best_val_n_perfect
 
@@ -448,12 +571,75 @@ def main():
                         help="Evaluate every N epochs")
     parser.add_argument("--log_every", type=int, default=50,
                         help="Log training metrics every N epochs")
+    # Run management
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to a results directory (used with --eval or --resume)")
+    parser.add_argument("--eval", action="store_true",
+                        help="Load best checkpoint from --ckpt and run test evaluation only")
+    parser.add_argument("--resume", action="store_true",
+                        help="Load best checkpoint from --ckpt and resume training")
 
     args = parser.parse_args()
 
+    # --- Validate run management flags ---
+    if args.eval and args.resume:
+        parser.error("--eval and --resume are mutually exclusive")
+    if (args.eval or args.resume) and args.ckpt is None:
+        parser.error("--ckpt is required when using --eval or --resume")
+    if (args.eval or args.resume) and not Path(args.ckpt).exists():
+        parser.error(f"Checkpoint directory not found: {args.ckpt}")
+
+    # --- Override args from saved config when eval/resuming ---
+    if args.eval or args.resume:
+        saved_args = load_run_config(args.ckpt)
+        saved_args.eval = args.eval
+        saved_args.resume = args.resume
+        saved_args.ckpt = args.ckpt
+        args = saved_args
+
+    # --- Set up run directory and logging ---
+    if args.eval or args.resume:
+        run_dir = Path(args.ckpt)
+        ckpt_path = run_dir / "checkpoint_best.npz"
+        if not ckpt_path.exists():
+            ckpt_path = run_dir / "checkpoint_final.npz"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"No checkpoint found in {run_dir}")
+        loaded_params = load_checkpoint(ckpt_path)
+        start_epoch = 0
+        if args.resume:
+            meta_path = run_dir / "checkpoint_meta.json"
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                start_epoch = meta.get("last_epoch", 0)
+                print(f"Resuming from epoch {start_epoch}/{args.epochs}")
+        log_mode = "a"
+    else:
+        run_dir = make_run_dir(args)
+        loaded_params = None
+        start_epoch = 0
+        log_mode = "w"
+
+    _tee = TeeLogger(run_dir / "train.log", mode=log_mode)
+    _tee.__enter__()
+    try:
+        _main_inner(args, run_dir, loaded_params, start_epoch)
+    finally:
+        _tee.__exit__(None, None, None)
+
+
+def _main_inner(args, run_dir, loaded_params, start_epoch):
+    """Inner main logic (runs inside TeeLogger context)."""
     print("=" * 60)
     print("Differentiable MDL for a^n b^n")
     print(f"Mode: {args.mode}")
+    if args.eval:
+        print(f"[EVAL MODE] checkpoint: {args.ckpt}")
+    elif args.resume:
+        print(f"[RESUME from epoch {start_epoch}] checkpoint: {args.ckpt}")
+    else:
+        print(f"Run directory: {run_dir}")
     print("=" * 60)
 
     # --- Golden network baseline ---
@@ -512,21 +698,69 @@ def main():
 
     rng = jrandom.PRNGKey(args.seed)
 
-    # --- Training ---
-    if args.mode == "basic":
+    # --- Training (or eval/resume) ---
+    if args.eval:
+        # Reconstruct a state with loaded params just to get apply_fn
+        N = x_train.shape[0]
+        bs = args.batch_size if args.batch_size > 0 else N
+        rng, init_rng = jrandom.split(rng)
+        if args.mode == "basic":
+            state = create_mdl_state(
+                init_rng, model,
+                seq_len=x_train.shape[1],
+                batch_size=min(bs, N),
+                lr=args.lr,
+                tau_init=args.tau_end,
+            )
+        else:
+            state = create_shared_mdl_state(
+                init_rng, model, grid_values,
+                seq_len=x_train.shape[1],
+                batch_size=min(bs, N),
+                lr=args.lr,
+                tau_init=args.tau_end,
+            )
+        state = state.replace(params=loaded_params)
+        best_params = loaded_params
+        best_val_n_perfect = None
+    elif args.mode == "basic":
         state, best_params, best_val_n_perfect = run_training_basic(
             args, model, grid_values, grid_codelengths,
             x_train, y_train, mask_train,
             val_inputs, val_targets, rng, grid,
+            run_dir=run_dir, start_epoch=start_epoch,
+            init_params=loaded_params,
         )
     else:
         state, best_params, best_val_n_perfect = run_training_shared(
             args, model, grid_values, grid_codelengths,
             x_train, y_train, mask_train,
             val_inputs, val_targets, rng, grid,
+            run_dir=run_dir, start_epoch=start_epoch,
+            init_params=loaded_params,
         )
 
+    if not args.eval and run_dir is not None:
+        save_checkpoint_meta(run_dir, args.epochs, best_val_n_perfect or 0)
+
     # --- Final evaluation ---
+    metrics = run_final_evaluation(
+        args, state, best_params,
+        grid, grid_values, test_inputs, test_targets,
+        golden_mdl, golden_result,
+    )
+    if run_dir is not None:
+        save_results(run_dir, metrics)
+        print(f"\nResults saved to: {run_dir}/")
+
+
+def run_final_evaluation(args, state, best_params,
+                         grid, grid_values, test_inputs, test_targets,
+                         golden_mdl, golden_result):
+    """Run final test evaluation and print the comparison table.
+
+    Returns a dict of metrics for results.json.
+    """
     print("\n" + "=" * 70)
     print("FINAL EVALUATION")
     print("=" * 70)
@@ -565,8 +799,6 @@ def main():
         print(f"  First failure at n={test_result['first_failure_n']}")
 
     # --- Summary comparison table ---
-    # Trivial baseline: always predict 'b'. Gets (n-1)/n per string,
-    # 0 perfect, and |H|=540 bits (108 zero weights * 5 bits each).
     n_params = len(discrete_weights)
     trivial_hyp = n_params * 5  # all-zero weights, 5 bits each
     trivial_mdl = arch_bits + trivial_hyp
@@ -588,6 +820,17 @@ def main():
     print(f"{mode_name:<30} {total_mdl_bits:>10d} {our_gen_n:>8d} "
           f"{our_n_perfect:>10d}/{test_max_n}")
     print("=" * 70)
+
+    return {
+        "mode": args.mode,
+        "gen_n": int(our_gen_n),
+        "n_perfect": int(our_n_perfect),
+        "total_mdl_bits": int(total_mdl_bits),
+        "arch_bits": int(arch_bits),
+        "weight_bits": int(total_hyp_bits),
+        "first_failure_n": test_result["first_failure_n"],
+        "mean_det_accuracy": float(test_result["mean_accuracy"]),
+    }
 
 
 if __name__ == "__main__":

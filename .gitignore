@@ -8,3 +8,4 @@ wandb/
 .claude/
 .pytest_cache/
 logs/
+results/
