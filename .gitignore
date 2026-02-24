@@ -9,3 +9,5 @@ wandb/
 .pytest_cache/
 logs/
 results/
+CLAUDE.md
+future-todos.md

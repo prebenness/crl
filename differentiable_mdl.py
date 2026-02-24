@@ -34,10 +34,20 @@ from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 
+# XLA_FLAGS must be set before JAX/XLA initialises - we can't wait for argparse.
+# We check sys.argv directly so the --deterministic flag still controls it.
+if "--deterministic" in sys.argv:
+    _xla_flags = os.environ.get("XLA_FLAGS", "")
+    if "--xla_gpu_deterministic_ops" not in _xla_flags:
+        os.environ["XLA_FLAGS"] = (_xla_flags + " --xla_gpu_deterministic_ops=true").strip()
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random as jrandom
+
+# Persist compiled XLA kernels across runs to avoid redundant JIT compilation.
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 
 from src.mdl.coding import (
     grid_values_and_codelengths,
@@ -324,13 +334,6 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     total_epochs = args.epochs
     st_epochs = total_epochs - warmup_epochs
 
-    # Warmup anneals tau from tau_start down to tau_start (staying constant
-    # is useless at high tau). Instead, anneal across the full range during
-    # warmup too: tau_start -> tau_end, then ST phase continues from tau_end
-    # with Gumbel noise for discretization.
-    # Actually: warmup anneals tau_start -> tau_start (same as ST start),
-    # then ST anneals tau_start -> tau_end. But the real issue is tau_start
-    # is too high. We anneal over BOTH phases: tau_start -> tau_end.
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
     print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
     print(f"  tau: {args.tau_start} -> {args.tau_end} (annealed across both phases)")
@@ -563,8 +566,8 @@ def main():
                         help="Number of training strings (1000 in Lan et al.)")
     parser.add_argument("--p", type=float, default=0.3,
                         help="PCFG termination probability")
-    parser.add_argument("--data_seed", type=int, default=0,
-                        help="Seed for data generation")
+    parser.add_argument("--data_seed", type=int, default=None,
+                        help="Seed for data generation (defaults to --seed if unset)")
     # Training
     parser.add_argument("--epochs", type=int, default=5000,
                         help="Number of training epochs")
@@ -598,6 +601,8 @@ def main():
                         help="Evaluate every N epochs")
     parser.add_argument("--log_every", type=int, default=50,
                         help="Log training metrics every N epochs")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Force deterministic GPU ops (slower but fully reproducible)")
     parser.add_argument("--analyze", action="store_true",
                         help="Run analytical network analysis (golden check, failure prediction)")
     parser.add_argument("--analyze_max_n", type=int, default=100_000,
@@ -611,6 +616,10 @@ def main():
                         help="Load best checkpoint from --ckpt and resume training")
 
     args = parser.parse_args()
+
+    # If data_seed not given, tie it to seed so --seed controls all randomness.
+    if args.data_seed is None:
+        args.data_seed = args.seed
 
     # --- Validate run management flags ---
     if args.eval and args.resume:
@@ -673,7 +682,14 @@ def main():
 
 def _main_inner(args, run_dir, loaded_params, start_epoch):
     """Inner main logic (runs inside TeeLogger context)."""
+    # Seed the global numpy RNG so any library path that uses it is reproducible.
+    np.random.seed(args.seed)
+
     print("=" * 60)
+    if args.deterministic:
+        print("Deterministic mode: ON  (--xla_gpu_deterministic_ops=true)")
+    else:
+        print("Deterministic mode: OFF (pass --deterministic for full reproducibility)")
     print("Differentiable MDL for a^n b^n")
     print(f"Mode: {args.mode}")
     if args.eval:

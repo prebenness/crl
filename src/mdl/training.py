@@ -115,19 +115,19 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
             keys = jrandom.split(rng, n_samples)
 
             def single_sample(key):
-                logits_k, _ = apply_fn(
+                logits_k, aux_k = apply_fn(
                     {"params": params}, x, tau=tau, train=True, rng=key,
                 )
-                return _compute_data_codelength(logits_k, y, mask)
+                data_cl, ce = _compute_data_codelength(logits_k, y, mask)
+                return data_cl, ce, aux_k
 
-            data_cls, ce_per_tokens = jax.vmap(single_sample)(keys)
+            data_cls, ce_per_tokens, all_aux = jax.vmap(single_sample)(keys)
             data_codelength = jnp.mean(data_cls)
             ce_per_token = jnp.mean(ce_per_tokens)
 
-            # Get model_aux from a single pass (identical for all samples)
-            _, model_aux = apply_fn(
-                {"params": params}, x, tau=tau, train=True, rng=keys[0],
-            )
+            # model_aux is identical across samples (doesn't depend on
+            # Gumbel noise), so just take the first.
+            model_aux = jax.tree.map(lambda x: x[0], all_aux)
         else:
             # Single Gumbel-Softmax sample
             logits, model_aux = apply_fn(
