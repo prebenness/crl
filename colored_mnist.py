@@ -20,16 +20,42 @@ from src.config import load_config
 from src.data.datasets import build_dataset, dataset_to_jax_arrays
 from src.models.ib_classifiers import VIBClassifier, ULAMLPVarClassifier
 from src.models.classifiers import StdClassifier, ULAMLPClassifier
-from src.training.train_state import create_state_inner, create_state_outer
-from src.training.steps import make_train_step, make_train_step_pair, make_eval_step
+from src.models.mdl_classifiers import GumbelSoftmaxMLP
+from src.mdl.coding import grid_values_and_codelengths
+from src.training.train_state import (
+    create_state_inner, create_state_outer, create_state_mdl,
+)
+from src.training.steps import (
+    make_train_step, make_train_step_pair, make_eval_step,
+    make_train_step_mdl, make_train_step_mdl_pair, make_eval_step_mdl,
+)
 from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
+    make_train_epoch_mdl, make_train_epoch_mdl_pair,
 )
-from src.training.runners import run_train_eval, run_train_eval_pair
+from src.training.runners import (
+    run_train_eval, run_train_eval_pair,
+    run_train_eval_mdl, run_train_eval_mdl_pair,
+)
 from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 
 
 # ---- Model construction (architecture stays as code, not config) ----
+
+def _make_mdl_mlp(cfg):
+    """Construct a GumbelSoftmaxMLP from config, caching the rational grid."""
+    if not hasattr(_make_mdl_mlp, "_cache"):
+        _make_mdl_mlp._cache = {}
+    key = (cfg.mdl.n_max, cfg.mdl.m_max)
+    if key not in _make_mdl_mlp._cache:
+        _make_mdl_mlp._cache[key] = grid_values_and_codelengths(*key)
+    gv, gc = _make_mdl_mlp._cache[key]
+    return GumbelSoftmaxMLP(
+        num_classes=cfg.model.num_classes,
+        grid_values=gv,
+        grid_codelengths=gc,
+    )
+
 
 INNER_MODELS = {
     "vib_cnn": lambda cfg: VIBClassifier(
@@ -39,6 +65,7 @@ INNER_MODELS = {
     "ula_mlp_var": lambda cfg: ULAMLPVarClassifier(
         num_classes=cfg.model.num_classes,
     ),
+    "mdl_mlp": _make_mdl_mlp,
 }
 
 OUTER_MODELS = {
@@ -58,7 +85,7 @@ def _make_sweep_plot(results, cfg):
     xs = np.array([r["lambda"] for r in results])
 
     plt.figure()
-    if cfg.model.mode == "pair":
+    if cfg.model.mode in ("pair", "mdl_pair"):
         plt.scatter(xs, [r["train_acc2"] for r in results],
                     label="Outer train", marker="o")
         plt.scatter(xs, [r["test_acc2"] for r in results],
@@ -76,9 +103,11 @@ def _make_sweep_plot(results, cfg):
     if cfg.sweep.log_sweep:
         plt.xscale("symlog", linthresh=0.01)
 
-    plt.xlabel("Lambda")
+    is_mdl = cfg.model.mode.startswith("mdl")
+    plt.xlabel("MDL lambda" if is_mdl else "Lambda")
     plt.ylabel("Accuracy")
-    plt.title(f"{cfg.dataset.name} accuracy vs Information capacity")
+    label = "MDL penalty" if is_mdl else "Information capacity"
+    plt.title(f"{cfg.dataset.name} accuracy vs {label}")
     plt.legend()
     plt.ylim(-0.02, 1.02)
 
@@ -121,13 +150,34 @@ def main():
     )
 
     # Build JIT-compiled functions from config
-    train_step = make_train_step(cfg)
-    train_step_pair = make_train_step_pair(cfg)
-    eval_step = make_eval_step(cfg)
+    mode = cfg.model.mode
 
-    train_epoch = make_train_epoch(train_step)
-    train_epoch_pair = make_train_epoch_pair(train_step_pair)
-    eval_epoch = make_eval_epoch(eval_step)
+    if mode in ("single", "pair"):
+        train_step = make_train_step(cfg)
+        train_step_pair = make_train_step_pair(cfg)
+        eval_step = make_eval_step(cfg)
+
+        train_epoch = make_train_epoch(train_step)
+        train_epoch_pair = make_train_epoch_pair(train_step_pair)
+        eval_epoch = make_eval_epoch(eval_step)
+
+    if mode in ("mdl", "mdl_pair"):
+        mdl_step_warmup = make_train_step_mdl(cfg, soft_forward=True)
+        mdl_step_train = make_train_step_mdl(cfg, soft_forward=False)
+        mdl_eval_step = make_eval_step_mdl(cfg)
+
+        mdl_epoch_warmup = make_train_epoch_mdl(mdl_step_warmup)
+        mdl_epoch_train = make_train_epoch_mdl(mdl_step_train)
+        mdl_eval_epoch = make_eval_epoch(mdl_eval_step)
+
+    if mode == "mdl_pair":
+        mdl_pair_step_warmup = make_train_step_mdl_pair(cfg, soft_forward=True)
+        mdl_pair_step_train = make_train_step_mdl_pair(cfg, soft_forward=False)
+        vib_eval_step = make_eval_step(cfg)
+
+        mdl_pair_epoch_warmup = make_train_epoch_mdl_pair(mdl_pair_step_warmup)
+        mdl_pair_epoch_train = make_train_epoch_mdl_pair(mdl_pair_step_train)
+        outer_eval_epoch = make_eval_epoch(vib_eval_step)
 
     # Load data
     print("Loading datasets and converting to JAX arrays...")
@@ -177,7 +227,7 @@ def main():
 
         t_start = time.time()
 
-        if cfg.model.mode == "single":
+        if mode == "single":
             res = run_train_eval(
                 x_train, y_train, x_test, y_test,
                 inner_model, cfg, lamb, wandb_run=run,
@@ -185,7 +235,7 @@ def main():
                 train_epoch_fn=train_epoch,
                 eval_epoch_fn=eval_epoch,
             )
-        elif cfg.model.mode == "pair":
+        elif mode == "pair":
             outer_model = OUTER_MODELS[cfg.model.outer](cfg)
             res = run_train_eval_pair(
                 x_train, y_train, x_test, y_test,
@@ -194,6 +244,27 @@ def main():
                 create_outer_fn=create_state_outer,
                 train_epoch_pair_fn=train_epoch_pair,
                 eval_epoch_fn=eval_epoch,
+            )
+        elif mode == "mdl":
+            res = run_train_eval_mdl(
+                x_train, y_train, x_test, y_test,
+                inner_model, cfg, lamb, wandb_run=run,
+                create_state_fn=create_state_mdl,
+                train_epoch_warmup_fn=mdl_epoch_warmup,
+                train_epoch_fn=mdl_epoch_train,
+                eval_epoch_fn=mdl_eval_epoch,
+            )
+        elif mode == "mdl_pair":
+            outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+            res = run_train_eval_mdl_pair(
+                x_train, y_train, x_test, y_test,
+                inner_model, outer_model, cfg, lamb, wandb_run=run,
+                create_inner_fn=create_state_mdl,
+                create_outer_fn=create_state_outer,
+                train_epoch_warmup_fn=mdl_pair_epoch_warmup,
+                train_epoch_fn=mdl_pair_epoch_train,
+                eval_inner_epoch_fn=mdl_eval_epoch,
+                eval_outer_epoch_fn=outer_eval_epoch,
             )
         else:
             raise ValueError(f"Unknown model.mode: {cfg.model.mode!r}")

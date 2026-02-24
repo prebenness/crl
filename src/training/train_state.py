@@ -32,6 +32,32 @@ def create_state_inner(rng, model, input_shape, cfg):
     )
 
 
+class MDLTrainState(train_state.TrainState):
+    """TrainState with Gumbel temperature for MDL models."""
+    tau: jnp.ndarray
+
+
+def create_state_mdl(rng, model, input_shape, cfg):
+    """Initialize MDL model state with temperature field."""
+    params = model.init(
+        rng,
+        jnp.ones(input_shape, jnp.float32),
+        tau=cfg.mdl.tau_start,
+        train=False,
+    )["params"]
+    tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
+    opt_state = tx.init(params)
+
+    return MDLTrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
+        tau=jnp.array(cfg.mdl.tau_start, dtype=jnp.float32),
+    )
+
+
 def create_state_outer(rng, model, input_shape, cfg):
     """Initialize outer (standard classifier) model state."""
     params = model.init(

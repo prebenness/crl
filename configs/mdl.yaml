@@ -1,0 +1,42 @@
+# ---- Weights & Biases ----
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-mdl"
+
+# ---- Dataset ----
+dataset:
+  name: "colored_mnist"
+  p_train: 0.9
+  p_test: 0.1
+
+# ---- Model ----
+# mode: "mdl" (single MDL model) or "mdl_pair" (MDL inner + HSIC outer)
+# inner: "mdl_mlp" for Gumbel-Softmax rational-grid parameterized MLP
+model:
+  mode: "mdl"
+  inner: "mdl_mlp"
+  num_classes: 10
+
+# ---- Training ----
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 0.0
+  epochs: 100
+  batch_size: 128
+  seed: 42
+
+# ---- MDL config ----
+mdl:
+  n_max: 5              # rational grid numerator max
+  m_max: 5              # rational grid denominator max
+  tau_start: 2.0        # initial Gumbel temperature
+  tau_end: 0.1          # final Gumbel temperature
+  warmup_epochs: 10     # epochs with continuous relaxation
+  n_samples: 1          # MC samples for Gumbel noise
+
+# ---- Lambda sweep (MDL penalty weight) ----
+sweep:
+  lambda_min_exp: -3
+  lambda_max_exp: 1
+  lambda_steps: 8
+  log_sweep: true

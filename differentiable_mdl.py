@@ -68,6 +68,7 @@ from src.mdl.training import (
     create_mdl_state,
     make_train_step,
     evaluate_deterministic_accuracy,
+    anneal_tau,
 )
 from src.mdl.golden import (
     build_golden_network_params,
@@ -185,12 +186,6 @@ def get_train_max_n(inputs):
         max_n = max(max_n, n)
     return max_n
 
-
-def anneal_tau(epoch, total_epochs, tau_start, tau_end):
-    """Exponential temperature annealing: tau_start -> tau_end over training."""
-    progress = epoch / max(total_epochs - 1, 1)
-    log_tau = jnp.log(tau_start) + progress * (jnp.log(tau_end) - jnp.log(tau_start))
-    return jnp.exp(log_tau)
 
 
 def compute_discrete_mdl_score(eval_params, grid, grid_values):

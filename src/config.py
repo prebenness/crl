@@ -60,6 +60,16 @@ class HSICConfig:
 
 
 @dataclass
+class MDLConfig:
+    n_max: int = 5
+    m_max: int = 5
+    tau_start: float = 2.0
+    tau_end: float = 0.1
+    warmup_epochs: int = 10
+    n_samples: int = 1
+
+
+@dataclass
 class SweepConfig:
     lambda_min_exp: float = -3.0
     lambda_max_exp: float = 3.0
@@ -76,6 +86,7 @@ class ExperimentConfig:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     mc_samples: MCSamplesConfig = field(default_factory=MCSamplesConfig)
     hsic: HSICConfig = field(default_factory=HSICConfig)
+    mdl: MDLConfig = field(default_factory=MDLConfig)
     sweep: SweepConfig = field(default_factory=SweepConfig)
 
     @property
@@ -102,6 +113,7 @@ def load_config(yaml_path: str) -> ExperimentConfig:
         "controller": ControllerConfig,
         "mc_samples": MCSamplesConfig,
         "hsic": HSICConfig,
+        "mdl": MDLConfig,
         "sweep": SweepConfig,
     }
 
