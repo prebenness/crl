@@ -7,6 +7,7 @@ os.environ["WANDB_SILENT"] = "true"
 
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import wandb
@@ -17,7 +18,10 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
 from src.config import load_config
-from src.data.datasets import build_dataset, dataset_to_jax_arrays
+from src.utils.checkpointing import TeeLogger, save_config
+from src.datasets.datasets import (
+    build_dataset, dataset_to_jax_arrays, DATASET_NUM_CLASSES,
+)
 from src.models.ib_classifiers import VIBClassifier, ULAMLPVarClassifier
 from src.models.classifiers import StdClassifier, ULAMLPClassifier
 from src.models.mdl_classifiers import GumbelSoftmaxMLP
@@ -139,6 +143,16 @@ def main():
 
     cfg = load_config(sys.argv[1])
 
+    expected_nc = DATASET_NUM_CLASSES.get(cfg.dataset.name)
+    if expected_nc is not None and cfg.model.num_classes != expected_nc:
+        print(
+            f"ERROR: dataset '{cfg.dataset.name}' has {expected_nc} classes "
+            f"but config sets model.num_classes={cfg.model.num_classes}. "
+            f"Fix the config to set num_classes: {expected_nc}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print("JAX devices:", jax.devices())
     jax.config.update("jax_default_matmul_precision", "high")
 
@@ -205,11 +219,27 @@ def main():
     all_results = []
     sweep_start = time.time()
 
+    # Create results directory for this sweep
+    sweep_dir = Path("results") / f"{timestamp}-{mode}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
     for lamb in cfg.lambdas:
         lamb = float(lamb)
         inner_model = INNER_MODELS[cfg.model.inner](cfg)
 
         print(f"\n--- Sweep (lamb={lamb:.1e}) ---")
+
+        # Per-lambda run directory
+        run_dir = sweep_dir / f"lamb_{lamb:.1e}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        save_config(run_dir, {
+            "mode": mode, "lambda": lamb,
+            "dataset": cfg.dataset.name,
+            "seed": cfg.training.seed,
+            "epochs": cfg.training.epochs,
+            "batch_size": cfg.training.batch_size,
+            "lr": cfg.training.lr,
+        })
 
         run_config = {
             "lambda": lamb,
@@ -227,47 +257,52 @@ def main():
 
         t_start = time.time()
 
-        if mode == "single":
-            res = run_train_eval(
-                x_train, y_train, x_test, y_test,
-                inner_model, cfg, lamb, wandb_run=run,
-                create_state_fn=create_state_inner,
-                train_epoch_fn=train_epoch,
-                eval_epoch_fn=eval_epoch,
-            )
-        elif mode == "pair":
-            outer_model = OUTER_MODELS[cfg.model.outer](cfg)
-            res = run_train_eval_pair(
-                x_train, y_train, x_test, y_test,
-                inner_model, outer_model, cfg, lamb, wandb_run=run,
-                create_inner_fn=create_state_inner,
-                create_outer_fn=create_state_outer,
-                train_epoch_pair_fn=train_epoch_pair,
-                eval_epoch_fn=eval_epoch,
-            )
-        elif mode == "mdl":
-            res = run_train_eval_mdl(
-                x_train, y_train, x_test, y_test,
-                inner_model, cfg, lamb, wandb_run=run,
-                create_state_fn=create_state_mdl,
-                train_epoch_warmup_fn=mdl_epoch_warmup,
-                train_epoch_fn=mdl_epoch_train,
-                eval_epoch_fn=mdl_eval_epoch,
-            )
-        elif mode == "mdl_pair":
-            outer_model = OUTER_MODELS[cfg.model.outer](cfg)
-            res = run_train_eval_mdl_pair(
-                x_train, y_train, x_test, y_test,
-                inner_model, outer_model, cfg, lamb, wandb_run=run,
-                create_inner_fn=create_state_mdl,
-                create_outer_fn=create_state_outer,
-                train_epoch_warmup_fn=mdl_pair_epoch_warmup,
-                train_epoch_fn=mdl_pair_epoch_train,
-                eval_inner_epoch_fn=mdl_eval_epoch,
-                eval_outer_epoch_fn=outer_eval_epoch,
-            )
-        else:
-            raise ValueError(f"Unknown model.mode: {cfg.model.mode!r}")
+        with TeeLogger(run_dir / "train.log"):
+            if mode == "single":
+                res = run_train_eval(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, cfg, lamb, wandb_run=run,
+                    create_state_fn=create_state_inner,
+                    train_epoch_fn=train_epoch,
+                    eval_epoch_fn=eval_epoch,
+                    run_dir=run_dir,
+                )
+            elif mode == "pair":
+                outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                res = run_train_eval_pair(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, outer_model, cfg, lamb, wandb_run=run,
+                    create_inner_fn=create_state_inner,
+                    create_outer_fn=create_state_outer,
+                    train_epoch_pair_fn=train_epoch_pair,
+                    eval_epoch_fn=eval_epoch,
+                    run_dir=run_dir,
+                )
+            elif mode == "mdl":
+                res = run_train_eval_mdl(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, cfg, lamb, wandb_run=run,
+                    create_state_fn=create_state_mdl,
+                    train_epoch_warmup_fn=mdl_epoch_warmup,
+                    train_epoch_fn=mdl_epoch_train,
+                    eval_epoch_fn=mdl_eval_epoch,
+                    run_dir=run_dir,
+                )
+            elif mode == "mdl_pair":
+                outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                res = run_train_eval_mdl_pair(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, outer_model, cfg, lamb, wandb_run=run,
+                    create_inner_fn=create_state_mdl,
+                    create_outer_fn=create_state_outer,
+                    train_epoch_warmup_fn=mdl_pair_epoch_warmup,
+                    train_epoch_fn=mdl_pair_epoch_train,
+                    eval_inner_epoch_fn=mdl_eval_epoch,
+                    eval_outer_epoch_fn=outer_eval_epoch,
+                    run_dir=run_dir,
+                )
+            else:
+                raise ValueError(f"Unknown model.mode: {cfg.model.mode!r}")
 
         res["run_time"] = time.time() - t_start
         res["dataset"] = cfg.dataset.name

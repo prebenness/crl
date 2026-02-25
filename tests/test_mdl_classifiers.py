@@ -14,7 +14,7 @@ from jax import random as jrandom
 import numpy as np
 
 from src.mdl.coding import grid_values_and_codelengths
-from src.models.mdl_classifiers import GumbelSoftmaxMLP
+from src.models.mdl_classifiers import GumbelSoftmaxMLP, kaiming_categorical_init
 
 
 @pytest.fixture
@@ -114,6 +114,43 @@ class TestAuxOutputs:
         # Each row should sum to ~1
         row_sums = jnp.sum(all_probs, axis=-1)
         np.testing.assert_allclose(row_sums, 1.0, atol=1e-5)
+
+
+class TestKaimingCategoricalInit:
+    """Verify the Kaiming categorical initializer produces non-degenerate weights."""
+
+    def test_init_produces_peaked_distributions(self, model, params):
+        logits = params["logits"]
+        # Every row should have a dominant peak (peak_logit=10.0)
+        max_vals = jnp.max(logits, axis=-1)
+        assert float((max_vals > 1.0).mean()) > 0.99
+
+    def test_soft_forward_not_near_zero(self, model, params, dummy_input):
+        logits, _ = model.apply(
+            {"params": params}, dummy_input,
+            tau=2.0, train=True, rng=jrandom.PRNGKey(10),
+            soft_forward=True,
+        )
+        # With Kaiming init, soft forward should produce non-trivial logits
+        assert float(jnp.abs(logits).max()) > 0.1
+
+    def test_warmup_gradient_nonzero(self, model, params, dummy_input):
+        y = jnp.array([0, 1, 2, 3])
+
+        def loss_fn(p):
+            logits, _ = model.apply(
+                {"params": p}, dummy_input,
+                tau=2.0, train=True, rng=jrandom.PRNGKey(11),
+                soft_forward=True,
+            )
+            import optax
+            return optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+
+        grads = jax.grad(loss_fn)(params)
+        grad_norm = jnp.sqrt(sum(
+            jnp.sum(g**2) for g in jax.tree.leaves(grads)
+        ))
+        assert float(grad_norm) > 1e-6
 
 
 class TestMDLLoss:

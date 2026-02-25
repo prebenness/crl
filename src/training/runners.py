@@ -1,17 +1,18 @@
-"""Full training-loop runners with W&B logging."""
+"""Full training-loop runners with W&B logging and checkpointing."""
 
 import time
 
 import jax.numpy as jnp
 from jax import random as jrandom
 
-from src.data.datasets import make_epoch_batches
+from src.datasets.datasets import make_epoch_batches
 from src.mdl.training import anneal_tau
+from src.utils.checkpointing import save_checkpoint, save_results
 
 
 def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
                    wandb_run, *, create_state_fn, train_epoch_fn,
-                   eval_epoch_fn):
+                   eval_epoch_fn, run_dir=None):
     """Single-model (inner only) training loop."""
     rng = jrandom.PRNGKey(cfg.training.seed)
     input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
@@ -68,13 +69,17 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
             f"      Time: {time.time()-t0:.2f}s"
         )
 
+    if run_dir is not None:
+        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        save_results(run_dir, results)
+
     return results
 
 
 def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
                         outer_model, cfg, lamb, wandb_run,
                         *, create_inner_fn, create_outer_fn,
-                        train_epoch_pair_fn, eval_epoch_fn):
+                        train_epoch_pair_fn, eval_epoch_fn, run_dir=None):
     """Dual-model (inner + outer) training loop."""
     rng = jrandom.PRNGKey(cfg.training.seed)
     input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
@@ -139,6 +144,11 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
             f" | {time.time()-t0:.2f}s"
         )
 
+    if run_dir is not None:
+        save_checkpoint(inner_state.params, run_dir / "inner_final.npz")
+        save_checkpoint(outer_state.params, run_dir / "outer_final.npz")
+        save_results(run_dir, results)
+
     results["train_acc"] = results["train_acc2"]
     results["test_acc"] = results["test_acc2"]
     results["lambda"] = float(lamb)
@@ -148,7 +158,7 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
 def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
                        wandb_run, *, create_state_fn,
                        train_epoch_warmup_fn, train_epoch_fn,
-                       eval_epoch_fn):
+                       eval_epoch_fn, run_dir=None):
     """MDL single-model training loop with warmup and tau annealing."""
     rng = jrandom.PRNGKey(cfg.training.seed)
     input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
@@ -210,6 +220,10 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             f"  {time.time()-t0:.2f}s"
         )
 
+    if run_dir is not None:
+        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        save_results(run_dir, results)
+
     return results
 
 
@@ -217,7 +231,8 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
                             outer_model, cfg, lamb, wandb_run,
                             *, create_inner_fn, create_outer_fn,
                             train_epoch_warmup_fn, train_epoch_fn,
-                            eval_inner_epoch_fn, eval_outer_epoch_fn):
+                            eval_inner_epoch_fn, eval_outer_epoch_fn,
+                            run_dir=None):
     """MDL dual-model (MDL inner + standard outer) training loop."""
     rng = jrandom.PRNGKey(cfg.training.seed)
     input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
@@ -295,6 +310,11 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             f"{'  [warmup]' if is_warmup else ''}"
             f" | {time.time()-t0:.2f}s"
         )
+
+    if run_dir is not None:
+        save_checkpoint(inner_state.params, run_dir / "inner_final.npz")
+        save_checkpoint(outer_state.params, run_dir / "outer_final.npz")
+        save_results(run_dir, results)
 
     results["train_acc"] = results["train_acc2"]
     results["test_acc"] = results["test_acc2"]

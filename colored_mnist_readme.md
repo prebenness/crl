@@ -78,12 +78,12 @@ A single MLP where every weight and bias is parameterized as a categorical distr
 **Inner model loss:**
 
 ```
-L = CE(y, f(theta)) + lambda * (B/N) * L_hyp - (B/N) * tau * H
+L = CE(y, f(theta)) + lambda * (1/N) * L_hyp - (1/N) * tau * H
 ```
 
 where:
 
-- `CE` — softmax cross-entropy between classifier logits and labels
+- `CE` — softmax cross-entropy between classifier logits and labels, **averaged** over the batch
 - `L_hyp = sum_i sum_m pi_{i,m} * l(s_m)` — expected hypothesis codelength
   - `pi_{i,m} = softmax(alpha_i)_m` — probability that weight i takes grid value s_m (computed from the categorical logits, no Gumbel noise)
   - `l(s_m)` — description length in bits of rational value s_m under the Li & Vitanyi self-delimiting code: `l(+/-n/m) = 1 + |E(n)| + |E(m)|` where `|E(k)| = 2*ceil(log2(k+1)) + 1`
@@ -91,7 +91,7 @@ where:
 - `H = sum_i H(pi_i) = sum_i [ -sum_m pi_{i,m} * log2(pi_{i,m}) ]` — total entropy of the categorical weight distributions
   - `tau * H` is the entropy bonus: at high temperature it encourages exploration (uniform distributions over the grid), at low temperature it vanishes and weights crystallize to point masses
 - `tau` — Gumbel-Softmax temperature, annealed exponentially from `tau_start` to `tau_end` over training
-- `B/N` — batch scaling factor (batch size / total training set size)
+- `1/N` — scaling factor (N = total training set size). Since CE is averaged over the batch, the hypothesis and entropy terms use `1/N` (not `B/N`) so that over a full epoch each term accumulates correctly
 - `lambda` — the swept MDL penalty weight
 
 **Training phases:**

@@ -165,12 +165,18 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
               n_train, n_samples=1, soft_forward=False):
     """MDL inner-model loss: CE + lambda * hyp_codelength - entropy_bonus.
 
+    The CE is averaged over the batch (standard deep learning convention),
+    so the hypothesis and entropy terms use scale = 1/N (not B/N) to match.
+    Over a full epoch of N/B steps, each term accumulates correctly:
+      - data:    (N/B) * mean_CE  = (1/B) * sum_all CE  (proportional to full CE)
+      - hyp:     (N/B) * (1/N) * hyp_cl = (1/B) * hyp_cl  (same per-epoch weight)
+
     Returns (total_loss, (logits, ce, hyp_cl, entropy, z)).
     """
     from src.mdl.training import _compute_hyp_and_entropy
 
-    B = x.shape[0]
-    batch_scale = B / jnp.maximum(n_train, 1)
+    # 1/N scaling: matches averaged CE (see docstring)
+    hyp_scale = 1.0 / jnp.maximum(n_train, 1)
 
     if soft_forward or n_samples <= 1:
         logits, aux = apply_fn(
@@ -194,7 +200,7 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
 
     hyp_cl, entropy, entropy_bonus = _compute_hyp_and_entropy(aux, tau)
 
-    total_loss = ce + mdl_lambda * batch_scale * hyp_cl - batch_scale * entropy_bonus
+    total_loss = ce + mdl_lambda * hyp_scale * hyp_cl - hyp_scale * entropy_bonus
 
     z = aux.get("z", None)
 

@@ -4,9 +4,12 @@ wandb:
   project: "colored-mnist-mdl"
 
 # ---- Dataset ----
+# Available: colored_mnist (2-class), irm_colored_mnist (2-class),
+#            standard_mnist_bin (2-class), cmnist_ula (10-class)
+# num_classes must match dataset (enforced at startup).
 dataset:
-  name: "colored_mnist"
-  p_train: 0.9
+  name: "cmnist_ula"
+  p_train: 0.95
   p_test: 0.1
 
 # ---- Model ----
@@ -36,7 +39,7 @@ mdl:
 
 # ---- Lambda sweep (MDL penalty weight) ----
 sweep:
-  lambda_min_exp: -3
-  lambda_max_exp: 1
-  lambda_steps: 8
+  lambda_min_exp: 1
+  lambda_max_exp: 3
+  lambda_steps: 3
   log_sweep: true

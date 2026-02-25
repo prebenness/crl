@@ -14,6 +14,60 @@ import flax.linen as nn
 from typing import Any
 
 
+def kaiming_categorical_init(grid_values, layer_dims, peak_logit=10.0):
+    """Flax initializer that peaks categorical logits at Kaiming He targets.
+
+    The standard normal(stddev=0.1) init gives near-uniform softmax over the
+    symmetric grid, so E[w] ≈ 0 for every parameter — a dead ReLU network.
+    This initializer instead:
+      1. Draws a target weight from N(0, sqrt(2)) for each weight param
+         (biases target 0). Since the forward pass divides by sqrt(fan_in),
+         the effective init is sqrt(2/fan_in) = Kaiming He for ReLU.
+      2. Finds the nearest grid value to each target.
+      3. Sets the logit at that grid index to peak_logit, rest to 0.
+
+    Uses pure JAX ops so the function is traceable under JIT.
+
+    Args:
+        grid_values: (M,) array of rational grid values
+        layer_dims: [input_dim, h1, bottleneck, h3, num_classes]
+        peak_logit: logit value at the target grid index (rest get 0)
+    """
+    grid_jnp = jnp.asarray(grid_values)
+
+    def init_fn(rng, shape, dtype=jnp.float32):
+        n_total, M = shape
+
+        # Build per-parameter target weights using JAX random
+        targets = jnp.zeros(n_total)
+        offset = 0
+        for i in range(len(layer_dims) - 1):
+            fan_in = layer_dims[i]
+            fan_out = layer_dims[i + 1]
+
+            # Weights: N(0, sqrt(2)) — forward pass divides by sqrt(fan_in)
+            n_w = fan_in * fan_out
+            rng, rng_layer = jrandom.split(rng)
+            w_targets = jrandom.normal(rng_layer, shape=(n_w,)) * jnp.sqrt(2.0)
+            targets = targets.at[offset:offset + n_w].set(w_targets)
+            offset += n_w
+
+            # Biases: target 0 (already zero)
+            offset += fan_out
+
+        # Find nearest grid value for each parameter
+        nearest_idx = jnp.argmin(
+            jnp.abs(targets[:, None] - grid_jnp[None, :]), axis=-1,
+        )
+
+        # Set logit at nearest grid index to peak_logit, rest stay at 0
+        logits = jnp.zeros((n_total, M), dtype=dtype)
+        logits = logits.at[jnp.arange(n_total), nearest_idx].set(peak_logit)
+        return logits
+
+    return init_fn
+
+
 class GumbelSoftmaxMLP(nn.Module):
     """MLP where every weight/bias is a categorical over a rational grid.
 
@@ -73,7 +127,7 @@ class GumbelSoftmaxMLP(nn.Module):
 
         all_logits = self.param(
             "logits",
-            nn.initializers.normal(stddev=0.1),
+            kaiming_categorical_init(self.grid_values, layer_dims),
             (n_total, M),
         )
 
@@ -114,28 +168,34 @@ class GumbelSoftmaxMLP(nn.Module):
 
         h = x.reshape((B, -1))  # flatten
 
+        # Each layer applies fan-in scaling: W / sqrt(fan_in).
+        # Without this, random grid values (up to ±5) with large fan-in
+        # produce extreme activations — unlike LSTMs where sigmoid/tanh
+        # gates naturally bound values. The scaling is part of the
+        # architecture; codelengths still describe the unscaled rationals.
+
         # Layer 1: input -> h1
         W1 = take(input_dim * self.h1).reshape(input_dim, self.h1)
         b1 = take(self.h1)
-        h = h @ W1 + b1
+        h = h @ W1 / jnp.sqrt(jnp.float32(input_dim)) + b1
         h = nn.relu(h)
 
         # Layer 2: h1 -> bottleneck
         W2 = take(self.h1 * self.bottleneck).reshape(self.h1, self.bottleneck)
         b2 = take(self.bottleneck)
-        z = h @ W2 + b2  # bottleneck activations (for HSIC)
+        z = h @ W2 / jnp.sqrt(jnp.float32(self.h1)) + b2
         h = nn.relu(z)
 
         # Layer 3: bottleneck -> h3
         W3 = take(self.bottleneck * self.h3).reshape(self.bottleneck, self.h3)
         b3 = take(self.h3)
-        h = h @ W3 + b3
+        h = h @ W3 / jnp.sqrt(jnp.float32(self.bottleneck)) + b3
         h = nn.relu(h)
 
         # Layer 4: h3 -> num_classes
         W4 = take(self.h3 * self.num_classes).reshape(self.h3, self.num_classes)
         b4 = take(self.num_classes)
-        logits = h @ W4 + b4
+        logits = h @ W4 / jnp.sqrt(jnp.float32(self.h3)) + b4
 
         aux = {
             "expected_codelength": expected_codelength,
