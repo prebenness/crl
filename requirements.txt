@@ -1,0 +1,17 @@
+# Single environment spec for this project (research workflow, not production).
+# Targeted at your current setup: Python 3.12 + NVIDIA GPU (CUDA 13 wheels).
+
+numpy>=2.0
+scipy>=1.12
+pandas>=2.2
+matplotlib>=3.8
+PyYAML>=6.0
+tqdm>=4.66
+wandb>=0.18
+
+flax>=0.11
+optax>=0.2
+torch>=2.4
+torchvision>=0.19
+
+jax[cuda13]
