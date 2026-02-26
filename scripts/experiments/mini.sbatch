@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --account=prebenmn
-#SBATCH --job-name=lambda-sweep
+#SBATCH --job-name=lambda-mini
 #SBATCH --partition=a40q
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=6
-#SBATCH --mem=32G
-#SBATCH --time=04:00:00
-#SBATCH --array=0-7%8
-#SBATCH --output=/home/prebenmn/D1/workspace/crl/logs/lambda_sweep_%A_%a.log
+#SBATCH --mem=16G
+#SBATCH --time=00:20:00
+#SBATCH --array=0-0
+#SBATCH --output=/home/prebenmn/D1/workspace/crl/logs/lambda_mini_%A_%a.log
 
 set -euo pipefail
 
@@ -17,7 +17,7 @@ REPO=/home/prebenmn/D1/workspace/crl
 PY=$REPO/venv/bin/python
 N_LAM=8
 SEED=42
-EPOCHS=300
+EPOCHS=1
 N_SAMPLES=10
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
@@ -34,7 +34,7 @@ print(np.linspace(-3, 1, $N_LAM)[$LIDX])
 PY
 )
 
-WORK=${SLURM_TMPDIR:-/tmp}/cmnist_${SLURM_JOB_ID}_${TASK_ID}
+WORK=${SLURM_TMPDIR:-/tmp}/cmnist_mini_${SLURM_JOB_ID}_${TASK_ID}
 mkdir -p "$WORK"
 cd "$WORK"
 ln -s "$REPO/data" data || true
@@ -58,7 +58,7 @@ mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 $PY "$REPO/colored_mnist.py" "$CFG"
 
-DEST="$REPO/results/slurm_${SLURM_JOB_ID}_${TASK_ID}"
+DEST="$REPO/results/slurm_mini_${SLURM_JOB_ID}_${TASK_ID}"
 mkdir -p "$DEST"
 cp -r "$WORK/results" "$DEST/" || true
 cp -r "$WORK/wandb" "$DEST/" 2>/dev/null || true
