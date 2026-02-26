@@ -163,17 +163,33 @@ def make_train_step_pair(cfg):
 
 def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
               n_train, n_samples=1, soft_forward=False):
-    """MDL inner-model loss: CE + lambda * hyp_codelength - entropy_bonus.
+    """MDL inner-model loss in nats: CE + lambda * hyp_codelength - entropy_bonus.
 
     The CE is averaged over the batch (standard deep learning convention),
     so the hypothesis and entropy terms use scale = 1/N (not B/N) to match.
     Over a full epoch of N/B steps, each term accumulates correctly:
       - data:    (N/B) * mean_CE  = (1/B) * sum_all CE  (proportional to full CE)
       - hyp:     (N/B) * (1/N) * hyp_cl = (1/B) * hyp_cl  (same per-epoch weight)
+    For Colored-MNIST only, the MDL terms are converted to nats so all
+    components share the same unit:
+      - CE is already in nats (optax softmax CE)
+      - codelength is converted from bits to nats via ln(2)
+      - entropy uses natural log (nats)
 
     Returns (total_loss, (logits, ce, hyp_cl, entropy, z)).
     """
-    from src.mdl.training import _compute_hyp_and_entropy
+    def _compute_hyp_and_entropy_nats(model_aux, tau_val):
+        expected_hyp_bits = model_aux["expected_codelength"]
+        expected_hyp_nats = expected_hyp_bits * jnp.log(2.0)
+
+        all_probs = model_aux["all_probs"]  # (n_params, M)
+        log_probs = jnp.log(all_probs + 1e-10)
+        entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
+        total_entropy_nats = jnp.sum(entropy_per_param)
+
+        # beta = 1/tau, so 1/beta = tau
+        entropy_bonus_nats = tau_val * total_entropy_nats
+        return expected_hyp_nats, total_entropy_nats, entropy_bonus_nats
 
     # 1/N scaling: matches averaged CE (see docstring)
     hyp_scale = 1.0 / jnp.maximum(n_train, 1)
@@ -198,7 +214,7 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
 
     ce = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
 
-    hyp_cl, entropy, entropy_bonus = _compute_hyp_and_entropy(aux, tau)
+    hyp_cl, entropy, entropy_bonus = _compute_hyp_and_entropy_nats(aux, tau)
 
     total_loss = ce + mdl_lambda * hyp_scale * hyp_cl - hyp_scale * entropy_bonus
 

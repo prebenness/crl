@@ -112,7 +112,7 @@ python colored_mnist.py configs/mdl.yaml
 
 Two models trained jointly. The inner model is the same MDL-regularised MLP as in `mdl` mode. The outer model is a standard classifier decorrelated via class-conditional HSIC, identical to the outer model in `pair` mode.
 
-**Inner model loss:** Identical to `mdl` mode above. The 50-dimensional bottleneck layer activations serve as the representation `z1` for HSIC (analogous to `mu` in VIB).
+**Inner model loss:** Identical to `mdl` mode above. The 100-dimensional bottleneck layer activations serve as the representation `z1` for HSIC (analogous to `mu` in VIB).
 
 **Outer model loss:**
 

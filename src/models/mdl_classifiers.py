@@ -89,7 +89,7 @@ class GumbelSoftmaxMLP(nn.Module):
     grid_values: Any   # (M,) array
     grid_codelengths: Any  # (M,) array
     h1: int = 100
-    bottleneck: int = 50
+    bottleneck: int = 100
     h3: int = 100
 
     @nn.compact

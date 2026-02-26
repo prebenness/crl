@@ -202,6 +202,8 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             "train_ce": float(metrics["ce"]),
             "train_hyp_cl": float(metrics["hyp_cl"]),
             "train_entropy": float(metrics["entropy"]),
+            "train_hyp_cl_nats": float(metrics["hyp_cl"]),
+            "train_entropy_nats": float(metrics["entropy"]),
             "tau": float(tau),
             "test_loss": float(te_loss),
             "test_acc": float(te_acc),
@@ -213,8 +215,8 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             f"  Epoch {ep+1}/{cfg.training.epochs}"
             f"  Acc tr {float(metrics['acc']):.4f} te {float(te_acc):.4f}"
             f"  CE {float(metrics['ce']):.4f}"
-            f"  HypCL {float(metrics['hyp_cl']):.1f}"
-            f"  H {float(metrics['entropy']):.1f}"
+            f"  HypCL(nats) {float(metrics['hyp_cl']):.1f}"
+            f"  H(nats) {float(metrics['entropy']):.1f}"
             f"  tau {float(tau):.4f}"
             f"{'  [warmup]' if is_warmup else ''}"
             f"  {time.time()-t0:.2f}s"
@@ -286,6 +288,8 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             "train_ce1": float(metrics["ce1"]),
             "train_hyp_cl": float(metrics["hyp_cl"]),
             "train_entropy": float(metrics["entropy"]),
+            "train_hyp_cl_nats": float(metrics["hyp_cl"]),
+            "train_entropy_nats": float(metrics["entropy"]),
             "test_acc1": float(te_acc1),
             "test_loss1": float(te_loss1),
             "train_acc2": float(metrics["acc2"]),
