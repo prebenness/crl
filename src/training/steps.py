@@ -264,12 +264,14 @@ def make_train_step_mdl_pair(cfg, soft_forward=False):
         x, y = batch
         hsic_w = jnp.asarray(hsic_w, jnp.float32)
 
-        rng1, rng2 = jrandom.split(rng, 2)
+        # Keep inner RNG stream identical to single-model MDL step.
+        # This preserves inner-update comparability between mdl and mdl_pair.
+        rng_inner = rng
 
         # --- Inner model (MDL) ---
         def loss_fn1(params):
             return _mdl_loss(
-                inner_state.apply_fn, params, x, y, rng1,
+                inner_state.apply_fn, params, x, y, rng_inner,
                 inner_state.tau, mdl_lambda, n_train, n_samples, soft_forward,
             )
 

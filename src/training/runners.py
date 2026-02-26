@@ -160,11 +160,13 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
                        train_epoch_warmup_fn, train_epoch_fn,
                        eval_epoch_fn, run_dir=None):
     """MDL single-model training loop with warmup and tau annealing."""
-    rng = jrandom.PRNGKey(cfg.training.seed)
+    base_rng = jrandom.PRNGKey(cfg.training.seed)
+    rng_init_inner = jrandom.fold_in(base_rng, 0)
+    rng_train = jrandom.fold_in(base_rng, 2)
+    rng_eval = jrandom.fold_in(base_rng, 3)
     input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
-    rng, rng_init = jrandom.split(rng)
 
-    state = create_state_fn(rng_init, model, input_shape, cfg)
+    state = create_state_fn(rng_init_inner, model, input_shape, cfg)
     n_train = x_train.shape[0]
 
     for ep in range(cfg.training.epochs):
@@ -179,7 +181,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
 
         seed_tr = cfg.training.seed * 10_000 + ep
         seed_te = cfg.training.seed * 20_000 + ep
-        rng, rng_epoch = jrandom.split(rng)
+        rng_train, rng_epoch = jrandom.split(rng_train)
 
         xb, yb = make_epoch_batches(
             x_train, y_train, cfg.training.batch_size, seed_tr,
@@ -192,8 +194,8 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             state, xb, yb, rng_epoch, lamb, n_train,
         )
 
-        rng, rng_eval = jrandom.split(rng)
-        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval)
+        rng_eval, rng_eval_epoch = jrandom.split(rng_eval)
+        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval_epoch)
 
         results = {
             "epoch": ep + 1,
@@ -236,12 +238,17 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
                             eval_inner_epoch_fn, eval_outer_epoch_fn,
                             run_dir=None):
     """MDL dual-model (MDL inner + standard outer) training loop."""
-    rng = jrandom.PRNGKey(cfg.training.seed)
+    base_rng = jrandom.PRNGKey(cfg.training.seed)
+    # Match the inner-model init/train/eval streams used in run_train_eval_mdl
+    # so mdl and mdl_pair are directly comparable.
+    rng_init_inner = jrandom.fold_in(base_rng, 0)
+    rng_init_outer = jrandom.fold_in(base_rng, 1)
+    rng_train = jrandom.fold_in(base_rng, 2)
+    rng_eval = jrandom.fold_in(base_rng, 3)
     input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
-    rng, r1, r2 = jrandom.split(rng, 3)
 
-    inner_state = create_inner_fn(r1, inner_model, input_shape, cfg)
-    outer_state = create_outer_fn(r2, outer_model, input_shape, cfg)
+    inner_state = create_inner_fn(rng_init_inner, inner_model, input_shape, cfg)
+    outer_state = create_outer_fn(rng_init_outer, outer_model, input_shape, cfg)
     n_train = x_train.shape[0]
 
     for ep in range(cfg.training.epochs):
@@ -258,7 +265,7 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
 
         seed_tr = cfg.training.seed * 10_000 + ep
         seed_te = cfg.training.seed * 20_000 + ep
-        rng, rng_epoch = jrandom.split(rng)
+        rng_train, rng_epoch = jrandom.split(rng_train)
 
         xb, yb = make_epoch_batches(
             x_train, y_train, cfg.training.batch_size, seed_tr,
@@ -273,12 +280,13 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             num_classes=cfg.model.num_classes,
         )
 
-        rng, rng_eval1, rng_eval2 = jrandom.split(rng, 3)
+        rng_eval, rng_eval_inner = jrandom.split(rng_eval)
+        rng_eval_outer = jrandom.fold_in(rng_eval_inner, 1)
         te_loss1, te_acc1 = eval_inner_epoch_fn(
-            inner_state, xt, yt, rng_eval1,
+            inner_state, xt, yt, rng_eval_inner,
         )
         te_loss2, te_acc2 = eval_outer_epoch_fn(
-            outer_state, xt, yt, rng_eval2,
+            outer_state, xt, yt, rng_eval_outer,
         )
 
         results = {
