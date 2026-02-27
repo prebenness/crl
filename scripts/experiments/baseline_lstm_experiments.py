@@ -9,13 +9,13 @@ while MDL-trained networks find generalizing solutions.
 
 Usage:
     # Single run
-    python3.12 baseline_experiments.py --reg none --seed 42
+    python3.12 scripts/experiments/baseline_lstm_experiments.py --reg none --seed 42
 
     # With L1 regularization
-    python3.12 baseline_experiments.py --reg l1 --reg_lambda 0.1 --seed 42
+    python3.12 scripts/experiments/baseline_lstm_experiments.py --reg l1 --reg_lambda 0.1 --seed 42
 
     # Full grid search (matching Lan et al.)
-    bash run_baselines.sh
+    bash scripts/experiments/run_baselines.sh
 """
 
 import argparse
@@ -30,6 +30,10 @@ import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 import optax
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from src.mdl.data import (
     make_anbn_dataset,

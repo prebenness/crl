@@ -22,7 +22,7 @@ LOG="$ROOT_DIR/logs"
 mkdir -p "$LOG"
 
 PY="${PY:-python3.12}"
-S="$ROOT_DIR/baseline_experiments.py"
+S="$ROOT_DIR/scripts/experiments/baseline_lstm_experiments.py"
 
 # Matching Lan et al.: Adam lr=0.001, 20000 epochs, train_size=1000
 COMMON="--epochs 20000 --lr 0.001 --num_train 1000 --batch_size 0 \
@@ -76,4 +76,4 @@ echo "============================================"
 echo "Baseline experiments complete at $(date)"
 echo "============================================"
 echo ""
-echo "Run 'python3.12 analyze_results.py --tag baseline' to see summary."
+echo "Run 'python3.12 scripts/analysis/summarize_experiment_results.py --tag baseline' to see summary."

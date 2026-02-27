@@ -4,10 +4,10 @@ Reads results.json files from results/ directories and computes
 summary statistics (mean, std, min, max) for key metrics.
 
 Usage:
-    python3.12 analyze_results.py                    # all results
-    python3.12 analyze_results.py --tag sweep         # only dirs containing "sweep"
-    python3.12 analyze_results.py --tag baseline      # only baseline runs
-    python3.12 analyze_results.py --mode basic        # only basic mode runs
+    python3.12 scripts/analysis/summarize_experiment_results.py                 # all results
+    python3.12 scripts/analysis/summarize_experiment_results.py --tag sweep     # only dirs containing "sweep"
+    python3.12 scripts/analysis/summarize_experiment_results.py --tag baseline  # only baseline runs
+    python3.12 scripts/analysis/summarize_experiment_results.py --mode basic    # only basic mode runs
 """
 
 import argparse
