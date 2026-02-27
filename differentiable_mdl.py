@@ -664,6 +664,29 @@ def _load_resume_meta_epoch(run_dir: Path) -> int:
     return 0
 
 
+def _print_resolved_parameters(args):
+    """Print resolved effective parameters at startup."""
+    params = vars(args)
+
+    print("\nResolved parameters")
+    print("-" * 60)
+    print(f"  mode={args.mode}")
+    if args.mode == "basic":
+        print(f"  objective: CE + mdl_lambda*|H| - entropy_bonus")
+        print(f"  mdl_lambda={args.mdl_lambda}")
+    else:
+        print(
+            "  objective: CE + lambda1*KL(pi||phi) + lambda2*KL(phi||P_base) - entropy_bonus"
+        )
+        print(f"  lambda1={args.lambda1}")
+        print(f"  lambda2={args.lambda2}")
+        print(f"  epsilon={args.epsilon}")
+
+    for key in sorted(params):
+        print(f"  {key}={params[key]}")
+    print("-" * 60)
+
+
 def main():
     # Parse config path first so YAML defaults can seed argparse.
     pre = argparse.ArgumentParser(add_help=False)
@@ -767,6 +790,7 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     else:
         print(f"Run directory: {run_dir}")
     print("=" * 60)
+    _print_resolved_parameters(args)
 
     # --- Golden network baseline ---
     golden_mdl, golden_result = evaluate_golden_baseline(args.test_max_n, args.p)
