@@ -41,5 +41,5 @@ mdl:
 sweep:
   lambda_min_exp: -3
   lambda_max_exp: 3
-  lambda_steps: 7
+  lambda_steps: 30
   log_sweep: true
