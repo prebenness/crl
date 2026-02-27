@@ -10,7 +10,7 @@
 echo "Starting job at time:" && date +%Y-%m-%d_%H:%M:%S
 
 # Set venv for partition
-source /global/D1/homes/prebenmn/workspace/crl/hgx2q/bin/activate
+source /global/D1/homes/prebenmn/workspace/crl/venvs/hgx2q/bin/activate
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
 

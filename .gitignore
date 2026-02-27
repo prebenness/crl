@@ -1,5 +1,7 @@
+# Virtual environments
 venv/
-hgx2q
+venvs/
+
 input_data/
 __pycache__/
 cfg.env
