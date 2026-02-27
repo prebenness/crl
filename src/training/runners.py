@@ -7,7 +7,7 @@ from jax import random as jrandom
 
 from src.datasets.datasets import make_epoch_batches
 from src.mdl.training import anneal_tau
-from src.utils.checkpointing import save_checkpoint, save_results
+from src.utils.checkpointing import save_checkpoint, save_results, checkpoint_path
 
 
 def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
@@ -70,7 +70,7 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
         )
 
     if run_dir is not None:
-        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
         save_results(run_dir, results)
 
     return results
@@ -145,8 +145,8 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
         )
 
     if run_dir is not None:
-        save_checkpoint(inner_state.params, run_dir / "inner_final.npz")
-        save_checkpoint(outer_state.params, run_dir / "outer_final.npz")
+        save_checkpoint(inner_state.params, checkpoint_path(run_dir, "inner_final.npz"))
+        save_checkpoint(outer_state.params, checkpoint_path(run_dir, "outer_final.npz"))
         save_results(run_dir, results)
 
     results["train_acc"] = results["train_acc2"]
@@ -225,7 +225,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
         )
 
     if run_dir is not None:
-        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
         save_results(run_dir, results)
 
     return results
@@ -324,8 +324,8 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
         )
 
     if run_dir is not None:
-        save_checkpoint(inner_state.params, run_dir / "inner_final.npz")
-        save_checkpoint(outer_state.params, run_dir / "outer_final.npz")
+        save_checkpoint(inner_state.params, checkpoint_path(run_dir, "inner_final.npz"))
+        save_checkpoint(outer_state.params, checkpoint_path(run_dir, "outer_final.npz"))
         save_results(run_dir, results)
 
     results["train_acc"] = results["train_acc2"]

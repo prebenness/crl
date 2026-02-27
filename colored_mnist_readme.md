@@ -32,8 +32,8 @@ where:
 **What lambda controls:** Information capacity target. The ControlVAE controller adjusts beta to push KL toward lambda. Low lambda = tight bottleneck (less information passes through z), high lambda = loose bottleneck.
 
 ```bash
-# Edit configs/default.yaml: set model.mode to "single"
-python colored_mnist.py configs/default.yaml
+# Edit config/colored_mnist/vib_pair_sweep.yaml: set model.mode to "single"
+python colored_mnist.py config/colored_mnist/vib_pair_sweep.yaml
 ```
 
 ---
@@ -66,7 +66,7 @@ The idea: the inner model captures shortcuts (colour) via its bottleneck; the ou
 **What lambda controls:** Same as `single` — VIB capacity target for the inner model.
 
 ```bash
-python colored_mnist.py configs/default.yaml
+python colored_mnist.py config/colored_mnist/vib_pair_sweep.yaml
 ```
 
 ---
@@ -103,7 +103,7 @@ where:
 **What lambda controls:** Weight complexity penalty strength. Low lambda = almost no MDL pressure (model free to use any weights), high lambda = strong pressure toward simple rational weights (short description).
 
 ```bash
-python colored_mnist.py configs/mdl.yaml
+python colored_mnist.py config/colored_mnist/mdl_single_sweep.yaml
 ```
 
 ---
@@ -127,7 +127,7 @@ Identical in form to the `pair` outer loss, except `sg(z1)` comes from the MDL i
 **What lambda controls:** MDL penalty weight for the inner model (same as `mdl`).
 
 ```bash
-python colored_mnist.py configs/mdl_pair.yaml
+python colored_mnist.py config/colored_mnist/mdl_pair_sweep.yaml
 ```
 
 ---

@@ -22,6 +22,8 @@ Modes:
     --mode shared  : shared-weight extension with adaptive prior (Section 8)
 
 Usage:
+    python differentiable_mdl.py config/anbn_mdl/basic_train.yaml
+    python differentiable_mdl.py config/anbn_mdl/basic_train.yaml --epochs 50000
     python differentiable_mdl.py [--n_max 10] [--m_max 10] [--epochs 5000] ...
 """
 
@@ -30,7 +32,6 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 
@@ -45,6 +46,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random as jrandom
+import yaml
 
 # Persist compiled XLA kernels across runs to avoid redundant JIT compilation.
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
@@ -87,60 +89,39 @@ from src.mdl.analysis import (
     evaluate_range_f64,
     find_failure_n,
 )
+from src.utils.checkpointing import (
+    TeeLogger,
+    save_checkpoint,
+    load_checkpoint,
+    save_results,
+    save_config,
+    make_experiment_dir,
+    checkpoint_path,
+    utc_timestamp,
+)
 
 
 # ---------------------------------------------------------------------------
 # Run management: directories, logging, checkpointing
 # ---------------------------------------------------------------------------
 
-class TeeLogger:
-    """Mirrors stdout to both the terminal and a log file simultaneously."""
-
-    def __init__(self, log_path, mode="w"):
-        self._log_path = log_path
-        self._mode = mode
-        self._file = None
-        self._orig = None
-
-    def __enter__(self):
-        self._file = open(self._log_path, self._mode)
-        self._orig = sys.stdout
-        sys.stdout = self
-        return self
-
-    def __exit__(self, *_):
-        sys.stdout = self._orig
-        self._file.close()
-
-    def write(self, data):
-        self._orig.write(data)
-        self._file.write(data)
-
-    def flush(self):
-        self._orig.flush()
-        self._file.flush()
-
-    def fileno(self):
-        return self._orig.fileno()
-
 
 def make_run_dir(args):
     """Create a timestamped results directory and write config.json.
 
     Name format:
-        results/YYYYMMDD_HHMMSS_MODE_eEPOCHS_lrLR_lamLAMBDA_gNxM_sSEED/
+        results/anbn_mdl/YYYYMMDD_HHMMSS_MODE_eEPOCHS_lrLR_lamLAMBDA_gNxM_sSEED/
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = utc_timestamp()
     lam = args.mdl_lambda if args.mode == "basic" else args.lambda1
+    cfg_tag = f"_cfg{args.config_name}" if args.config_name else ""
     name = (
         f"{ts}_{args.mode}_e{args.epochs}"
         f"_lr{args.lr}_lam{lam}"
-        f"_g{args.n_max}x{args.m_max}_s{args.seed}"
+        f"_g{args.n_max}x{args.m_max}_s{args.seed}{cfg_tag}"
     )
-    run_dir = Path("results") / name
-    run_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / "config.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+    run_dir = make_experiment_dir("anbn_mdl", name)
+    save_config(run_dir, vars(args))
     return run_dir
 
 
@@ -150,32 +131,11 @@ def load_run_config(run_dir):
         return argparse.Namespace(**json.load(f))
 
 
-def save_checkpoint(params, path):
-    """Save a params dict (JAX/numpy arrays) to a .npz file."""
-    np.savez(str(path), **{k: np.array(v) for k, v in params.items()})
-
-
-def load_checkpoint(path):
-    """Load a params dict from a .npz file. Returns dict of jnp arrays."""
-    data = np.load(str(path))
-    return {k: jnp.array(data[k]) for k in data.files}
-
-
 def save_checkpoint_meta(run_dir, epoch, best_val_n_perfect):
-    """Write a small JSON sidecar recording the last completed epoch."""
+    """Write a small sidecar recording the last completed epoch."""
     meta = {"last_epoch": int(epoch), "best_val_n_perfect": int(best_val_n_perfect)}
-    with open(Path(run_dir) / "checkpoint_meta.json", "w") as f:
+    with open(checkpoint_path(run_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
-
-
-def save_results(run_dir, results_dict):
-    """Write final test metrics to results.json."""
-    clean = {
-        k: (v.item() if hasattr(v, "item") else v)
-        for k, v in results_dict.items()
-    }
-    with open(Path(run_dir) / "results.json", "w") as f:
-        json.dump(clean, f, indent=2)
 
 
 def get_train_max_n(inputs):
@@ -385,7 +345,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 best_val_n_perfect = n_perfect
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
-                    save_checkpoint(best_params, run_dir / "checkpoint_best.npz")
+                    save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
                     save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
                     print(f"              ↳ [CKPT] checkpoint saved")
 
@@ -394,7 +354,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     print(f"Training complete in {elapsed:.1f}s")
 
     if run_dir is not None:
-        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
         print(f"  [CKPT] Final checkpoint saved")
 
     return state, best_params, best_val_n_perfect
@@ -527,7 +487,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 best_val_n_perfect = n_perfect
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
-                    save_checkpoint(best_params, run_dir / "checkpoint_best.npz")
+                    save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
                     save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
                     print(f"              ↳ [CKPT] checkpoint saved")
 
@@ -536,14 +496,44 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     print(f"Training complete in {elapsed:.1f}s")
 
     if run_dir is not None:
-        save_checkpoint(state.params, run_dir / "checkpoint_final.npz")
+        save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
         print(f"  [CKPT] Final checkpoint saved")
 
     return state, best_params, best_val_n_perfect
 
 
-def main():
+def _resolve_config_path(config_arg):
+    """Resolve a config argument to an existing YAML path."""
+    if config_arg is None:
+        return None
+    p = Path(config_arg)
+    if p.exists():
+        return p
+    for ext in (".yaml", ".yml"):
+        p_ext = Path(f"{config_arg}{ext}")
+        if p_ext.exists():
+            return p_ext
+    return None
+
+
+def _load_yaml_defaults(config_path):
+    """Load flat key/value defaults from a YAML config file."""
+    with open(config_path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Config must be a mapping of argument names to values: {config_path}"
+        )
+    return raw
+
+
+def _build_arg_parser(defaults=None):
+    """Build argument parser, optionally seeded by config defaults."""
     parser = argparse.ArgumentParser(description="Differentiable MDL experiment")
+    parser.add_argument(
+        "config", nargs="?", default=None,
+        help="Optional YAML config path. CLI flags override YAML values.",
+    )
     # Mode
     parser.add_argument("--mode", type=str, default="basic",
                         choices=["basic", "shared"],
@@ -610,7 +600,68 @@ def main():
     parser.add_argument("--resume", action="store_true",
                         help="Load best checkpoint from --ckpt and resume training")
 
+    if defaults:
+        valid_dests = {a.dest for a in parser._actions}
+        unknown = sorted(k for k in defaults if k not in valid_dests)
+        if unknown:
+            raise ValueError(
+                "Unknown config keys: "
+                f"{', '.join(unknown)}"
+            )
+        parser.set_defaults(**defaults)
+    return parser
+
+
+def _resolve_resume_checkpoint(run_dir: Path) -> Path:
+    """Find checkpoint file for eval/resume, supporting legacy filenames."""
+    candidates = [
+        checkpoint_path(run_dir, "best.npz", create=False),
+        checkpoint_path(run_dir, "final.npz", create=False),
+        run_dir / "checkpoint_best.npz",
+        run_dir / "checkpoint_final.npz",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError(f"No checkpoint found in {run_dir}")
+
+
+def _load_resume_meta_epoch(run_dir: Path) -> int:
+    """Read resume epoch from checkpoint metadata, supporting legacy path."""
+    candidates = [
+        checkpoint_path(run_dir, "meta.json", create=False),
+        run_dir / "checkpoint_meta.json",
+    ]
+    for meta_path in candidates:
+        if meta_path.exists():
+            with open(meta_path) as f:
+                meta = json.load(f)
+            return int(meta.get("last_epoch", 0))
+    return 0
+
+
+def main():
+    # Parse config path first so YAML defaults can seed argparse.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("config", nargs="?")
+    pre_args, _ = pre.parse_known_args()
+
+    yaml_defaults = {}
+    pre_cfg_path = _resolve_config_path(pre_args.config)
+    if pre_cfg_path is not None:
+        yaml_defaults = _load_yaml_defaults(pre_cfg_path)
+
+    try:
+        parser = _build_arg_parser(defaults=yaml_defaults)
+    except ValueError as e:
+        raise SystemExit(str(e))
     args = parser.parse_args()
+
+    cfg_path = _resolve_config_path(args.config)
+    if args.config is not None and cfg_path is None:
+        parser.error(f"Config file not found: {args.config}")
+    args.config = str(cfg_path) if cfg_path else None
+    args.config_name = cfg_path.stem if cfg_path else None
 
     # If data_seed not given, tie it to seed so --seed controls all randomness.
     if args.data_seed is None:
@@ -639,6 +690,10 @@ def main():
         saved_args.ckpt = args.ckpt
         saved_args.analyze = cli_analyze
         saved_args.analyze_max_n = cli_analyze_max_n
+        if not hasattr(saved_args, "config"):
+            saved_args.config = None
+        if not hasattr(saved_args, "config_name"):
+            saved_args.config_name = None
         if test_max_n_explicit:
             saved_args.test_max_n = cli_test_max_n
         args = saved_args
@@ -646,20 +701,12 @@ def main():
     # --- Set up run directory and logging ---
     if args.eval or args.resume:
         run_dir = Path(args.ckpt)
-        ckpt_path = run_dir / "checkpoint_best.npz"
-        if not ckpt_path.exists():
-            ckpt_path = run_dir / "checkpoint_final.npz"
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"No checkpoint found in {run_dir}")
+        ckpt_path = _resolve_resume_checkpoint(run_dir)
         loaded_params = load_checkpoint(ckpt_path)
         start_epoch = 0
         if args.resume:
-            meta_path = run_dir / "checkpoint_meta.json"
-            if meta_path.exists():
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                start_epoch = meta.get("last_epoch", 0)
-                print(f"Resuming from epoch {start_epoch}/{args.epochs}")
+            start_epoch = _load_resume_meta_epoch(run_dir)
+            print(f"Resuming from epoch {start_epoch}/{args.epochs}")
         log_mode = "a"
     else:
         run_dir = make_run_dir(args)
@@ -687,6 +734,8 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         print("Deterministic mode: OFF (pass --deterministic for full reproducibility)")
     print("Differentiable MDL for a^n b^n")
     print(f"Mode: {args.mode}")
+    if getattr(args, "config", None):
+        print(f"Config: {args.config}")
     if args.eval:
         print(f"[EVAL MODE] checkpoint: {args.ckpt}")
     elif args.resume:

@@ -5,6 +5,7 @@ Shared utilities used by both differentiable_mdl.py and colored_mnist.py.
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -69,8 +70,30 @@ def load_checkpoint(path):
     return params
 
 
+def utc_timestamp() -> str:
+    """Return a compact UTC timestamp safe for filenames."""
+    return time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+
+
+def make_experiment_dir(experiment: str, run_name: str,
+                        results_root: str = "results") -> Path:
+    """Create and return a run directory under results/<experiment>/."""
+    run_dir = Path(results_root) / experiment / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def checkpoint_path(run_dir, filename: str, create: bool = True) -> Path:
+    """Return run_dir/checkpoints/<filename>, creating the directory if needed."""
+    ckpt_dir = Path(run_dir) / "checkpoints"
+    if create:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    return ckpt_dir / filename
+
+
 def save_results(run_dir, results_dict):
     """Write final metrics to results.json."""
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
     clean = {
         k: (v.item() if hasattr(v, "item") else v)
         for k, v in results_dict.items()
@@ -81,5 +104,6 @@ def save_results(run_dir, results_dict):
 
 def save_config(run_dir, config_dict):
     """Write config to config.json."""
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(run_dir) / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)

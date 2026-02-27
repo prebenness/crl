@@ -6,13 +6,15 @@
 #   bash run_seed_sweep.sh          # run all 10 seeds
 #   bash run_seed_sweep.sh 0 4      # run seeds 0..4 only
 
-cd "$(dirname "$0")"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
 
-LOG=logs
+LOG="$ROOT_DIR/logs"
 mkdir -p "$LOG"
 
-PY=python3.12
-S=differentiable_mdl.py
+PY="${PY:-python3.12}"
+S="$ROOT_DIR/differentiable_mdl.py"
+CFG="$ROOT_DIR/config/anbn_mdl/basic_train.yaml"
 
 # Best configuration from existing runs
 COMMON="--mode basic --epochs 10000 --warmup_epochs 1000 \
@@ -31,7 +33,7 @@ run() {
   echo ""
   echo ">>> Seed sweep: seed=${seed}"
   echo ">>> Log: ${LOG}/${name}.log"
-  $PY $S $COMMON --seed $seed 2>&1 | tee "${LOG}/${name}.log"
+  $PY $S "$CFG" $COMMON --seed $seed 2>&1 | tee "${LOG}/${name}.log"
   echo ">>> Done: seed=${seed}"
 }
 

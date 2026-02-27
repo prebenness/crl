@@ -14,7 +14,7 @@ from src.training.train_state import create_state_mdl, create_state_outer
 
 def test_mdl_inner_step_matches_pair_when_hsic_is_zero():
     """Inner MDL update should match exactly when pairing adds no gradient."""
-    cfg = load_config("configs/mdl_pair.yaml")
+    cfg = load_config("config/colored_mnist/mdl_pair_sweep.yaml")
     cfg.training.batch_size = 16
     cfg.mdl.n_samples = 3
 

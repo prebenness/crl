@@ -14,4 +14,4 @@ source /global/D1/homes/prebenmn/workspace/crl/hgx2q/bin/activate
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
 
-srun python colored_mnist.py configs/mdl.yaml
+srun python colored_mnist.py config/colored_mnist/mdl_single_sweep.yaml

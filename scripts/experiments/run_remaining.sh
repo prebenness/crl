@@ -1,16 +1,19 @@
 #!/bin/bash
-cd "$(dirname "$0")"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
 
-LOG=logs
-PY=/usr/bin/python3.12
-S=differentiable_mdl.py
+LOG="$ROOT_DIR/logs"
+mkdir -p "$LOG"
+PY="${PY:-python3.12}"
+S="$ROOT_DIR/differentiable_mdl.py"
+CFG="$ROOT_DIR/config/anbn_mdl/basic_train.yaml"
 COMMON="--batch_size 0 --eval_every 500 --log_every 200"
 
 run() {
   local name=$1; shift
   echo ""
   echo ">>> Experiment: ${name}"
-  $PY $S "$@" $COMMON 2>&1 | tee ${LOG}/${name}.log
+  $PY $S "$CFG" "$@" $COMMON 2>&1 | tee "${LOG}/${name}.log"
   echo ">>> Done: ${name}"
 }
 

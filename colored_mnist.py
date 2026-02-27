@@ -1,4 +1,4 @@
-# Run with: python colored_mnist.py configs/default.yaml
+# Run with: python colored_mnist.py config/colored_mnist/vib_pair_sweep.yaml
 # Requirements:
 #   pip install jax jaxlib flax optax torch torchvision matplotlib pyyaml tqdm
 
@@ -8,6 +8,7 @@ os.environ["WANDB_SILENT"] = "true"
 import sys
 import time
 from pathlib import Path
+import json
 
 import numpy as np
 import wandb
@@ -18,7 +19,12 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
 from src.config import load_config
-from src.utils.checkpointing import TeeLogger, save_config
+from src.utils.checkpointing import (
+    TeeLogger,
+    save_config,
+    make_experiment_dir,
+    utc_timestamp,
+)
 from src.datasets.datasets import (
     build_dataset, dataset_to_jax_arrays, DATASET_NUM_CLASSES,
 )
@@ -84,7 +90,7 @@ OUTER_MODELS = {
 }
 
 
-def _make_sweep_plot(results, cfg):
+def _make_sweep_plot(results, cfg, out_path):
     """Generate and save the matplotlib sweep plot."""
     xs = np.array([r["lambda"] for r in results])
 
@@ -122,8 +128,8 @@ def _make_sweep_plot(results, cfg):
     ax.grid(True, which="minor", alpha=0.35)
 
     plt.tight_layout()
-    plt.savefig("coloredmnist_sweep.png", dpi=300)
-    print("Saved plot: coloredmnist_sweep.png")
+    plt.savefig(out_path, dpi=300)
+    print(f"Saved plot: {out_path}")
 
 
 def _print_timing_table(results, dataset_name):
@@ -156,7 +162,9 @@ def main():
     print("JAX devices:", jax.devices())
     jax.config.update("jax_default_matmul_precision", "high")
 
-    timestamp = time.strftime("%Y-%m-%d-T%H-%M-%S", time.gmtime())
+    cfg_path = Path(sys.argv[1]).resolve()
+    cfg_name = cfg_path.stem
+    timestamp = utc_timestamp()
     experiment_group_id = (
         f"{timestamp}-sweep-lambda"
         f"-{cfg.sweep.lambda_min_exp}-{cfg.sweep.lambda_max_exp}"
@@ -220,8 +228,23 @@ def main():
     sweep_start = time.time()
 
     # Create results directory for this sweep
-    sweep_dir = Path("results") / f"{timestamp}-{mode}"
-    sweep_dir.mkdir(parents=True, exist_ok=True)
+    sweep_name = f"{timestamp}_{cfg_name}_{cfg.dataset.name}_{mode}"
+    sweep_dir = make_experiment_dir("colored_mnist", sweep_name)
+    runs_dir = sweep_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    save_config(sweep_dir, {
+        "experiment": "colored_mnist",
+        "sweep_name": sweep_name,
+        "config_path": str(cfg_path),
+        "mode": mode,
+        "dataset": cfg.dataset.name,
+        "seed": cfg.training.seed,
+        "epochs": cfg.training.epochs,
+        "batch_size": cfg.training.batch_size,
+        "lr": cfg.training.lr,
+        "n_lambdas": int(len(cfg.lambdas)),
+        "lambdas": [float(v) for v in cfg.lambdas],
+    })
 
     for lamb in cfg.lambdas:
         lamb = float(lamb)
@@ -230,11 +253,14 @@ def main():
         print(f"\n--- Sweep (lamb={lamb:.1e}) ---")
 
         # Per-lambda run directory
-        run_dir = sweep_dir / f"lamb_{lamb:.1e}"
+        run_dir = runs_dir / f"lambda_{lamb:.1e}"
         run_dir.mkdir(parents=True, exist_ok=True)
         save_config(run_dir, {
+            "experiment": "colored_mnist",
+            "sweep_name": sweep_name,
             "mode": mode, "lambda": lamb,
             "dataset": cfg.dataset.name,
+            "config_path": str(cfg_path),
             "seed": cfg.training.seed,
             "epochs": cfg.training.epochs,
             "batch_size": cfg.training.batch_size,
@@ -332,7 +358,21 @@ def main():
         "raw_data": wandb.Table(dataframe=pd.DataFrame(all_results)),
     })
 
-    _make_sweep_plot(all_results, cfg)
+    plot_path = sweep_dir / "sweep_plot.png"
+    _make_sweep_plot(all_results, cfg, plot_path)
+
+    with open(sweep_dir / "summary.json", "w") as f:
+        json.dump({
+            "experiment": "colored_mnist",
+            "sweep_name": sweep_name,
+            "config_path": str(cfg_path),
+            "mode": mode,
+            "dataset": cfg.dataset.name,
+            "n_runs": len(all_results),
+            "total_time_sec": total_time,
+            "results": all_results,
+        }, f, indent=2)
+    pd.DataFrame(all_results).to_csv(sweep_dir / "summary.csv", index=False)
 
     summary_run.finish()
 

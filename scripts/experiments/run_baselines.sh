@@ -15,13 +15,14 @@
 # Usage:
 #   bash run_baselines.sh
 
-cd "$(dirname "$0")"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
 
-LOG=logs
+LOG="$ROOT_DIR/logs"
 mkdir -p "$LOG"
 
-PY=python3.12
-S=baseline_experiments.py
+PY="${PY:-python3.12}"
+S="$ROOT_DIR/baseline_experiments.py"
 
 # Matching Lan et al.: Adam lr=0.001, 20000 epochs, train_size=1000
 COMMON="--epochs 20000 --lr 0.001 --num_train 1000 --batch_size 0 \
