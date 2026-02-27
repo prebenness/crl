@@ -162,7 +162,8 @@ def make_train_step_pair(cfg):
 
 
 def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
-              n_train, n_samples=1, soft_forward=False):
+              n_train, n_samples=1, soft_forward=False,
+              deterministic_st=False):
     """MDL inner-model loss in nats: CE + lambda * hyp_codelength - entropy_bonus.
 
     The CE is averaged over the batch (standard deep learning convention),
@@ -194,25 +195,38 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
     # 1/N scaling: matches averaged CE (see docstring)
     hyp_scale = 1.0 / jnp.maximum(n_train, 1)
 
-    if soft_forward or n_samples <= 1:
+    if soft_forward:
         logits, aux = apply_fn(
             {"params": params}, x, tau=tau, train=True, rng=rng,
             soft_forward=soft_forward,
         )
-    else:
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+    elif deterministic_st:
+        logits, aux = apply_fn(
+            {"params": params}, x, tau=tau, train=True,
+            deterministic_st=True,
+        )
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+    elif n_samples > 1:
         keys = jrandom.split(rng, n_samples)
 
         def one_sample(k):
-            return apply_fn(
+            logits_k, aux_k = apply_fn(
                 {"params": params}, x, tau=tau, train=True, rng=k,
             )
+            ce_k = optax.softmax_cross_entropy_with_integer_labels(logits_k, y).mean()
+            return logits_k, ce_k, aux_k
 
-        all_logits_K, all_aux_K = jax.vmap(one_sample)(keys)
+        all_logits_K, ce_K, all_aux_K = jax.vmap(one_sample)(keys)
         logits = jnp.mean(all_logits_K, axis=0)
+        ce = jnp.mean(ce_K)
         # probs/codelength are identical across Gumbel samples
         aux = jax.tree.map(lambda a: a[0], all_aux_K)
-
-    ce = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+    else:
+        logits, aux = apply_fn(
+            {"params": params}, x, tau=tau, train=True, rng=rng,
+        )
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
 
     hyp_cl, entropy, entropy_bonus = _compute_hyp_and_entropy_nats(aux, tau)
 
@@ -223,10 +237,11 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
     return total_loss, (logits, ce, hyp_cl, entropy, z)
 
 
-def make_train_step_mdl(cfg, soft_forward=False):
+def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
     """Return a JIT-compiled single-model MDL train_step.
 
-    Call twice: once with soft_forward=True (warmup), once with False (training).
+    Call for warmup (soft_forward=True), optional bridge (deterministic_st=True),
+    and regular stochastic ST training.
     """
     n_samples = cfg.mdl.n_samples
 
@@ -238,6 +253,7 @@ def make_train_step_mdl(cfg, soft_forward=False):
             return _mdl_loss(
                 state.apply_fn, params, x, y, rng, state.tau,
                 mdl_lambda, n_train, n_samples, soft_forward,
+                deterministic_st,
             )
 
         (loss, (logits, ce, hyp_cl, entropy, _z)), grads = (
@@ -255,7 +271,7 @@ def make_train_step_mdl(cfg, soft_forward=False):
     return train_step
 
 
-def make_train_step_mdl_pair(cfg, soft_forward=False):
+def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
     """Return a JIT-compiled dual-model train step: MDL inner + standard outer with HSIC."""
     n_samples = cfg.mdl.n_samples
 
@@ -273,6 +289,7 @@ def make_train_step_mdl_pair(cfg, soft_forward=False):
             return _mdl_loss(
                 inner_state.apply_fn, params, x, y, rng_inner,
                 inner_state.tau, mdl_lambda, n_train, n_samples, soft_forward,
+                deterministic_st,
             )
 
         (loss1, (logits1, ce1, hyp_cl, entropy, z1)), grads1 = (

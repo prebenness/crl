@@ -195,7 +195,8 @@ def _shared_compute_data_codelength(logits, y, mask):
 
 
 def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
-                        n_samples=1, soft_forward=False):
+                        n_samples=1, soft_forward=False,
+                        deterministic_st=False):
     """Create the shared-weight MDL loss function (Section 8.1).
 
     The composite objective is:
@@ -227,6 +228,14 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
             logits, model_aux = apply_fn(
                 {"params": model_params}, x, tau=tau, train=True, rng=rng,
                 soft_forward=True,
+            )
+            data_codelength, ce_per_token = _shared_compute_data_codelength(
+                logits, y, mask,
+            )
+        elif deterministic_st:
+            logits, model_aux = apply_fn(
+                {"params": model_params}, x, tau=tau, train=True,
+                deterministic_st=True,
             )
             data_codelength, ce_per_token = _shared_compute_data_codelength(
                 logits, y, mask,
@@ -316,7 +325,8 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
 # ---------------------------------------------------------------------------
 
 def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
-                           n_samples=1, soft_forward=False):
+                           n_samples=1, soft_forward=False,
+                           deterministic_st=False):
     """Create a JIT-compiled training step for the shared-weight objective.
 
     Args:
@@ -326,10 +336,12 @@ def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         n_train: total number of training sequences (for batch scaling).
         n_samples: Gumbel samples for variance reduction.
         soft_forward: use continuous relaxation (warmup phase).
+        deterministic_st: deterministic straight-through bridge phase.
     """
     loss_fn = make_shared_loss_fn(
         lambda1, lambda2, epsilon, n_train=n_train,
         n_samples=n_samples, soft_forward=soft_forward,
+        deterministic_st=deterministic_st,
     )
 
     @jax.jit

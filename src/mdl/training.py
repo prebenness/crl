@@ -74,7 +74,7 @@ def _compute_data_codelength(logits, y, mask):
 
 
 def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
-                 soft_forward: bool = False):
+                 soft_forward: bool = False, deterministic_st: bool = False):
     """Create the MDL loss function.
 
     The loss combines:
@@ -87,12 +87,15 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
     When soft_forward=True, uses continuous relaxation (no Gumbel noise)
     for zero-variance gradients during warmup phase.
+    When deterministic_st=True, uses hard argmax weights in forward with
+    softmax(logits/tau) gradients (no Gumbel noise) for a stable bridge phase.
 
     Args:
         mdl_lambda: trade-off parameter for hypothesis codelength
         n_train: total number of training sequences (for batch scaling)
         n_samples: number of Gumbel samples to average data term over
         soft_forward: if True, use continuous relaxation (no Gumbel)
+        deterministic_st: if True, use deterministic straight-through
     """
     mdl_lambda = float(mdl_lambda)
     n_train = float(max(n_train, 1))
@@ -106,6 +109,15 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
             logits, model_aux = apply_fn(
                 {"params": params}, x, tau=tau, train=True, rng=rng,
                 soft_forward=True,
+            )
+            data_codelength, ce_per_token = _compute_data_codelength(
+                logits, y, mask,
+            )
+        elif deterministic_st:
+            # Single deterministic ST pass (hard argmax + soft gradients).
+            logits, model_aux = apply_fn(
+                {"params": params}, x, tau=tau, train=True,
+                deterministic_st=True,
             )
             data_codelength, ce_per_token = _compute_data_codelength(
                 logits, y, mask,
@@ -159,7 +171,8 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
 
 def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
-                    soft_forward: bool = False):
+                    soft_forward: bool = False,
+                    deterministic_st: bool = False):
     """Create a JIT-compiled training step.
 
     Args:
@@ -167,10 +180,11 @@ def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
         n_train: total training sequences (for batch scaling)
         n_samples: Gumbel samples for variance reduction (ST phase)
         soft_forward: use continuous relaxation (warmup phase)
+        deterministic_st: deterministic straight-through bridge phase
     """
     loss_fn = make_loss_fn(
         mdl_lambda, n_train=n_train, n_samples=n_samples,
-        soft_forward=soft_forward,
+        soft_forward=soft_forward, deterministic_st=deterministic_st,
     )
 
     @jax.jit
@@ -326,3 +340,12 @@ def anneal_tau(epoch, total_epochs, tau_start, tau_end):
     progress = epoch / max(total_epochs - 1, 1)
     log_tau = jnp.log(tau_start) + progress * (jnp.log(tau_end) - jnp.log(tau_start))
     return jnp.exp(log_tau)
+
+
+def anneal_tau_st_phase(epoch, total_epochs, warmup_epochs, tau_start, tau_end):
+    """Anneal tau only after warmup; keep tau_start during warmup."""
+    if epoch < warmup_epochs:
+        return jnp.asarray(tau_start)
+    st_epoch = epoch - warmup_epochs
+    st_total = max(total_epochs - warmup_epochs, 1)
+    return anneal_tau(st_epoch, st_total, tau_start, tau_end)

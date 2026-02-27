@@ -185,19 +185,27 @@ def main():
 
     if mode in ("mdl", "mdl_pair"):
         mdl_step_warmup = make_train_step_mdl(cfg, soft_forward=True)
+        mdl_step_bridge = make_train_step_mdl(
+            cfg, soft_forward=False, deterministic_st=True,
+        )
         mdl_step_train = make_train_step_mdl(cfg, soft_forward=False)
         mdl_eval_step = make_eval_step_mdl(cfg)
 
         mdl_epoch_warmup = make_train_epoch_mdl(mdl_step_warmup)
+        mdl_epoch_bridge = make_train_epoch_mdl(mdl_step_bridge)
         mdl_epoch_train = make_train_epoch_mdl(mdl_step_train)
         mdl_eval_epoch = make_eval_epoch(mdl_eval_step)
 
     if mode == "mdl_pair":
         mdl_pair_step_warmup = make_train_step_mdl_pair(cfg, soft_forward=True)
+        mdl_pair_step_bridge = make_train_step_mdl_pair(
+            cfg, soft_forward=False, deterministic_st=True,
+        )
         mdl_pair_step_train = make_train_step_mdl_pair(cfg, soft_forward=False)
         vib_eval_step = make_eval_step(cfg)
 
         mdl_pair_epoch_warmup = make_train_epoch_mdl_pair(mdl_pair_step_warmup)
+        mdl_pair_epoch_bridge = make_train_epoch_mdl_pair(mdl_pair_step_bridge)
         mdl_pair_epoch_train = make_train_epoch_mdl_pair(mdl_pair_step_train)
         outer_eval_epoch = make_eval_epoch(vib_eval_step)
 
@@ -310,6 +318,7 @@ def main():
                     inner_model, cfg, lamb, wandb_run=run,
                     create_state_fn=create_state_mdl,
                     train_epoch_warmup_fn=mdl_epoch_warmup,
+                    train_epoch_bridge_fn=mdl_epoch_bridge,
                     train_epoch_fn=mdl_epoch_train,
                     eval_epoch_fn=mdl_eval_epoch,
                     run_dir=run_dir,
@@ -322,6 +331,7 @@ def main():
                     create_inner_fn=create_state_mdl,
                     create_outer_fn=create_state_outer,
                     train_epoch_warmup_fn=mdl_pair_epoch_warmup,
+                    train_epoch_bridge_fn=mdl_pair_epoch_bridge,
                     train_epoch_fn=mdl_pair_epoch_train,
                     eval_inner_epoch_fn=mdl_eval_epoch,
                     eval_outer_epoch_fn=outer_eval_epoch,

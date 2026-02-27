@@ -70,7 +70,7 @@ from src.mdl.training import (
     create_mdl_state,
     make_train_step,
     evaluate_deterministic_accuracy,
-    anneal_tau,
+    anneal_tau_st_phase,
 )
 from src.mdl.golden import (
     build_golden_network_params,
@@ -281,17 +281,24 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     warmup_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=1, soft_forward=True,
     )
+    bridge_train_step = make_train_step(
+        args.mdl_lambda, n_train=N, n_samples=1,
+        soft_forward=False, deterministic_st=True,
+    )
     st_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=args.n_samples, soft_forward=False,
     )
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
-    st_epochs = total_epochs - warmup_epochs
+    bridge_epochs = 1 if (warmup_epochs > 0 and warmup_epochs < total_epochs) else 0
+    st_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
 
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
-    print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(f"  tau: {args.tau_start} -> {args.tau_end} (annealed across both phases)")
+    if bridge_epochs:
+        print("  Phase 2 (bridge): 1 epoch, deterministic ST (hard forward, no Gumbel)")
+    print(f"  Phase 3 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
+    print(f"  tau: warmup fixed at {args.tau_start}, then ST anneal {args.tau_start} -> {args.tau_end}")
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
     print("-" * 70)
 
@@ -301,13 +308,18 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
-        phase_name = "warmup" if is_warmup else "ST"
+        is_bridge = bridge_epochs and (epoch == warmup_epochs)
+        phase_name = "warmup" if is_warmup else ("bridge" if is_bridge else "ST")
 
-        # Anneal tau across BOTH phases
-        tau = anneal_tau(epoch, total_epochs, args.tau_start, args.tau_end)
+        # Keep warmup tau fixed; anneal only in ST phase.
+        tau = anneal_tau_st_phase(
+            epoch, total_epochs, warmup_epochs, args.tau_start, args.tau_end,
+        )
 
         if is_warmup:
             train_step = warmup_train_step
+        elif is_bridge:
+            train_step = bridge_train_step
         else:
             train_step = st_train_step
 
@@ -420,6 +432,10 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=1, soft_forward=True,
     )
+    bridge_train_step = make_shared_train_step(
+        args.lambda1, args.lambda2, args.epsilon, n_train=N,
+        n_samples=1, soft_forward=False, deterministic_st=True,
+    )
     st_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=args.n_samples, soft_forward=False,
@@ -427,11 +443,14 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
-    st_epochs = total_epochs - warmup_epochs
+    bridge_epochs = 1 if (warmup_epochs > 0 and warmup_epochs < total_epochs) else 0
+    st_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
 
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
-    print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(f"  tau: {args.tau_start} -> {args.tau_end} (annealed across both phases)")
+    if bridge_epochs:
+        print("  Phase 2 (bridge): 1 epoch, deterministic ST (hard forward, no Gumbel)")
+    print(f"  Phase 3 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
+    print(f"  tau: warmup fixed at {args.tau_start}, then ST anneal {args.tau_start} -> {args.tau_end}")
     print(f"  lr={args.lr}, lambda1={args.lambda1}, lambda2={args.lambda2}, "
           f"eps={args.epsilon}, batch_size={bs}")
     print("-" * 70)
@@ -442,13 +461,18 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
-        phase_name = "warmup" if is_warmup else "ST"
+        is_bridge = bridge_epochs and (epoch == warmup_epochs)
+        phase_name = "warmup" if is_warmup else ("bridge" if is_bridge else "ST")
 
-        # Anneal tau across BOTH phases
-        tau = anneal_tau(epoch, total_epochs, args.tau_start, args.tau_end)
+        # Keep warmup tau fixed; anneal only in ST phase.
+        tau = anneal_tau_st_phase(
+            epoch, total_epochs, warmup_epochs, args.tau_start, args.tau_end,
+        )
 
         if is_warmup:
             train_step = warmup_train_step
+        elif is_bridge:
+            train_step = bridge_train_step
         else:
             train_step = st_train_step
 

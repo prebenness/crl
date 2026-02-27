@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax import random as jrandom
 
 from src.datasets.datasets import make_epoch_batches
-from src.mdl.training import anneal_tau
+from src.mdl.training import anneal_tau_st_phase
 from src.utils.checkpointing import save_checkpoint, save_results, checkpoint_path
 
 
@@ -157,7 +157,8 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
 
 def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
                        wandb_run, *, create_state_fn,
-                       train_epoch_warmup_fn, train_epoch_fn,
+                       train_epoch_warmup_fn, train_epoch_bridge_fn,
+                       train_epoch_fn,
                        eval_epoch_fn, run_dir=None):
     """MDL single-model training loop with warmup and tau annealing."""
     base_rng = jrandom.PRNGKey(cfg.training.seed)
@@ -172,12 +173,25 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
-        tau = anneal_tau(ep, cfg.training.epochs,
-                         cfg.mdl.tau_start, cfg.mdl.tau_end)
+        tau = anneal_tau_st_phase(
+            ep, cfg.training.epochs, cfg.mdl.warmup_epochs,
+            cfg.mdl.tau_start, cfg.mdl.tau_end,
+        )
         state = state.replace(tau=jnp.array(tau, dtype=jnp.float32))
 
         is_warmup = ep < cfg.mdl.warmup_epochs
-        epoch_fn = train_epoch_warmup_fn if is_warmup else train_epoch_fn
+        is_bridge = (
+            train_epoch_bridge_fn is not None
+            and cfg.mdl.warmup_epochs > 0
+            and cfg.mdl.warmup_epochs < cfg.training.epochs
+            and ep == cfg.mdl.warmup_epochs
+        )
+        if is_warmup:
+            epoch_fn = train_epoch_warmup_fn
+        elif is_bridge:
+            epoch_fn = train_epoch_bridge_fn
+        else:
+            epoch_fn = train_epoch_fn
 
         seed_tr = cfg.training.seed * 10_000 + ep
         seed_te = cfg.training.seed * 20_000 + ep
@@ -220,7 +234,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             f"  HypCL(nats) {float(metrics['hyp_cl']):.1f}"
             f"  H(nats) {float(metrics['entropy']):.1f}"
             f"  tau {float(tau):.4f}"
-            f"{'  [warmup]' if is_warmup else ''}"
+            f"{'  [warmup]' if is_warmup else ('  [bridge]' if is_bridge else '')}"
             f"  {time.time()-t0:.2f}s"
         )
 
@@ -234,7 +248,8 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
 def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
                             outer_model, cfg, lamb, wandb_run,
                             *, create_inner_fn, create_outer_fn,
-                            train_epoch_warmup_fn, train_epoch_fn,
+                            train_epoch_warmup_fn, train_epoch_bridge_fn,
+                            train_epoch_fn,
                             eval_inner_epoch_fn, eval_outer_epoch_fn,
                             run_dir=None):
     """MDL dual-model (MDL inner + standard outer) training loop."""
@@ -254,14 +269,27 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
-        tau = anneal_tau(ep, cfg.training.epochs,
-                         cfg.mdl.tau_start, cfg.mdl.tau_end)
+        tau = anneal_tau_st_phase(
+            ep, cfg.training.epochs, cfg.mdl.warmup_epochs,
+            cfg.mdl.tau_start, cfg.mdl.tau_end,
+        )
         inner_state = inner_state.replace(
             tau=jnp.array(tau, dtype=jnp.float32),
         )
 
         is_warmup = ep < cfg.mdl.warmup_epochs
-        epoch_fn = train_epoch_warmup_fn if is_warmup else train_epoch_fn
+        is_bridge = (
+            train_epoch_bridge_fn is not None
+            and cfg.mdl.warmup_epochs > 0
+            and cfg.mdl.warmup_epochs < cfg.training.epochs
+            and ep == cfg.mdl.warmup_epochs
+        )
+        if is_warmup:
+            epoch_fn = train_epoch_warmup_fn
+        elif is_bridge:
+            epoch_fn = train_epoch_bridge_fn
+        else:
+            epoch_fn = train_epoch_fn
 
         seed_tr = cfg.training.seed * 10_000 + ep
         seed_te = cfg.training.seed * 20_000 + ep
@@ -319,7 +347,7 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             f" te {results['test_acc2']:.4f}"
             f" | hsic {results['hsic']:.4f}"
             f" | tau {float(tau):.4f}"
-            f"{'  [warmup]' if is_warmup else ''}"
+            f"{'  [warmup]' if is_warmup else ('  [bridge]' if is_bridge else '')}"
             f" | {time.time()-t0:.2f}s"
         )
 
