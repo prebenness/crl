@@ -133,3 +133,257 @@ This is the first run in this sweep that completely broke the old `~1.8e4` plate
    - `mdl_lambda = 0.05`
    - `mdl_lambda = 0.2`
 3. If the ANBN result stays stable, port the same softer-regularization setting into the ColoredMNIST MDL runs as the new default starting point.
+
+## Continuation Sweep (Later On 2026-02-28)
+
+### What Changed In The Tooling
+
+1. `differentiable_mdl.py`
+   - resume now copies into a fresh run directory by default instead of mutating the source run
+   - `--ckpt_select {auto,best,final}` is supported for both `--eval` and `--resume`
+   - `--resume_epoch` is supported
+   - `--resume_in_place` keeps the old behavior when explicitly requested
+   - resume metadata now records `best_checkpoint_epoch`
+2. `src/mdl/golden.py`
+   - added a sparse finite-precision benchmark for the handcrafted golden network
+   - the exact float32 counter limit is now treated as `2^24 = 16,777,216`
+3. `differentiable_mdl.py`
+   - the golden baseline no longer claims “correct for all n” on large test ranges
+   - for large `test_max_n`, it now reports the float32 boundary estimate instead
+
+### Fresh Source Checkpoint
+
+- Run: `results/anbn_mdl/20260228_183438_basic_e10000_lr0.05_lam0.144_g10x10_s0`
+- This was a clean reconstruction of the current strong `lambda=0.144` setting.
+- The saved `best` checkpoint was reached early (`best_checkpoint_epoch = 200`).
+- Direct eval of that `best` checkpoint:
+  - `|H| = 841 bits`
+  - `gen_n = 1,000,000`
+  - `n_perfect = 1,000,000`
+- This is the current strongest checkpoint in the new continuation sweep.
+
+### Short Tail Experiments From The Strong `best` Checkpoint
+
+#### 1. Deterministic short tail
+
+- Run: `results/anbn_mdl/20260228_184213_basic_e1400_lr0.01_lam0.144_g10x10_s0_resume_best`
+- Resume source:
+  - fresh source run above
+  - `best` checkpoint from epoch `200`
+- Config changes:
+  - total epochs reduced to `1400`
+  - `warmup_epochs=400`
+  - `lr=0.01`
+  - `--deterministic_st`
+- Best checkpoint from this continuation:
+  - `|H| = 865 bits`
+  - `gen_n = 100,000`
+- Conclusion:
+  - stable, but not an improvement over the `841`-bit source
+
+#### 2. Short low-LR tail (same early checkpoint, shorter schedule)
+
+- Run: `results/anbn_mdl/20260228_184818_basic_e800_lr0.005_lam0.144_g10x10_s0_resume_best`
+- Resume source:
+  - same fresh source run
+  - `best` checkpoint from epoch `200`
+- Config changes:
+  - total epochs reduced to `800`
+  - `warmup_epochs=200` (so ST starts immediately after resume)
+  - `lr=0.005`
+  - `--det_st_after_tau 0.1`
+- The saved `best` checkpoint in this run is from epoch `250`.
+- Direct eval of that `best` checkpoint:
+  - `|H| = 823 bits`
+  - perfect through `n=100,000`
+- Stress-test to `n=1,000,000`:
+  - `gen_n = 120,170`
+  - first failure at `120,171`
+- Conclusion:
+  - this is a real compression improvement on the `100k` test range
+  - but it is not a true Pareto improvement against the `841`-bit source once tested to `10^6`
+
+#### 3. Completed low-LR stochastic tail
+
+- Run: `results/anbn_mdl/20260228_185026_basic_e800_lr0.005_lam0.144_g10x10_s0_resume_best`
+- Same resume source and schedule as the previous short tail, but allowed to finish.
+- Training behavior:
+  - the run oscillated after the early good checkpoint
+  - it temporarily fell out of the good basin, then recovered full validation later
+- Key checkpoints:
+  - `best` checkpoint (epoch `250`):
+    - same headline result as the previous short tail
+    - `|H| = 823 bits`
+    - `gen_n = 120,170` when tested to `10^6`
+  - `final` checkpoint:
+    - `|H| = 899 bits`
+    - still perfect through `n=100,000`
+- Conclusion:
+  - the improvement lives in an early transient checkpoint
+  - continuing stochastic updates after that point tends to increase description length again
+
+### Main Takeaways From The Continuation Sweep
+
+1. The fresh `841`-bit source checkpoint remains the strongest result:
+   - it is still perfect through `n=1,000,000`
+2. Very short, low-LR continuation from a strong early checkpoint can reduce the model to `823` bits.
+3. That `823`-bit solution is not equally robust at larger `n`:
+   - it breaks around `n=120,171`
+4. The best saved checkpoint often occurs much earlier than the nominal end of training.
+   - for these resumed tails, the useful checkpoint was around epoch `250`
+   - later training often degrades or only partially recovers the strong basin
+
+### Updated Next Steps
+
+1. Treat `841` bits / `n=10^6` as the current baseline to beat.
+2. Focus on **very short** continuation schedules from a strong source checkpoint:
+   - low LR
+   - early stop
+   - more frequent checkpointing than “best by validation only”
+3. Save more than one checkpoint after first full validation.
+   - right now, once validation saturates, later lower-bit checkpoints are invisible unless they are evaluated manually
+4. Keep using direct long-`n` evaluation (`10^6`) as the main selection criterion.
+   - `100k` alone is not enough to distinguish the `823`-bit transient from the stronger `841`-bit baseline
+
+## Long-Range Selection Update (Later On 2026-02-28)
+
+### Problem Identified
+
+The `n=22..5000` structured validation set is too weak to select robust low-bit checkpoints:
+
+- A continuation could hit:
+  - full structured validation
+  - lower `|H|`
+  - but still fail well below `n=100000`
+
+Concretely:
+
+- Run: `results/anbn_mdl/20260228_195359_basic_e40_lr0.001_lam0.144_g10x10_s0_resume_best`
+- It found:
+  - `|H| = 831 bits`
+  - still perfect on the structured `22..5000` validation set
+- But final evaluation showed:
+  - first failure at `n=38129`
+
+So “perfect on `5000`” is not strong enough as a tie-break if the goal is near-golden behavior.
+
+### Tooling Change
+
+`differentiable_mdl.py` now supports optional sparse large-`n` validation probes:
+
+- new CLI flag: `--long_val_n`
+- can be repeated, for example:
+  - `--long_val_n 200000`
+  - `--long_val_n 200000 --long_val_n 500000`
+
+Best-checkpoint selection is now:
+
+1. structured validation (`n_perfect`)
+2. structured validation prefix (`gen_n`)
+3. number of sparse large-`n` probes passed
+4. lower discrete `|H|`
+
+This keeps the useful “prefer smaller models” behavior, but only among checkpoints that also clear the extra long-range checks.
+
+### New Best Result
+
+- Run: `results/anbn_mdl/20260228_200521_basic_e40_lr0.001_lam0.144_g10x10_s0_resume_best`
+- Source:
+  - `results/anbn_mdl/20260228_183438_basic_e10000_lr0.05_lam0.144_g10x10_s0`
+  - resumed from the saved `best` checkpoint
+- Continuation config:
+  - `resume_epoch=0`
+  - `epochs=40`
+  - `warmup_epochs=40`
+  - `lr=0.001`
+  - `tau_start=1.0`
+  - `tau_end=0.8`
+  - `--long_val_n 200000`
+
+Behavior:
+
+- it stayed in the good basin
+- it found progressively smaller checkpoints that still passed:
+  - the full structured validation set
+  - the explicit `n=200000` sparse probe
+
+Final selected checkpoint:
+
+- `|H| = 833 bits`
+- `gen_n = 1,000,000`
+- `n_perfect = 1,000,000`
+
+This beats the previous best `841`-bit checkpoint while keeping the same tested long-range behavior.
+
+### Negative Control
+
+- Run: `results/anbn_mdl/20260228_201752_basic_e40_lr0.002_lam0.144_g10x10_s0_resume_best`
+- Continuation config:
+  - same short warmup-only continuation
+  - stronger `lr=0.002`
+  - dual sparse probes:
+    - `--long_val_n 200000`
+    - `--long_val_n 500000`
+- Observation:
+  - once the run reached the lower-bit region (for example `|H| = 837`), it failed both sparse probes
+- Conclusion:
+  - on this path, the stronger step size is too aggressive
+
+### Current Best Checkpoint
+
+As of this sweep, the strongest known checkpoint is:
+
+- `results/anbn_mdl/20260228_200521_basic_e40_lr0.001_lam0.144_g10x10_s0_resume_best`
+- `|H| = 833 bits`
+- correct through at least `n = 1,000,000`
+
+### Updated Practical Direction
+
+1. Keep the sparse large-`n` probes enabled during refinement.
+2. Stay in very short warmup-only continuation schedules.
+3. Use small learning rates (`~1e-3`) for refinement.
+4. Treat the `833`-bit / `10^6` checkpoint as the new baseline to beat.
+
+## Pause / Handoff Note
+
+### Current Best Checkpoint To Resume From
+
+- Preferred source checkpoint:
+  - `results/anbn_mdl/20260228_200521_basic_e40_lr0.001_lam0.144_g10x10_s0_resume_best`
+- Verified metrics:
+  - `|H| = 833 bits`
+  - `gen_n = 1,000,000`
+  - `n_perfect = 1,000,000`
+
+This is the current frontier.
+
+### Interrupted Experiment
+
+- Run directory:
+  - `results/anbn_mdl/20260228_205336_basic_e20_lr0.0005_lam0.144_g10x10_s0_resume_best`
+- Intended config:
+  - refine from the `833`-bit checkpoint
+  - `epochs=20`
+  - `warmup_epochs=20`
+  - `lr=0.0005`
+  - `tau_start=0.8`
+  - `tau_end=0.7`
+  - `--long_val_n 200000`
+  - `--long_val_n 500000`
+- Actual progress before interruption:
+  - only reached epoch `1`
+  - no validation step ran
+  - no `best.npz` / `final.npz` was written
+
+So this run should be treated as an aborted stub, not a result.
+
+### Best Immediate Next Experiments
+
+1. Re-run the interrupted polish attempt above from scratch.
+   - It is still the cleanest next test because it targets the current `833`-bit frontier directly.
+2. If that does not improve, try the same setup with:
+   - `lr=0.00075`
+   - same `20`-epoch soft-only continuation
+   - same `--long_val_n 200000 --long_val_n 500000`
+3. Keep using the long-range probe rule during selection.
+   - Without it, the search keeps preferring smaller but brittle checkpoints.

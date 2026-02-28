@@ -29,7 +29,9 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+import shutil
 import sys
 import time
 from fractions import Fraction
@@ -77,6 +79,7 @@ from src.mdl.golden import (
     golden_forward,
     golden_mdl_score,
     evaluate_golden_network,
+    estimate_golden_float32_limit,
 )
 from src.mdl.shared_weights import (
     compute_p_base,
@@ -85,6 +88,7 @@ from src.mdl.shared_weights import (
 )
 from src.mdl.analysis import (
     analyze_model,
+    _check_single_n,
     extract_weights,
     evaluate_range_f64,
     find_failure_n,
@@ -106,7 +110,7 @@ from src.utils.checkpointing import (
 # ---------------------------------------------------------------------------
 
 
-def make_run_dir(args):
+def make_run_dir(args, suffix=""):
     """Create a timestamped results directory and write config.json.
 
     Name format:
@@ -118,7 +122,7 @@ def make_run_dir(args):
     name = (
         f"{ts}_{args.mode}_e{args.epochs}"
         f"_lr{args.lr}_lam{lam}"
-        f"_g{args.n_max}x{args.m_max}_s{args.seed}{cfg_tag}"
+        f"_g{args.n_max}x{args.m_max}_s{args.seed}{cfg_tag}{suffix}"
     )
     run_dir = make_experiment_dir("anbn_mdl", name)
     save_config(run_dir, vars(args))
@@ -131,11 +135,86 @@ def load_run_config(run_dir):
         return argparse.Namespace(**json.load(f))
 
 
-def save_checkpoint_meta(run_dir, epoch, best_val_n_perfect):
+def save_checkpoint_meta(run_dir, epoch, best_val_n_perfect, best_checkpoint_epoch=None):
     """Write a small sidecar recording the last completed epoch."""
-    meta = {"last_epoch": int(epoch), "best_val_n_perfect": int(best_val_n_perfect)}
+    meta_path = checkpoint_path(run_dir, "meta.json")
+    meta = {}
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+    meta["last_epoch"] = int(epoch)
+    meta["best_val_n_perfect"] = int(best_val_n_perfect)
+    if best_checkpoint_epoch is not None:
+        meta["best_checkpoint_epoch"] = int(best_checkpoint_epoch)
+    elif "best_checkpoint_epoch" in meta:
+        meta["best_checkpoint_epoch"] = int(meta["best_checkpoint_epoch"])
     with open(checkpoint_path(run_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
+
+
+def _format_val_summary(val_result, val_inputs):
+    """Convert relative validation metrics into absolute n values."""
+    gen_n = val_result["gen_n"]
+    fail_n = val_result["first_failure_n"]
+    n_val = len(val_inputs)
+    if not val_inputs:
+        val_desc = f"perfect_prefix_len={gen_n}"
+        fail_abs_n = None
+    else:
+        val_start_n = len(val_inputs[0]) // 2
+        val_end_n = len(val_inputs[-1]) // 2
+        last_perfect_n = val_start_n + gen_n - 1 if gen_n > 0 else val_start_n - 1
+        fail_abs_n = val_start_n + fail_n - 1 if fail_n is not None else None
+        val_desc = (
+            f"contig_ok_through_n={last_perfect_n} "
+            f"(prefix_len={gen_n}, val_n={val_start_n}..{val_end_n})"
+        )
+    return {
+        "n_val": n_val,
+        "val_desc": val_desc,
+        "fail_abs_n": fail_abs_n,
+    }
+
+
+def _evaluate_long_val_probes(model_params, grid, grid_values, probe_ns):
+    """Run sparse large-n correctness probes on the discrete argmax network."""
+    probe_ns = sorted({int(n) for n in (probe_ns or []) if int(n) > 0})
+    if not probe_ns:
+        return {
+            "passed_count": 0,
+            "all_passed": True,
+            "results": [],
+            "summary": "",
+        }
+
+    extracted = extract_weights(model_params, grid, grid_values)
+    results = []
+    passed_count = 0
+    for n in probe_ns:
+        ok = bool(_check_single_n(extracted["named"], n))
+        results.append({"n": n, "correct": ok})
+        passed_count += int(ok)
+
+    summary = " ".join(f"{r['n']}{'✓' if r['correct'] else '✗'}" for r in results)
+    return {
+        "passed_count": passed_count,
+        "all_passed": passed_count == len(results),
+        "results": results,
+        "summary": summary,
+    }
+
+
+def _should_update_best(n_perfect, gen_n, long_val_passes, complexity_bits,
+                        best_val_n_perfect, best_val_gen_n,
+                        best_long_val_passes, best_complexity_bits):
+    """Prefer better validation coverage, then stronger sparse long-n checks."""
+    if n_perfect != best_val_n_perfect:
+        return n_perfect > best_val_n_perfect
+    if gen_n != best_val_gen_n:
+        return gen_n > best_val_gen_n
+    if long_val_passes != best_long_val_passes:
+        return long_val_passes > best_long_val_passes
+    return complexity_bits < best_complexity_bits
 
 
 def get_train_max_n(inputs):
@@ -171,8 +250,9 @@ def compute_discrete_mdl_score(eval_params, grid, grid_values):
 def evaluate_golden_baseline(test_max_n, p):
     """Run golden network evaluation and MDL scoring.
 
-    For large test_max_n (>1500), the golden network is known to be correct
-    by construction, so we skip the expensive JAX evaluation.
+    For moderate test_max_n, evaluate exactly with the batched JAX forward.
+    For larger ranges, switch to a sparse finite-precision benchmark instead
+    of assuming the handcrafted network is perfect for all n.
     """
     print("\n" + "=" * 60)
     print("GOLDEN NETWORK BASELINE (Lan et al. 2024)")
@@ -195,13 +275,19 @@ def evaluate_golden_baseline(test_max_n, p):
         else:
             print(f"  First failure at n={golden_result['first_failure_n']}")
     else:
-        # For large n, the golden network is correct by construction
-        print(f"  Golden network is correct for ALL n by construction (skipping eval)")
-        golden_result = {
-            "mean_accuracy": 1.0,
-            "all_correct": True,
-            "first_failure_n": None,
-        }
+        # For large n, use the exact float32 counter limit rather than the
+        # idealized mathematical claim.
+        print(f"  Estimating float32 golden boundary up to n={test_max_n}...")
+        golden_result = estimate_golden_float32_limit(max_n=test_max_n, p=p)
+        print(f"  Finite-precision golden range: n=1..{golden_result['max_correct_n']}")
+        if golden_result["all_correct"]:
+            print("  All correct in the requested test range: YES")
+        else:
+            print(
+                "  First finite-precision failure at "
+                f"n={golden_result['first_failure_n']}"
+            )
+        print(f"  Probe trace: {len(golden_result['probes'])} sparse checks")
 
     return mdl, golden_result
 
@@ -293,37 +379,68 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     warmup_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=1, soft_forward=True,
     )
+    use_det_st = args.deterministic_st or args.det_st_after_tau is not None
     st_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=args.n_samples, soft_forward=False,
     )
+    det_st_train_step = None
+    if use_det_st:
+        det_st_train_step = make_train_step(
+            args.mdl_lambda,
+            n_train=N,
+            n_samples=args.n_samples,
+            soft_forward=False,
+            deterministic_st=True,
+        )
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
     st_epochs = total_epochs - warmup_epochs
 
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
-    print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
+    if args.deterministic_st:
+        print(f"  Phase 2 (ST):     {st_epochs} epochs, deterministic straight-through")
+    elif args.det_st_after_tau is not None:
+        print(
+            "  Phase 2 (ST):     "
+            f"{st_epochs} epochs, Gumbel ST then deterministic ST when "
+            f"τ<={args.det_st_after_tau}"
+        )
+    else:
+        print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
     print(f"  tau: global anneal {args.tau_start} -> {args.tau_end}")
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
     print("-" * 70)
 
     best_val_n_perfect = -1
     best_val_gen_n = -1
+    best_long_val_passes = -1
+    best_complexity_bits = math.inf
     best_params = None
+    long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
-        phase_name = "warmup" if is_warmup else "ST"
-
         tau = anneal_tau(
             epoch, total_epochs, args.tau_start, args.tau_end,
         )
 
         if is_warmup:
             train_step = warmup_train_step
+            phase_name = "warmup"
+        elif args.deterministic_st:
+            train_step = det_st_train_step
+            phase_name = "DST"
+        elif (
+            args.det_st_after_tau is not None
+            and float(tau) <= args.det_st_after_tau
+        ):
+            train_step = det_st_train_step
+            phase_name = "DST"
         else:
             train_step = st_train_step
+            phase_name = "GST"
 
         state = state.replace(tau=tau)
 
@@ -354,23 +471,61 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 val_inputs, val_targets,
             )
             n_perfect = val_result["n_perfect"]
-            n_val = len(val_inputs)
             gen_n = val_result["gen_n"]
-            fail_n = val_result["first_failure_n"]
-            val_sym = "✓" if fail_n is None else f"✗ (fails@{fail_n})"
-            is_best = (
-                n_perfect > best_val_n_perfect
-                or (n_perfect == best_val_n_perfect and gen_n > best_val_gen_n)
+            current_complexity_bits = _compute_discrete_hyp_bits(
+                state.params, grid, grid_values,
+            )
+            val_summary = _format_val_summary(val_result, val_inputs)
+            n_val = val_summary["n_val"]
+            fail_abs_n = val_summary["fail_abs_n"]
+            long_val_probe = {
+                "passed_count": 0,
+                "all_passed": True,
+                "summary": "",
+            }
+            if n_perfect == n_val and long_val_probe_ns:
+                long_val_probe = _evaluate_long_val_probes(
+                    state.params, grid, grid_values, long_val_probe_ns,
+                )
+            val_sym = "✓" if fail_abs_n is None else f"✗ (fails@{fail_abs_n})"
+            is_best = _should_update_best(
+                n_perfect,
+                gen_n,
+                long_val_probe["passed_count"],
+                current_complexity_bits,
+                best_val_n_perfect,
+                best_val_gen_n,
+                best_long_val_passes,
+                best_complexity_bits,
             )
             best_tag = "  ★ NEW BEST" if is_best else ""
-            print(f"              ↳ val: gen_n={gen_n} {val_sym}  ({n_perfect}/{n_val} perfect){best_tag}")
+            long_val_suffix = ""
+            if long_val_probe_ns:
+                if n_perfect == n_val:
+                    long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
+                else:
+                    long_val_suffix = ", long_n=[skipped]"
+            print(
+                f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
+                f"({n_perfect}/{n_val} perfect, "
+                f"|H|={current_complexity_bits + integer_code_length(args.hidden_size)}b"
+                f"{long_val_suffix})"
+                f"{best_tag}"
+            )
             if is_best:
                 best_val_n_perfect = n_perfect
                 best_val_gen_n = gen_n
+                best_long_val_passes = long_val_probe["passed_count"]
+                best_complexity_bits = current_complexity_bits
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
                     save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
-                    save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
+                    save_checkpoint_meta(
+                        run_dir,
+                        epoch + 1,
+                        best_val_n_perfect,
+                        best_checkpoint_epoch=epoch + 1,
+                    )
                     print(f"              ↳ [CKPT] checkpoint saved")
 
     elapsed = time.time() - t0
@@ -471,17 +626,38 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=1, soft_forward=True,
     )
+    use_det_st = args.deterministic_st or args.det_st_after_tau is not None
     st_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=args.n_samples, soft_forward=False,
     )
+    det_st_train_step = None
+    if use_det_st:
+        det_st_train_step = make_shared_train_step(
+            args.lambda1,
+            args.lambda2,
+            args.epsilon,
+            n_train=N,
+            n_samples=args.n_samples,
+            soft_forward=False,
+            deterministic_st=True,
+        )
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
     st_epochs = total_epochs - warmup_epochs
 
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
-    print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
+    if args.deterministic_st:
+        print(f"  Phase 2 (ST):     {st_epochs} epochs, deterministic straight-through")
+    elif args.det_st_after_tau is not None:
+        print(
+            "  Phase 2 (ST):     "
+            f"{st_epochs} epochs, Gumbel ST then deterministic ST when "
+            f"τ<={args.det_st_after_tau}"
+        )
+    else:
+        print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
     print(f"  tau: global anneal {args.tau_start} -> {args.tau_end}")
     print(f"  lr={args.lr}, lambda1={args.lambda1}, lambda2={args.lambda2}, "
           f"eps={args.epsilon}, batch_size={bs}")
@@ -489,21 +665,33 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
     best_val_n_perfect = -1
     best_val_gen_n = -1
+    best_long_val_passes = -1
+    best_complexity_bits = math.inf
     best_params = None
+    long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
-        phase_name = "warmup" if is_warmup else "ST"
-
         tau = anneal_tau(
             epoch, total_epochs, args.tau_start, args.tau_end,
         )
 
         if is_warmup:
             train_step = warmup_train_step
+            phase_name = "warmup"
+        elif args.deterministic_st:
+            train_step = det_st_train_step
+            phase_name = "DST"
+        elif (
+            args.det_st_after_tau is not None
+            and float(tau) <= args.det_st_after_tau
+        ):
+            train_step = det_st_train_step
+            phase_name = "DST"
         else:
             train_step = st_train_step
+            phase_name = "GST"
 
         state = state.replace(tau=tau)
 
@@ -540,23 +728,61 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 val_inputs, val_targets,
             )
             n_perfect = val_result["n_perfect"]
-            n_val = len(val_inputs)
             gen_n = val_result["gen_n"]
-            fail_n = val_result["first_failure_n"]
-            val_sym = "✓" if fail_n is None else f"✗ (fails@{fail_n})"
-            is_best = (
-                n_perfect > best_val_n_perfect
-                or (n_perfect == best_val_n_perfect and gen_n > best_val_gen_n)
+            current_complexity_bits = _compute_discrete_hyp_bits(
+                model_params, grid, grid_values,
+            )
+            val_summary = _format_val_summary(val_result, val_inputs)
+            n_val = val_summary["n_val"]
+            fail_abs_n = val_summary["fail_abs_n"]
+            long_val_probe = {
+                "passed_count": 0,
+                "all_passed": True,
+                "summary": "",
+            }
+            if n_perfect == n_val and long_val_probe_ns:
+                long_val_probe = _evaluate_long_val_probes(
+                    model_params, grid, grid_values, long_val_probe_ns,
+                )
+            val_sym = "✓" if fail_abs_n is None else f"✗ (fails@{fail_abs_n})"
+            is_best = _should_update_best(
+                n_perfect,
+                gen_n,
+                long_val_probe["passed_count"],
+                current_complexity_bits,
+                best_val_n_perfect,
+                best_val_gen_n,
+                best_long_val_passes,
+                best_complexity_bits,
             )
             best_tag = "  ★ NEW BEST" if is_best else ""
-            print(f"              ↳ val: gen_n={gen_n} {val_sym}  ({n_perfect}/{n_val} perfect){best_tag}")
+            long_val_suffix = ""
+            if long_val_probe_ns:
+                if n_perfect == n_val:
+                    long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
+                else:
+                    long_val_suffix = ", long_n=[skipped]"
+            print(
+                f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
+                f"({n_perfect}/{n_val} perfect, "
+                f"|H|={current_complexity_bits + integer_code_length(args.hidden_size)}b"
+                f"{long_val_suffix})"
+                f"{best_tag}"
+            )
             if is_best:
                 best_val_n_perfect = n_perfect
                 best_val_gen_n = gen_n
+                best_long_val_passes = long_val_probe["passed_count"]
+                best_complexity_bits = current_complexity_bits
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
                     save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
-                    save_checkpoint_meta(run_dir, epoch + 1, best_val_n_perfect)
+                    save_checkpoint_meta(
+                        run_dir,
+                        epoch + 1,
+                        best_val_n_perfect,
+                        best_checkpoint_epoch=epoch + 1,
+                    )
                     print(f"              ↳ [CKPT] checkpoint saved")
 
     elapsed = time.time() - t0
@@ -636,6 +862,10 @@ def _build_arg_parser(defaults=None):
                         help="Training batch size (0 = full batch)")
     parser.add_argument("--n_samples", type=int, default=16,
                         help="Gumbel samples per step in ST phase (variance reduction)")
+    parser.add_argument("--deterministic_st", action="store_true",
+                        help="Use deterministic straight-through instead of Gumbel ST")
+    parser.add_argument("--det_st_after_tau", type=float, default=None,
+                        help="Switch from Gumbel ST to deterministic ST once tau falls below this threshold")
     parser.add_argument("--warmup_epochs", type=int, default=500,
                         help="Soft warmup epochs before switching to ST")
     parser.add_argument("--seed", type=int, default=42,
@@ -654,6 +884,8 @@ def _build_arg_parser(defaults=None):
                         help="Minimum n included in the structured validation set")
     parser.add_argument("--val_max_n", type=int, default=71,
                         help="Maximum n included in the structured validation set")
+    parser.add_argument("--long_val_n", action="append", type=int, default=None,
+                        help="Optional sparse large-n validation probe (repeatable)")
     parser.add_argument("--eval_every", type=int, default=100,
                         help="Evaluate every N epochs")
     parser.add_argument("--log_every", type=int, default=50,
@@ -667,10 +899,17 @@ def _build_arg_parser(defaults=None):
     # Run management
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Path to a results directory (used with --eval or --resume)")
+    parser.add_argument("--ckpt_select", type=str, default="auto",
+                        choices=["auto", "best", "final"],
+                        help="Which checkpoint to load from --ckpt (default: auto)")
     parser.add_argument("--eval", action="store_true",
                         help="Load best checkpoint from --ckpt and run test evaluation only")
     parser.add_argument("--resume", action="store_true",
                         help="Load best checkpoint from --ckpt and resume training")
+    parser.add_argument("--resume_epoch", type=int, default=None,
+                        help="Override the starting epoch when resuming")
+    parser.add_argument("--resume_in_place", action="store_true",
+                        help="Resume inside --ckpt instead of copying into a fresh run dir")
 
     if defaults:
         valid_dests = {a.dest for a in parser._actions}
@@ -684,22 +923,32 @@ def _build_arg_parser(defaults=None):
     return parser
 
 
-def _resolve_resume_checkpoint(run_dir: Path) -> Path:
+def _resolve_resume_checkpoint(run_dir: Path, selection: str = "auto") -> tuple[Path, str]:
     """Find checkpoint file for eval/resume, supporting legacy filenames."""
-    candidates = [
-        checkpoint_path(run_dir, "best.npz", create=False),
-        checkpoint_path(run_dir, "final.npz", create=False),
-        run_dir / "checkpoint_best.npz",
-        run_dir / "checkpoint_final.npz",
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    raise FileNotFoundError(f"No checkpoint found in {run_dir}")
+    candidates_by_kind = {
+        "best": [
+            checkpoint_path(run_dir, "best.npz", create=False),
+            run_dir / "checkpoint_best.npz",
+        ],
+        "final": [
+            checkpoint_path(run_dir, "final.npz", create=False),
+            run_dir / "checkpoint_final.npz",
+        ],
+    }
+    if selection == "auto":
+        search_order = [("best", candidates_by_kind["best"]),
+                        ("final", candidates_by_kind["final"])]
+    else:
+        search_order = [(selection, candidates_by_kind[selection])]
+    for kind, candidates in search_order:
+        for c in candidates:
+            if c.exists():
+                return c, kind
+    raise FileNotFoundError(f"No {selection} checkpoint found in {run_dir}")
 
 
-def _load_resume_meta_epoch(run_dir: Path) -> int:
-    """Read resume epoch from checkpoint metadata, supporting legacy path."""
+def _read_resume_meta(run_dir: Path) -> dict:
+    """Read checkpoint metadata, supporting legacy path."""
     candidates = [
         checkpoint_path(run_dir, "meta.json", create=False),
         run_dir / "checkpoint_meta.json",
@@ -707,9 +956,47 @@ def _load_resume_meta_epoch(run_dir: Path) -> int:
     for meta_path in candidates:
         if meta_path.exists():
             with open(meta_path) as f:
-                meta = json.load(f)
-            return int(meta.get("last_epoch", 0))
-    return 0
+                return json.load(f)
+    return {}
+
+
+def _resolve_resume_start_epoch(run_dir: Path, checkpoint_kind: str,
+                                default_final_epoch: int = 0) -> int:
+    """Choose a sensible start epoch for the selected checkpoint kind."""
+    meta = _read_resume_meta(run_dir)
+    if checkpoint_kind == "best":
+        if "best_checkpoint_epoch" in meta:
+            return int(meta["best_checkpoint_epoch"])
+        # Legacy runs do not record the epoch for the best checkpoint; safest is
+        # to restart the schedule from the beginning unless the user overrides it.
+        return 0
+    if "last_epoch" in meta:
+        return int(meta["last_epoch"])
+    return int(default_final_epoch)
+
+
+def _write_resume_info(run_dir: Path, source_run_dir: Path, source_ckpt_path: Path,
+                       checkpoint_kind: str, start_epoch: int):
+    """Record the provenance of a copied resume run."""
+    info = {
+        "source_run_dir": str(source_run_dir.resolve()),
+        "source_checkpoint_path": str(source_ckpt_path.resolve()),
+        "source_checkpoint_kind": checkpoint_kind,
+        "resume_start_epoch": int(start_epoch),
+    }
+    with open(run_dir / "resume_info.json", "w") as f:
+        json.dump(info, f, indent=2)
+
+
+def _prepare_resume_run_dir(args, source_run_dir: Path, source_ckpt_path: Path,
+                            checkpoint_kind: str, start_epoch: int) -> Path:
+    """Create a fresh run directory seeded by a copied source checkpoint."""
+    run_dir = make_run_dir(args, suffix=f"_resume_{checkpoint_kind}")
+    copied_ckpt = run_dir / f"resume_source_{checkpoint_kind}.npz"
+    shutil.copy2(source_ckpt_path, copied_ckpt)
+    _write_resume_info(run_dir, source_run_dir, source_ckpt_path, checkpoint_kind,
+                       start_epoch)
+    return run_dir
 
 
 def _print_resolved_parameters(args):
@@ -741,12 +1028,12 @@ def _print_resolved_parameters(args):
 
 def main():
     # Parse config path first so YAML defaults can seed argparse.
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("config", nargs="?")
-    pre_args, _ = pre.parse_known_args()
-
+    # Only treat argv[1] as a config candidate if it is actually positional.
+    pre_config_arg = None
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        pre_config_arg = sys.argv[1]
     yaml_defaults = {}
-    pre_cfg_path = _resolve_config_path(pre_args.config)
+    pre_cfg_path = _resolve_config_path(pre_config_arg)
     if pre_cfg_path is not None:
         yaml_defaults = _load_yaml_defaults(pre_cfg_path)
 
@@ -776,37 +1063,89 @@ def main():
 
     # --- Override args from saved config when eval/resuming ---
     if args.eval or args.resume:
-        # Preserve CLI-specified eval-time overrides
-        cli_test_max_n = args.test_max_n
-        cli_analyze = args.analyze
-        cli_analyze_max_n = args.analyze_max_n
-        # Check if --test_max_n was explicitly provided on the command line
-        test_max_n_explicit = "--test_max_n" in sys.argv
+        # Preserve explicitly provided CLI overrides when loading saved config.
+        override_flags = {
+            "test_max_n": "--test_max_n",
+            "analyze": "--analyze",
+            "analyze_max_n": "--analyze_max_n",
+            "epochs": "--epochs",
+            "warmup_epochs": "--warmup_epochs",
+            "lr": "--lr",
+            "mdl_lambda": "--mdl_lambda",
+            "lambda1": "--lambda1",
+            "lambda2": "--lambda2",
+            "epsilon": "--epsilon",
+            "tau_start": "--tau_start",
+            "tau_end": "--tau_end",
+            "batch_size": "--batch_size",
+            "n_samples": "--n_samples",
+            "deterministic_st": "--deterministic_st",
+            "det_st_after_tau": "--det_st_after_tau",
+            "deterministic": "--deterministic",
+            "long_val_n": "--long_val_n",
+            "eval_every": "--eval_every",
+            "log_every": "--log_every",
+        }
+        run_mgmt_overrides = {
+            "ckpt_select": args.ckpt_select,
+            "resume_epoch": args.resume_epoch,
+            "resume_in_place": args.resume_in_place,
+        }
+        parser_defaults = {
+            a.dest: a.default for a in parser._actions
+            if a.dest != "help"
+        }
+        cli_overrides = {
+            dest: getattr(args, dest)
+            for dest, flag in override_flags.items()
+            if flag in sys.argv
+        }
 
         saved_args = load_run_config(args.ckpt)
         saved_args.eval = args.eval
         saved_args.resume = args.resume
         saved_args.ckpt = args.ckpt
-        saved_args.analyze = cli_analyze
-        saved_args.analyze_max_n = cli_analyze_max_n
+        for dest, default in parser_defaults.items():
+            if not hasattr(saved_args, dest):
+                setattr(saved_args, dest, default)
         if not hasattr(saved_args, "config"):
             saved_args.config = None
         if not hasattr(saved_args, "config_name"):
             saved_args.config_name = None
-        if test_max_n_explicit:
-            saved_args.test_max_n = cli_test_max_n
+        for dest, value in cli_overrides.items():
+            setattr(saved_args, dest, value)
+        for dest, value in run_mgmt_overrides.items():
+            setattr(saved_args, dest, value)
         args = saved_args
 
     # --- Set up run directory and logging ---
-    if args.eval or args.resume:
+    if args.eval:
         run_dir = Path(args.ckpt)
-        ckpt_path = _resolve_resume_checkpoint(run_dir)
+        ckpt_path, _ = _resolve_resume_checkpoint(run_dir, args.ckpt_select)
         loaded_params = load_checkpoint(ckpt_path)
         start_epoch = 0
-        if args.resume:
-            start_epoch = _load_resume_meta_epoch(run_dir)
-            print(f"Resuming from epoch {start_epoch}/{args.epochs}")
         log_mode = "a"
+    elif args.resume:
+        source_run_dir = Path(args.ckpt)
+        ckpt_path, checkpoint_kind = _resolve_resume_checkpoint(
+            source_run_dir, args.ckpt_select,
+        )
+        loaded_params = load_checkpoint(ckpt_path)
+        if args.resume_epoch is not None:
+            start_epoch = int(args.resume_epoch)
+        else:
+            start_epoch = _resolve_resume_start_epoch(
+                source_run_dir, checkpoint_kind, default_final_epoch=args.epochs,
+            )
+        if args.resume_in_place:
+            run_dir = source_run_dir
+            log_mode = "a"
+        else:
+            run_dir = _prepare_resume_run_dir(
+                args, source_run_dir, ckpt_path, checkpoint_kind, start_epoch,
+            )
+            log_mode = "w"
+        print(f"Resuming from epoch {start_epoch}/{args.epochs}")
     else:
         run_dir = make_run_dir(args)
         loaded_params = None
@@ -839,6 +1178,8 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         print(f"[EVAL MODE] checkpoint: {args.ckpt}")
     elif args.resume:
         print(f"[RESUME from epoch {start_epoch}] checkpoint: {args.ckpt}")
+        if run_dir != Path(args.ckpt):
+            print(f"Resume run directory: {run_dir}")
     else:
         print(f"Run directory: {run_dir}")
     print("=" * 60)
@@ -1045,8 +1386,11 @@ def run_final_evaluation(args, state, best_params,
     trivial_hyp = n_params * 5  # all-zero weights, 5 bits each
     trivial_mdl = arch_bits + trivial_hyp
 
-    golden_gen_n = test_max_n if golden_result["all_correct"] else (golden_result["first_failure_n"] - 1)
-    golden_n_perfect = test_max_n if golden_result["all_correct"] else 0
+    golden_gen_n = (
+        test_max_n if golden_result["all_correct"]
+        else (golden_result["first_failure_n"] - 1)
+    )
+    golden_n_perfect = golden_gen_n
 
     print("\n" + "=" * 70)
     print("COMPARISON TABLE (cf. Lan et al. 2024, Table 1)")

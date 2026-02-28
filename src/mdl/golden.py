@@ -9,6 +9,7 @@ This module provides:
     - golden_forward(): run the golden LSTM on batched token sequences
     - golden_mdl_score(): compute hypothesis codelength |H| under MDL coding
     - evaluate_golden_network(): test deterministic accuracy on a^n b^n strings
+    - estimate_golden_float32_limit(): sparse finite-precision boundary estimate
 
 References:
     Lan et al. (2024), Appendix B
@@ -39,6 +40,11 @@ LARGE = 2**7 - 1  # 127
 HIDDEN_SIZE = 3
 INPUT_SIZE = NUM_SYMBOLS   # 3: {#, a, b}
 OUTPUT_SIZE = NUM_SYMBOLS  # 3: {#, a, b}
+# Largest positive integer such that repeated +/-1 updates remain exact in
+# IEEE-754 float32. The handcrafted golden network's counter is a float32 cell
+# state updated by unit increments and decrements, so this is its exact counting
+# limit under finite precision.
+FLOAT32_CONSECUTIVE_INT_LIMIT = 2**24
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +502,132 @@ def evaluate_golden_network(
         "all_correct": all_correct,
         "first_failure_n": first_fail,
         "per_string_acc": accs_arr,
+    }
+
+
+def golden_float32_counter_limit() -> int:
+    """Return the exact float32 counting limit of the handcrafted counter.
+
+    The handcrafted golden network stores the running count in a float32 cell
+    state and updates it by exactly +1 on each `a` and -1 on each `b`.
+    Because all integers are exactly representable only up to 2^24 in float32,
+    the counter can track `n` exactly iff `n <= 2^24`.
+    """
+    return FLOAT32_CONSECUTIVE_INT_LIMIT
+
+
+def check_golden_network_single_n(n: int, p: float = 0.3) -> dict:
+    """Check one `a^n b^n` string under float32 arithmetic.
+
+    This uses the closed-form behavior of the handcrafted network rather than
+    materializing a length-`2n+1` sequence. For this network, correctness on a
+    single string is equivalent to whether the float32 counter can represent the
+    `a`-phase count exactly.
+
+    Args:
+        n: string length parameter in `a^n b^n`
+        p: included for API symmetry with the exact batched evaluator; unused
+
+    Returns:
+        dict with:
+            correct: bool, whether the network predicts the full string
+            counter_after_a: float32 value stored after the `a` phase
+            first_wrong_b_index: 1-based b-phase step where output first fails,
+                or None if the string is correct
+            limit_n: exact float32 counter limit
+    """
+    del p  # The finite-precision boundary is independent of the PCFG parameter.
+
+    if n < 1:
+        raise ValueError("n must be >= 1")
+
+    limit_n = golden_float32_counter_limit()
+    correct = n <= limit_n
+    counter_after_a = float(min(n, limit_n))
+    first_wrong_b_index = None if correct else limit_n
+
+    return {
+        "correct": correct,
+        "counter_after_a": counter_after_a,
+        "first_wrong_b_index": first_wrong_b_index,
+        "limit_n": limit_n,
+    }
+
+
+def estimate_golden_float32_limit(max_n: int | None = None, p: float = 0.3) -> dict:
+    """Estimate the handcrafted network's float32 boundary via sparse probing.
+
+    The probing pattern matches the learned-model evaluation flow: exponential
+    search to bracket the boundary, then binary search to locate the first
+    failure. Each probe uses the closed-form single-`n` check above, so this is
+    cheap even for very large `n`.
+
+    Args:
+        max_n: maximum `n` to consider. If None, probes until the first failure.
+        p: included for API symmetry with the exact batched evaluator; unused
+
+    Returns:
+        dict with:
+            max_correct_n: largest n confirmed correct within the search range
+            first_failure_n: first failing n within the search range, or None
+            all_correct: bool, whether all strings up to max_n are correct
+            probes: ordered list of {"n": ..., "correct": ...} probe results
+            method: short description of the estimate
+    """
+    del p  # The finite-precision boundary is independent of the PCFG parameter.
+
+    limit_n = golden_float32_counter_limit()
+    if max_n is not None and max_n < 1:
+        raise ValueError("max_n must be >= 1")
+
+    probes = []
+
+    def probe(n: int) -> bool:
+        ok = bool(check_golden_network_single_n(n)["correct"])
+        probes.append({"n": int(n), "correct": ok})
+        return ok
+
+    n = 1
+    while True:
+        if max_n is not None and n > max_n:
+            break
+        if not probe(n):
+            break
+        n *= 2
+
+    if max_n is not None and n > max_n:
+        if max_n == 1 or probe(max_n):
+            return {
+                "max_correct_n": int(max_n),
+                "first_failure_n": None,
+                "all_correct": True,
+                "probes": probes,
+                "method": "analytic float32 counter limit (exponential search)",
+            }
+        lo, hi = n // 2, max_n
+    elif n == 1 and probes and not probes[0]["correct"]:
+        lo, hi = 0, 1
+    else:
+        lo, hi = n // 2, n
+
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if probe(mid):
+            lo = mid
+        else:
+            hi = mid
+
+    first_failure_n = hi if hi > limit_n else None
+    max_correct_n = lo if first_failure_n is not None else limit_n
+    if max_n is not None:
+        max_correct_n = min(max_correct_n, max_n)
+
+    return {
+        "max_correct_n": int(max_correct_n),
+        "first_failure_n": None if first_failure_n is None else int(first_failure_n),
+        "all_correct": first_failure_n is None,
+        "probes": probes,
+        "method": "analytic float32 counter limit (exp + binary search)",
     }
 
 

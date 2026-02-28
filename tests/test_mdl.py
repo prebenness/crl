@@ -172,6 +172,24 @@ class TestGoldenNetwork:
         result = evaluate_golden_network(max_n=20, p=0.3)
         assert result["all_correct"], f"Failed at n={result['first_failure_n']}"
 
+    def test_golden_float32_limit(self):
+        """The handcrafted float32 counter should fail immediately after 2^24."""
+        from src.mdl.golden import (
+            check_golden_network_single_n,
+            estimate_golden_float32_limit,
+            golden_float32_counter_limit,
+        )
+
+        limit_n = golden_float32_counter_limit()
+        assert limit_n == 2**24
+
+        assert check_golden_network_single_n(limit_n)["correct"]
+        assert not check_golden_network_single_n(limit_n + 1)["correct"]
+
+        estimate = estimate_golden_float32_limit(max_n=limit_n + 8)
+        assert estimate["max_correct_n"] == limit_n
+        assert estimate["first_failure_n"] == limit_n + 1
+
     def test_mdl_score_positive(self):
         """MDL score should be a positive number of bits."""
         from src.mdl.golden import golden_mdl_score
