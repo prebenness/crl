@@ -1,0 +1,50 @@
+# ---- Weights & Biases ----
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-mdl"
+
+# ---- Dataset ----
+# Keep the same dataset/model path as the main ex3 run so batch smoke tests
+# exercise the same code path without the multi-hour runtime.
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+# ---- Model ----
+model:
+  mode: "mdl"
+  inner: "mdl_mlp"
+  num_classes: 10
+
+# ---- Training ----
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 0.0
+  epochs: 3
+  batch_size: 128
+  seed: 42
+
+# ---- PyTorch DataLoader for dataset materialisation ----
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 1
+
+# ---- MDL config ----
+mdl:
+  n_max: 5
+  m_max: 5
+  tau_start: 2.0
+  tau_end: 0.1
+  warmup_epochs: 1
+  n_samples: 1
+
+# ---- Lambda sweep (MDL penalty weight) ----
+# Two lambdas are enough to validate sweep setup, W&B init/finish, and batch IO.
+sweep:
+  lambda_min_exp: -2
+  lambda_max_exp: 0
+  lambda_steps: 2
+  log_sweep: true

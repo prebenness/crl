@@ -22,7 +22,9 @@ class TeeLogger:
         self._orig = None
 
     def __enter__(self):
-        self._file = open(self._log_path, self._mode)
+        # Line-buffer the sidecar log so long batch jobs do not accumulate
+        # buffered output and stall on wrapped stdout writes.
+        self._file = open(self._log_path, self._mode, buffering=1)
         self._orig = sys.stdout
         sys.stdout = self
         return self
@@ -36,6 +38,7 @@ class TeeLogger:
         self._file.write(data)
         # Keep the on-disk log tail-able during long runs.
         self.flush()
+        return len(data)
 
     def flush(self):
         self._orig.flush()
