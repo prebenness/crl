@@ -26,7 +26,7 @@ training:
   lr: 1.0e-3
   weight_decay_inner: 0.0
   weight_decay_outer: 0.0
-  epochs: 100
+  epochs: 500
   batch_size: 128
   seed: 42
 
@@ -37,22 +37,30 @@ dataloader:
   persistent_workers: false
   prefetch_factor: 2   # only used when num_workers > 0
 
-# ---- MDL config ----
-mdl:
-  n_max: 5
-  m_max: 5
-  tau_start: 2.0
-  tau_end: 0.1
-  warmup_epochs: 10
-  n_samples: 1
-
 # ---- HSIC regularisation (pair mode) ----
 hsic:
   weight: 0.50
 
+# ---- PyTorch DataLoader for dataset materialisation ----
+# ex3-safe defaults: conservative single-process loading for shared filesystems.
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 1   # kept low for ex3; only used when num_workers > 0
+
+# ---- MDL config ----
+mdl:
+  n_max: 10               # rational grid numerator max
+  m_max: 10               # rational grid denominator max
+  tau_start: 2.0          # initial Gumbel temperature
+  tau_end: 0.1            # final Gumbel temperature
+  warmup_epochs: 100      # epochs with continuous relaxation
+  n_samples: 10           # MC samples for Gumbel noise
+
 # ---- Lambda sweep (MDL penalty weight) ----
 sweep:
   lambda_min_exp: -3
-  lambda_max_exp: 1
-  lambda_steps: 8
+  lambda_max_exp: 3
+  lambda_steps: 30
   log_sweep: true
