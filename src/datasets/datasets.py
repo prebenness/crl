@@ -1,4 +1,4 @@
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import MNIST
 from torchvision import transforms
 
@@ -232,15 +232,54 @@ class CMNISTuLA(Dataset):
         return x_rgb, y
 
 
-def dataset_to_jax_arrays(dataset: Dataset):
-    """Load whole PyTorch dataset once, convert to NHWC JAX arrays once."""
+def _as_numpy(batch, dtype):
+    """Convert a DataLoader batch to a NumPy array without assuming tensor type."""
+    if hasattr(batch, "detach"):
+        batch = batch.detach()
+    if hasattr(batch, "cpu"):
+        batch = batch.cpu()
+    return np.asarray(batch, dtype=dtype)
+
+
+def dataset_to_jax_arrays(
+    dataset: Dataset,
+    *,
+    batch_size: int = 128,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
+):
+    """Load a PyTorch dataset once and convert it to NHWC JAX arrays."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if num_workers < 0:
+        raise ValueError("num_workers must be >= 0")
+    if persistent_workers and num_workers == 0:
+        raise ValueError("persistent_workers requires num_workers > 0")
+    if num_workers > 0 and prefetch_factor < 1:
+        raise ValueError("prefetch_factor must be >= 1 when num_workers > 0")
+
+    loader_kwargs = {
+        "batch_size": min(int(batch_size), len(dataset)),
+        "shuffle": False,
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
+    loader = DataLoader(dataset, **loader_kwargs)
+
     xs, ys = [], []
-    for x, y in dataset:
-        xs.append(x)
-        ys.append(y)
-    xs = np.stack(xs, axis=0)  # NCHW
+    for x_batch, y_batch in loader:
+        xs.append(_as_numpy(x_batch, np.float32))
+        ys.append(_as_numpy(y_batch, np.int32))
+
+    xs = np.concatenate(xs, axis=0)  # NCHW
     xs = np.transpose(xs, (0, 2, 3, 1))  # NHWC
-    ys = np.array(ys, dtype=np.int32)
+    ys = np.concatenate(ys, axis=0)
     return jnp.array(xs), jnp.array(ys)
 
 DATASET_NUM_CLASSES = {

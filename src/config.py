@@ -21,6 +21,14 @@ class DatasetConfig:
 
 
 @dataclass
+class DataLoaderConfig:
+    num_workers: int = 0
+    pin_memory: bool = False
+    persistent_workers: bool = False
+    prefetch_factor: int = 2
+
+
+@dataclass
 class ModelConfig:
     mode: str = "pair"
     inner: str = "ula_mlp_var"
@@ -81,6 +89,7 @@ class SweepConfig:
 class ExperimentConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
@@ -108,6 +117,7 @@ def load_config(yaml_path: str) -> ExperimentConfig:
     section_map = {
         "wandb": WandbConfig,
         "dataset": DatasetConfig,
+        "dataloader": DataLoaderConfig,
         "model": ModelConfig,
         "training": TrainingConfig,
         "controller": ControllerConfig,

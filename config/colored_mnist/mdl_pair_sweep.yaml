@@ -30,6 +30,13 @@ training:
   batch_size: 128
   seed: 42
 
+# ---- PyTorch DataLoader for dataset materialisation ----
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2   # only used when num_workers > 0
+
 # ---- MDL config ----
 mdl:
   n_max: 5

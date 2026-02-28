@@ -2,6 +2,7 @@
 # Requirements:
 #   pip install jax jaxlib flax optax torch torchvision matplotlib pyyaml tqdm
 
+import argparse
 import os
 os.environ["WANDB_SILENT"] = "true"
 
@@ -90,6 +91,77 @@ OUTER_MODELS = {
 }
 
 
+def parse_args(argv=None):
+    """Parse CLI arguments and optional dataloader overrides."""
+    parser = argparse.ArgumentParser(
+        description="Run the colored-MNIST lambda sweep from a YAML config.",
+    )
+    parser.add_argument("config", help="Path to the experiment YAML config.")
+    parser.add_argument(
+        "--dataloader-workers",
+        type=int,
+        default=None,
+        help="Override dataloader.num_workers for PyTorch dataset loading.",
+    )
+    parser.add_argument(
+        "--dataloader-prefetch-factor",
+        type=int,
+        default=None,
+        help="Override dataloader.prefetch_factor (used only when workers > 0).",
+    )
+    parser.add_argument(
+        "--dataloader-pin-memory",
+        dest="dataloader_pin_memory",
+        action="store_true",
+        help="Override dataloader.pin_memory=True.",
+    )
+    parser.add_argument(
+        "--no-dataloader-pin-memory",
+        dest="dataloader_pin_memory",
+        action="store_false",
+        help="Override dataloader.pin_memory=False.",
+    )
+    parser.add_argument(
+        "--dataloader-persistent-workers",
+        dest="dataloader_persistent_workers",
+        action="store_true",
+        help="Override dataloader.persistent_workers=True.",
+    )
+    parser.add_argument(
+        "--no-dataloader-persistent-workers",
+        dest="dataloader_persistent_workers",
+        action="store_false",
+        help="Override dataloader.persistent_workers=False.",
+    )
+    parser.set_defaults(
+        dataloader_pin_memory=None,
+        dataloader_persistent_workers=None,
+    )
+    return parser.parse_args(argv)
+
+
+def _apply_cli_overrides(cfg, args):
+    """Apply optional CLI overrides after YAML is loaded."""
+    if args.dataloader_workers is not None:
+        cfg.dataloader.num_workers = args.dataloader_workers
+    if args.dataloader_prefetch_factor is not None:
+        cfg.dataloader.prefetch_factor = args.dataloader_prefetch_factor
+    if args.dataloader_pin_memory is not None:
+        cfg.dataloader.pin_memory = args.dataloader_pin_memory
+    if args.dataloader_persistent_workers is not None:
+        cfg.dataloader.persistent_workers = args.dataloader_persistent_workers
+
+
+def _dataloader_settings(cfg):
+    """Return the active PyTorch dataloader settings as a plain dict."""
+    return {
+        "num_workers": int(cfg.dataloader.num_workers),
+        "pin_memory": bool(cfg.dataloader.pin_memory),
+        "persistent_workers": bool(cfg.dataloader.persistent_workers),
+        "prefetch_factor": int(cfg.dataloader.prefetch_factor),
+    }
+
+
 def _make_sweep_plot(results, cfg, out_path):
     """Generate and save the matplotlib sweep plot."""
     xs = np.array([r["lambda"] for r in results])
@@ -141,13 +213,10 @@ def _print_timing_table(results, dataset_name):
               f"\t{r['train_acc']:.3f}\t\t{r['test_acc']:.3f}")
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python colored_mnist.py <config.yaml>",
-              file=sys.stderr)
-        sys.exit(1)
-
-    cfg = load_config(sys.argv[1])
+def main(argv=None):
+    args = parse_args(argv)
+    cfg = load_config(args.config)
+    _apply_cli_overrides(cfg, args)
 
     expected_nc = DATASET_NUM_CLASSES.get(cfg.dataset.name)
     if expected_nc is not None and cfg.model.num_classes != expected_nc:
@@ -162,7 +231,7 @@ def main():
     print("JAX devices:", jax.devices())
     jax.config.update("jax_default_matmul_precision", "high")
 
-    cfg_path = Path(sys.argv[1]).resolve()
+    cfg_path = Path(args.config).resolve()
     cfg_name = cfg_path.stem
     timestamp = utc_timestamp()
     experiment_group_id = (
@@ -170,6 +239,7 @@ def main():
         f"-{cfg.sweep.lambda_min_exp}-{cfg.sweep.lambda_max_exp}"
         f"-{cfg.sweep.lambda_steps}"
     )
+    dataloader_settings = _dataloader_settings(cfg)
 
     # Build JIT-compiled functions from config
     mode = cfg.model.mode
@@ -211,6 +281,7 @@ def main():
 
     # Load data
     print("Loading datasets and converting to JAX arrays...")
+    print("PyTorch DataLoader settings:", dataloader_settings)
     t0 = time.time()
 
     train_ds = build_dataset(
@@ -221,8 +292,16 @@ def main():
         cfg.dataset.name, train=False,
         p_corr=cfg.dataset.p_test, seed=cfg.training.seed + 1,
     )
-    x_train, y_train = dataset_to_jax_arrays(train_ds)
-    x_test, y_test = dataset_to_jax_arrays(test_ds)
+    x_train, y_train = dataset_to_jax_arrays(
+        train_ds,
+        batch_size=cfg.training.batch_size,
+        **dataloader_settings,
+    )
+    x_test, y_test = dataset_to_jax_arrays(
+        test_ds,
+        batch_size=cfg.training.batch_size,
+        **dataloader_settings,
+    )
 
     print("Data shapes")
     print("Train shape, min, max:",
@@ -250,6 +329,7 @@ def main():
         "epochs": cfg.training.epochs,
         "batch_size": cfg.training.batch_size,
         "lr": cfg.training.lr,
+        "dataloader": dataloader_settings,
         "n_lambdas": int(len(cfg.lambdas)),
         "lambdas": [float(v) for v in cfg.lambdas],
     })
@@ -273,12 +353,14 @@ def main():
             "epochs": cfg.training.epochs,
             "batch_size": cfg.training.batch_size,
             "lr": cfg.training.lr,
+            "dataloader": dataloader_settings,
         })
 
         run_config = {
             "lambda": lamb,
             "dataset": cfg.dataset.name,
             "type": "sweep",
+            "dataloader": dataloader_settings,
         }
         run = wandb.init(
             entity=cfg.wandb.entity,
@@ -378,6 +460,7 @@ def main():
             "config_path": str(cfg_path),
             "mode": mode,
             "dataset": cfg.dataset.name,
+            "dataloader": dataloader_settings,
             "n_runs": len(all_results),
             "total_time_sec": total_time,
             "results": all_results,
