@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=prebenmn
-#SBATCH --job-name=lambda-mini
+#SBATCH --job-name=mdl-pair-sweep
 #SBATCH --output=logs/%x_%j.log     # job-name_job-ID.log
 #SBATCH --partition a40q
 #SBATCH --nodes=1

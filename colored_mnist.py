@@ -372,6 +372,7 @@ def main(argv=None):
         )
 
         t_start = time.time()
+        print(f"Detailed training log: {run_dir / 'train.log'}")
 
         with TeeLogger(run_dir / "train.log"):
             if mode == "single":

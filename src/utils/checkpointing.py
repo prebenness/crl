@@ -4,6 +4,7 @@ Shared utilities used by both differentiable_mdl.py and colored_mnist.py.
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -20,12 +21,14 @@ class TeeLogger:
         self._mode = mode
         self._file = None
         self._orig = None
+        self._mirror_stdout = True
 
     def __enter__(self):
         # Line-buffer the sidecar log so long batch jobs do not accumulate
-        # buffered output and stall on wrapped stdout writes.
+        # buffered output.
         self._file = open(self._log_path, self._mode, buffering=1)
         self._orig = sys.stdout
+        self._mirror_stdout = self._should_mirror_stdout()
         sys.stdout = self
         return self
 
@@ -34,18 +37,31 @@ class TeeLogger:
         self._file.close()
 
     def write(self, data):
-        self._orig.write(data)
+        if self._mirror_stdout:
+            self._orig.write(data)
         self._file.write(data)
         # Keep the on-disk log tail-able during long runs.
         self.flush()
         return len(data)
 
     def flush(self):
-        self._orig.flush()
+        if self._mirror_stdout:
+            self._orig.flush()
         self._file.flush()
 
     def fileno(self):
         return self._orig.fileno()
+
+    def _should_mirror_stdout(self):
+        """Avoid blocking on non-interactive Slurm stdout streams by default."""
+        mode = os.environ.get("CRL_TEE_STDOUT", "auto").strip().lower()
+        if mode in {"0", "false", "no", "off"}:
+            return False
+        if mode in {"1", "true", "yes", "on"}:
+            return True
+
+        is_tty = bool(getattr(self._orig, "isatty", lambda: False)())
+        return not os.environ.get("SLURM_JOB_ID") or is_tty
 
 
 def save_checkpoint(params, path):
