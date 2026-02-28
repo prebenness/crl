@@ -10,9 +10,12 @@
 
 echo "Starting job at time:" && date +%Y-%m-%d_%H:%M:%S
 
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
 # Set venv for partition
 source /global/D1/homes/prebenmn/workspace/crl/venvs/a40q/bin/activate
 unset PYTHONPATH PYTHONHOME
 export PYTHONNOUSERSITE=1
 
-srun -n 1 stdbuf -oL -eL python -u colored_mnist.py config/colored_mnist/mdl_single_sweep.yaml
+srun --ntasks=1 --cpus-per-task=$SLURM_CPUS_PER_TASK python -u colored_mnist.py config/colored_mnist/mdl_single_sweep.yaml
