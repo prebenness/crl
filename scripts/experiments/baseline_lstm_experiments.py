@@ -176,7 +176,7 @@ def run_training(args, model, x_train, y_train, mask_train,
         n_batches = max(N // bs, 1)
 
         epoch_loss = 0.0
-        epoch_data_cl = 0.0
+        epoch_data_nll_bits = 0.0
         epoch_reg = 0.0
 
         for b in range(n_batches):
@@ -187,19 +187,20 @@ def run_training(args, model, x_train, y_train, mask_train,
             state, loss, aux = train_step(state, xb, yb, mb, batch_rng)
 
             epoch_loss += float(loss)
-            epoch_data_cl += float(aux["data_codelength"])
-            epoch_reg += float(aux["reg_term"])
+            epoch_data_nll_bits += float(aux["data_nll_bits"])
+            epoch_reg += float(aux["reg_regularizer"])
 
         epoch_loss /= n_batches
-        epoch_data_cl /= n_batches
+        epoch_data_nll_bits /= n_batches
         epoch_reg /= n_batches
 
         # Logging
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             print(
                 f"Epoch {epoch+1:5d} | "
-                f"loss={epoch_loss:8.2f}  NLL={epoch_data_cl:8.1f}b  "
-                f"reg={epoch_reg:8.4f}"
+                f"objective_total_bits={epoch_loss:8.2f}b  "
+                f"data_nll_bits={epoch_data_nll_bits:8.1f}b  "
+                f"reg_regularizer={epoch_reg:8.4f}"
             )
 
         # Validation (for early stopping and checkpointing)

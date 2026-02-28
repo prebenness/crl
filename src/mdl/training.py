@@ -45,32 +45,30 @@ def create_mdl_state(rng, model, seq_len, batch_size, lr, tau_init):
     )
 
 
-def _compute_hyp_and_entropy(model_aux, tau):
-    """Compute hypothesis codelength and entropy terms from model aux outputs.
+def _compute_complexity_and_entropy_bits(model_aux, tau):
+    """Compute complexity and entropy terms in bits from model aux outputs.
 
     These terms depend only on the categorical logits (not Gumbel noise),
     so they are computed once regardless of n_samples.
     """
-    expected_hyp_codelength = model_aux["expected_codelength"]
+    complexity_expected_bits = model_aux["expected_codelength"]
 
     all_probs = model_aux["all_probs"]  # (n_params, M)
     log_probs = jnp.log2(all_probs + 1e-10)
-    entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
-    total_entropy = jnp.sum(entropy_per_param)
+    entropy_per_param_bits = -jnp.sum(all_probs * log_probs, axis=-1)
+    entropy_weights_bits = jnp.sum(entropy_per_param_bits)
 
     # beta = 1/tau, so 1/beta = tau
-    entropy_bonus = tau * total_entropy
+    entropy_bonus_bits = tau * entropy_weights_bits
 
-    return expected_hyp_codelength, total_entropy, entropy_bonus
+    return complexity_expected_bits, entropy_weights_bits, entropy_bonus_bits
 
 
-def _compute_data_codelength(logits, y, mask):
-    """Compute data codelength (cross-entropy in bits) for one forward pass."""
+def _compute_data_nll_bits(logits, y, mask):
+    """Compute data NLL (cross-entropy) in bits for one forward pass."""
     ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     ce_bits = ce_nats / jnp.log(2.0)
-    data_codelength = jnp.sum(ce_bits * mask)
-    ce_per_token = jnp.sum(ce_nats * mask) / jnp.sum(mask)
-    return data_codelength, ce_per_token
+    return jnp.sum(ce_bits * mask)
 
 
 def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
@@ -110,18 +108,14 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
                 {"params": params}, x, tau=tau, train=True, rng=rng,
                 soft_forward=True,
             )
-            data_codelength, ce_per_token = _compute_data_codelength(
-                logits, y, mask,
-            )
+            data_nll_bits = _compute_data_nll_bits(logits, y, mask)
         elif deterministic_st:
             # Single deterministic ST pass (hard argmax + soft gradients).
             logits, model_aux = apply_fn(
                 {"params": params}, x, tau=tau, train=True,
                 deterministic_st=True,
             )
-            data_codelength, ce_per_token = _compute_data_codelength(
-                logits, y, mask,
-            )
+            data_nll_bits = _compute_data_nll_bits(logits, y, mask)
         elif n_samples > 1:
             # Multi-sample: average data_cl over K Gumbel-Softmax passes
             keys = jrandom.split(rng, n_samples)
@@ -130,12 +124,11 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
                 logits_k, aux_k = apply_fn(
                     {"params": params}, x, tau=tau, train=True, rng=key,
                 )
-                data_cl, ce = _compute_data_codelength(logits_k, y, mask)
-                return data_cl, ce, aux_k
+                data_nll_k = _compute_data_nll_bits(logits_k, y, mask)
+                return data_nll_k, aux_k
 
-            data_cls, ce_per_tokens, all_aux = jax.vmap(single_sample)(keys)
-            data_codelength = jnp.mean(data_cls)
-            ce_per_token = jnp.mean(ce_per_tokens)
+            data_nll_samples, all_aux = jax.vmap(single_sample)(keys)
+            data_nll_bits = jnp.mean(data_nll_samples)
 
             # model_aux is identical across samples (doesn't depend on
             # Gumbel noise), so just take the first.
@@ -145,27 +138,29 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
             logits, model_aux = apply_fn(
                 {"params": params}, x, tau=tau, train=True, rng=rng,
             )
-            data_codelength, ce_per_token = _compute_data_codelength(
-                logits, y, mask,
-            )
+            data_nll_bits = _compute_data_nll_bits(logits, y, mask)
 
         # Hypothesis and entropy (exact, independent of Gumbel noise)
-        expected_hyp_codelength, total_entropy, entropy_bonus = \
-            _compute_hyp_and_entropy(model_aux, tau)
+        complexity_expected_bits, entropy_weights_bits, entropy_bonus_bits = \
+            _compute_complexity_and_entropy_bits(model_aux, tau)
 
-        # Total relaxed MDL objective with batch scaling
-        mdl_loss = data_codelength + mdl_lambda * batch_scale * expected_hyp_codelength
-        total_loss = mdl_loss - batch_scale * entropy_bonus
+        # Total relaxed MDL objective with batch scaling.
+        reg_complexity_weighted = mdl_lambda * batch_scale * complexity_expected_bits
+        reg_entropy_bonus = batch_scale * entropy_bonus_bits
+        reg_net = reg_complexity_weighted - reg_entropy_bonus
+        objective_total_bits = data_nll_bits + reg_net
 
         aux = {
-            "data_codelength": data_codelength,
-            "hyp_codelength": expected_hyp_codelength,
-            "entropy": total_entropy,
-            "entropy_bonus": entropy_bonus,
-            "mdl_total": mdl_loss,
-            "ce_per_token": ce_per_token,
+            # Unified naming (bits): objective decomposition
+            "objective_total_bits": objective_total_bits,
+            "data_nll_bits": data_nll_bits,
+            "complexity_expected_bits": complexity_expected_bits,
+            "entropy_weights_bits": entropy_weights_bits,
+            "reg_complexity_weighted_bits": reg_complexity_weighted,
+            "reg_entropy_bonus_bits": reg_entropy_bonus,
+            "reg_net_bits": reg_net,
         }
-        return total_loss, aux
+        return objective_total_bits, aux
 
     return loss_fn
 

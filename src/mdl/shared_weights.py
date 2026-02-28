@@ -185,13 +185,11 @@ def create_shared_mdl_state(
 # Loss function
 # ---------------------------------------------------------------------------
 
-def _shared_compute_data_codelength(logits, y, mask):
-    """Compute data codelength (cross-entropy in bits) for one forward pass."""
+def _shared_compute_data_nll_bits(logits, y, mask):
+    """Compute data NLL (cross-entropy) in bits for one forward pass."""
     ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     ce_bits = ce_nats / jnp.log(2.0)
-    data_codelength = jnp.sum(ce_bits * mask)
-    ce_per_token = jnp.sum(ce_nats * mask) / jnp.sum(mask)
-    return data_codelength, ce_per_token
+    return jnp.sum(ce_bits * mask)
 
 
 def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
@@ -229,17 +227,13 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
                 {"params": model_params}, x, tau=tau, train=True, rng=rng,
                 soft_forward=True,
             )
-            data_codelength, ce_per_token = _shared_compute_data_codelength(
-                logits, y, mask,
-            )
+            data_nll_bits = _shared_compute_data_nll_bits(logits, y, mask)
         elif deterministic_st:
             logits, model_aux = apply_fn(
                 {"params": model_params}, x, tau=tau, train=True,
                 deterministic_st=True,
             )
-            data_codelength, ce_per_token = _shared_compute_data_codelength(
-                logits, y, mask,
-            )
+            data_nll_bits = _shared_compute_data_nll_bits(logits, y, mask)
         elif n_samples > 1:
             keys = jrandom.split(rng, n_samples)
 
@@ -247,12 +241,11 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
                 logits_k, aux_k = apply_fn(
                     {"params": model_params}, x, tau=tau, train=True, rng=key,
                 )
-                data_cl, ce = _shared_compute_data_codelength(logits_k, y, mask)
-                return data_cl, ce, aux_k
+                data_nll_k = _shared_compute_data_nll_bits(logits_k, y, mask)
+                return data_nll_k, aux_k
 
-            data_cls, ce_per_tokens, all_aux = jax.vmap(single_sample)(keys)
-            data_codelength = jnp.mean(data_cls)
-            ce_per_token = jnp.mean(ce_per_tokens)
+            data_nll_samples, all_aux = jax.vmap(single_sample)(keys)
+            data_nll_bits = jnp.mean(data_nll_samples)
 
             # model_aux is identical across samples (doesn't depend on
             # Gumbel noise), so just take the first.
@@ -261,9 +254,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
             logits, model_aux = apply_fn(
                 {"params": model_params}, x, tau=tau, train=True, rng=rng,
             )
-            data_codelength, ce_per_token = _shared_compute_data_codelength(
-                logits, y, mask,
-            )
+            data_nll_bits = _shared_compute_data_nll_bits(logits, y, mask)
 
         # Per-weight distributions
         all_probs = model_aux["all_probs"]  # (n_params, M)
@@ -282,40 +273,38 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         # Entropy bonus
         log_probs = jnp.log2(all_probs + 1e-10)
         entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
-        total_entropy = jnp.sum(entropy_per_param)
-        entropy_bonus = tau * total_entropy
+        entropy_weights_bits = jnp.sum(entropy_per_param)
+        entropy_bonus_bits = tau * entropy_weights_bits
 
         # Batch scaling
         B = x.shape[0]
         batch_scale = B / n_train
 
-        # Composite objective
-        total_loss = (
-            data_codelength
-            + batch_scale * lambda1 * kl_weight_sharing
-            + batch_scale * lambda2 * kl_dictionary
-            - batch_scale * entropy_bonus
+        # Composite objective (bits) with explicit decomposition.
+        complexity_expected_bits = (
+            lambda1 * kl_weight_sharing + lambda2 * kl_dictionary
         )
+        reg_complexity_weighted = batch_scale * complexity_expected_bits
+        reg_entropy_bonus = batch_scale * entropy_bonus_bits
+        reg_net = reg_complexity_weighted - reg_entropy_bonus
+        objective_total_bits = data_nll_bits + reg_net
 
         aux = {
-            "data_codelength": data_codelength,
-            "kl_weight_sharing": kl_weight_sharing,
-            "kl_dictionary": kl_dictionary,
-            "entropy": total_entropy,
-            "entropy_bonus": entropy_bonus,
-            "total_loss": total_loss,
-            "hyp_codelength": lambda1 * kl_weight_sharing + lambda2 * kl_dictionary,
-            "mdl_total": (
-                data_codelength
-                + batch_scale * lambda1 * kl_weight_sharing
-                + batch_scale * lambda2 * kl_dictionary
-            ),
-            "ce_per_token": ce_per_token,
-            "phi_min": jnp.min(phi),
-            "phi_max": jnp.max(phi),
-            "phi_entropy": -jnp.sum(phi * jnp.log2(phi + 1e-10)),
+            # Unified naming (bits): objective decomposition
+            "objective_total_bits": objective_total_bits,
+            "data_nll_bits": data_nll_bits,
+            "complexity_expected_bits": complexity_expected_bits,
+            "entropy_weights_bits": entropy_weights_bits,
+            "reg_complexity_weighted_bits": reg_complexity_weighted,
+            "reg_entropy_bonus_bits": reg_entropy_bonus,
+            "reg_net_bits": reg_net,
+            "kl_pi_phi_bits": kl_weight_sharing,
+            "kl_phi_pbase_bits": kl_dictionary,
+            "phi_min_prob": jnp.min(phi),
+            "phi_max_prob": jnp.max(phi),
+            "phi_entropy_bits": -jnp.sum(phi * jnp.log2(phi + 1e-10)),
         }
-        return total_loss, aux
+        return objective_total_bits, aux
 
     return loss_fn
 

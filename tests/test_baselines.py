@@ -133,8 +133,8 @@ class TestBaselineLoss:
             self.step_rng,
         )
         assert float(loss) > 0
-        assert float(aux["data_codelength"]) > 0
-        assert float(aux["reg_term"]) == 0.0
+        assert float(aux["data_nll_bits"]) > 0
+        assert float(aux["reg_regularizer"]) == 0.0
 
     def test_l1_increases_loss(self):
         """L1 regularization increases the total loss."""
@@ -150,7 +150,7 @@ class TestBaselineLoss:
             self.step_rng,
         )
         assert float(loss_l1) > float(loss_noreg)
-        assert float(aux_l1["reg_term"]) > 0
+        assert float(aux_l1["reg_regularizer"]) > 0
 
     def test_l2_increases_loss(self):
         """L2 regularization increases the total loss."""

@@ -162,19 +162,19 @@ class TestMDLLoss:
         y = jnp.array([0, 1, 2, 3])
         rng = jrandom.PRNGKey(5)
 
-        total_loss, (logits, ce, hyp_cl, entropy, z) = _mdl_loss(
+        total_loss, (logits, data_nll_nats, complexity_expected_nats, entropy_weights_nats, z) = _mdl_loss(
             model.apply, params, dummy_input, y,
             rng=rng, tau=1.0, mdl_lambda=0.01,
             n_train=100, n_samples=1, soft_forward=True,
         )
 
         assert jnp.isfinite(total_loss)
-        assert jnp.isfinite(ce)
-        assert jnp.isfinite(hyp_cl)
-        assert jnp.isfinite(entropy)
-        assert float(ce) > 0
-        assert float(hyp_cl) > 0
-        assert float(entropy) >= 0
+        assert jnp.isfinite(data_nll_nats)
+        assert jnp.isfinite(complexity_expected_nats)
+        assert jnp.isfinite(entropy_weights_nats)
+        assert float(data_nll_nats) > 0
+        assert float(complexity_expected_nats) > 0
+        assert float(entropy_weights_nats) >= 0
 
 
 class TestMDLTrainStep:
@@ -214,6 +214,6 @@ class TestMDLTrainStep:
             mdl_lambda=0.01, n_train=100,
         )
 
-        assert jnp.isfinite(metrics["loss"])
-        assert 0 <= float(metrics["acc"]) <= 1
+        assert jnp.isfinite(metrics["objective_total_nats"])
+        assert 0 <= float(metrics["accuracy"]) <= 1
         assert state2.step == 1

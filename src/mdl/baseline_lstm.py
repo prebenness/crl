@@ -172,28 +172,27 @@ def make_baseline_loss_fn(reg_type=None, reg_lambda=0.0):
         # Cross-entropy
         ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
         ce_bits = ce_nats / jnp.log(2.0)
-        data_codelength = jnp.sum(ce_bits * mask)
-        ce_per_token = jnp.sum(ce_nats * mask) / jnp.sum(mask)
+        data_nll_bits = jnp.sum(ce_bits * mask)
 
-        loss = data_codelength
+        objective_total_bits = data_nll_bits
 
         # Regularization
-        reg_term = jnp.array(0.0)
+        reg_regularizer = jnp.array(0.0)
         if reg_type == "l1" and reg_lambda > 0:
             all_weights = flatten_params(params)
-            reg_term = reg_lambda * jnp.sum(jnp.abs(all_weights))
-            loss = loss + reg_term
+            reg_regularizer = reg_lambda * jnp.sum(jnp.abs(all_weights))
+            objective_total_bits = objective_total_bits + reg_regularizer
         elif reg_type == "l2" and reg_lambda > 0:
             all_weights = flatten_params(params)
-            reg_term = reg_lambda * jnp.sum(all_weights ** 2)
-            loss = loss + reg_term
+            reg_regularizer = reg_lambda * jnp.sum(all_weights ** 2)
+            objective_total_bits = objective_total_bits + reg_regularizer
 
         aux = {
-            "data_codelength": data_codelength,
-            "ce_per_token": ce_per_token,
-            "reg_term": reg_term,
+            "objective_total_bits": objective_total_bits,
+            "data_nll_bits": data_nll_bits,
+            "reg_regularizer": reg_regularizer,
         }
-        return loss, aux
+        return objective_total_bits, aux
 
     return loss_fn
 

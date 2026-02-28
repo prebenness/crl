@@ -44,28 +44,29 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
 
         results = {
             "epoch": ep + 1,
-            "train_loss": float(metrics["loss"]),
-            "train_acc": float(metrics["acc"]),
-            "train_kl": float(metrics["kl"]),
-            "train_recon": float(metrics["recon"]),
-            "train_beta": float(metrics["beta"]),
-            "test_loss": float(te_loss),
+            "train_acc": float(metrics["accuracy"]),
             "test_acc": float(te_acc),
-            "cap": float(lamb),
-            "kl_err": float(lamb - metrics["kl"]),
+            "objective_total_nats": float(metrics["objective_total_nats"]),
+            "data_nll_nats": float(metrics["data_nll_nats"]),
+            "reconstruction_nll_nats": float(metrics["reconstruction_nll_nats"]),
+            "kl_latent_nats": float(metrics["kl_latent_nats"]),
+            "beta_controller": float(metrics["beta_controller"]),
+            "test_nll_nats": float(te_loss),
+            "capacity_target_nats": float(lamb),
+            "kl_target_gap_nats": float(lamb - metrics["kl_latent_nats"]),
         }
         wandb_run.log(results)
 
         print(
             f"  Epoch {ep+1}/{cfg.training.epochs}"
-            f"  Acc. Train: {float(metrics['acc']):.4f}"
-            f" Test: {float(te_acc):.4f}"
-            f"  Loss Train: {float(metrics['loss']):.4f}"
-            f" Test: {float(te_loss):.4f}"
-            f"  Train CE: {float(metrics['ce']):.4f}"
-            f" Recon {float(metrics['recon']):.4f}"
-            f"  KL: {float(metrics['kl']):.4f}"
-            f"  Beta: {float(metrics['beta']):.3f}"
+            f"  train_acc {float(metrics['accuracy']):.4f}"
+            f" test_acc {float(te_acc):.4f}"
+            f"  objective_total {float(metrics['objective_total_nats']):.4f}n"
+            f" test_nll {float(te_loss):.4f}n"
+            f"  data_nll {float(metrics['data_nll_nats']):.4f}n"
+            f" recon_nll {float(metrics['reconstruction_nll_nats']):.4f}n"
+            f"  kl_latent {float(metrics['kl_latent_nats']):.4f}n"
+            f"  beta_controller {float(metrics['beta_controller']):.3f}"
             f"      Time: {time.time()-t0:.2f}s"
         )
 
@@ -117,29 +118,33 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
 
         results = {
             "epoch": ep + 1,
-            "train_acc1": float(metrics["acc1"]),
-            "train_loss1": float(metrics["loss1"]),
-            "train_kl1": float(metrics["kl1"]),
-            "train_recon1": float(metrics["recon1"]),
-            "train_beta1": float(metrics["beta1"]),
+            "train_acc1": float(metrics["accuracy_inner"]),
             "test_acc1": float(te_acc1),
-            "test_loss1": float(te_loss1),
-            "train_acc2": float(metrics["acc2"]),
-            "train_loss2": float(metrics["loss2"]),
-            "train_ce2": float(metrics["ce2"]),
+            "objective_total_nats": float(metrics["objective_total_nats"]),
+            "data_nll_nats": float(metrics["data_nll_nats"]),
+            "reconstruction_nll_nats": float(metrics["reconstruction_nll_nats"]),
+            "kl_latent_nats": float(metrics["kl_latent_nats"]),
+            "beta_controller": float(metrics["beta_controller"]),
+            "test_nll_nats_inner": float(te_loss1),
+            "train_acc2": float(metrics["accuracy_outer"]),
             "test_acc2": float(te_acc2),
-            "test_loss2": float(te_loss2),
+            "objective_total_outer_nats": float(metrics["objective_total_outer_nats"]),
+            "data_nll_outer_nats": float(metrics["data_nll_outer_nats"]),
+            "test_nll_nats_outer": float(te_loss2),
             "hsic": float(metrics["hsic"]),
-            "cap": float(lamb),
+            "capacity_target_nats": float(lamb),
+            "kl_target_gap_nats": float(lamb - metrics["kl_latent_nats"]),
         }
         wandb_run.log(results)
 
         print(
             f"  Epoch {ep+1}/{cfg.training.epochs}"
-            f" | Inner acc tr {results['train_acc1']:.4f}"
-            f" te {results['test_acc1']:.4f}"
-            f" | Outer acc tr {results['train_acc2']:.4f}"
-            f" te {results['test_acc2']:.4f}"
+            f" | inner_train_acc {results['train_acc1']:.4f}"
+            f" inner_test_acc {results['test_acc1']:.4f}"
+            f" | inner_objective_total {results['objective_total_nats']:.4f}n"
+            f" | outer_train_acc {results['train_acc2']:.4f}"
+            f" outer_test_acc {results['test_acc2']:.4f}"
+            f" | outer_objective_total {results['objective_total_outer_nats']:.4f}n"
             f" | hsic {results['hsic']:.4f}"
             f" | {time.time()-t0:.2f}s"
         )
@@ -211,28 +216,45 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
         rng_eval, rng_eval_epoch = jrandom.split(rng_eval)
         te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval_epoch)
 
+        phase = "warmup" if is_warmup else ("bridge" if is_bridge else "st")
+
         results = {
             "epoch": ep + 1,
-            "train_loss": float(metrics["loss"]),
-            "train_acc": float(metrics["acc"]),
-            "train_ce": float(metrics["ce"]),
-            "train_hyp_cl": float(metrics["hyp_cl"]),
-            "train_entropy": float(metrics["entropy"]),
-            "train_hyp_cl_nats": float(metrics["hyp_cl"]),
-            "train_entropy_nats": float(metrics["entropy"]),
+            "phase": phase,
             "tau": float(tau),
-            "test_loss": float(te_loss),
+            "lambda_reg": float(lamb),
+            "train_acc": float(metrics["accuracy"]),
             "test_acc": float(te_acc),
-            "cap": float(lamb),
+            "objective_total_nats": float(metrics["objective_total_nats"]),
+            "data_nll_nats": float(metrics["data_nll_nats"]),
+            "complexity_expected_nats": float(metrics["complexity_expected_nats"]),
+            "entropy_weights_nats": float(metrics["entropy_weights_nats"]),
+            "reg_complexity_weighted_nats": float(metrics["reg_complexity_weighted_nats"]),
+            "reg_entropy_bonus_nats": float(metrics["reg_entropy_bonus_nats"]),
+            "reg_net_nats": float(metrics["reg_net_nats"]),
+            "objective_total_bits": float(metrics["objective_total_bits"]),
+            "data_nll_bits": float(metrics["data_nll_bits"]),
+            "complexity_expected_bits": float(metrics["complexity_expected_bits"]),
+            "entropy_weights_bits": float(metrics["entropy_weights_bits"]),
+            "reg_complexity_weighted_bits": float(metrics["reg_complexity_weighted_bits"]),
+            "reg_entropy_bonus_bits": float(metrics["reg_entropy_bonus_bits"]),
+            "reg_net_bits": float(metrics["reg_net_bits"]),
+            "test_nll_nats": float(te_loss),
+            "test_nll_bits": float(te_loss / jnp.log(2.0)),
         }
         wandb_run.log(results)
 
         print(
             f"  Epoch {ep+1}/{cfg.training.epochs}"
-            f"  Acc tr {float(metrics['acc']):.4f} te {float(te_acc):.4f}"
-            f"  CE {float(metrics['ce']):.4f}"
-            f"  HypCL(nats) {float(metrics['hyp_cl']):.1f}"
-            f"  H(nats) {float(metrics['entropy']):.1f}"
+            f"  train_acc {float(metrics['accuracy']):.4f}"
+            f" test_acc {float(te_acc):.4f}"
+            f"  objective_total {float(metrics['objective_total_nats']):.4f}n"
+            f"  data_nll {float(metrics['data_nll_nats']):.4f}n"
+            f"  reg_net {float(metrics['reg_net_nats']):.4f}n"
+            f" (reg_complexity_weighted {float(metrics['reg_complexity_weighted_nats']):.4f}n"
+            f" - reg_entropy_bonus {float(metrics['reg_entropy_bonus_nats']):.4f}n)"
+            f"  complexity_expected {float(metrics['complexity_expected_nats']):.1f}n"
+            f"  entropy_weights {float(metrics['entropy_weights_nats']):.1f}n"
             f"  tau {float(tau):.4f}"
             f"{'  [warmup]' if is_warmup else ('  [bridge]' if is_bridge else '')}"
             f"  {time.time()-t0:.2f}s"
@@ -317,34 +339,50 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             outer_state, xt, yt, rng_eval_outer,
         )
 
+        phase = "warmup" if is_warmup else ("bridge" if is_bridge else "st")
+
         results = {
             "epoch": ep + 1,
-            "train_acc1": float(metrics["acc1"]),
-            "train_loss1": float(metrics["loss1"]),
-            "train_ce1": float(metrics["ce1"]),
-            "train_hyp_cl": float(metrics["hyp_cl"]),
-            "train_entropy": float(metrics["entropy"]),
-            "train_hyp_cl_nats": float(metrics["hyp_cl"]),
-            "train_entropy_nats": float(metrics["entropy"]),
-            "test_acc1": float(te_acc1),
-            "test_loss1": float(te_loss1),
-            "train_acc2": float(metrics["acc2"]),
-            "train_loss2": float(metrics["loss2"]),
-            "train_ce2": float(metrics["ce2"]),
-            "test_acc2": float(te_acc2),
-            "test_loss2": float(te_loss2),
-            "hsic": float(metrics["hsic"]),
+            "phase": phase,
             "tau": float(tau),
-            "cap": float(lamb),
+            "lambda_reg": float(lamb),
+            "train_acc1": float(metrics["accuracy_inner"]),
+            "objective_total_nats": float(metrics["objective_total_nats"]),
+            "data_nll_nats": float(metrics["data_nll_nats"]),
+            "complexity_expected_nats": float(metrics["complexity_expected_nats"]),
+            "entropy_weights_nats": float(metrics["entropy_weights_nats"]),
+            "reg_complexity_weighted_nats": float(metrics["reg_complexity_weighted_nats"]),
+            "reg_entropy_bonus_nats": float(metrics["reg_entropy_bonus_nats"]),
+            "reg_net_nats": float(metrics["reg_net_nats"]),
+            "objective_total_bits": float(metrics["objective_total_bits"]),
+            "data_nll_bits": float(metrics["data_nll_bits"]),
+            "complexity_expected_bits": float(metrics["complexity_expected_bits"]),
+            "entropy_weights_bits": float(metrics["entropy_weights_bits"]),
+            "reg_complexity_weighted_bits": float(metrics["reg_complexity_weighted_bits"]),
+            "reg_entropy_bonus_bits": float(metrics["reg_entropy_bonus_bits"]),
+            "reg_net_bits": float(metrics["reg_net_bits"]),
+            "test_acc1": float(te_acc1),
+            "test_nll_nats_inner": float(te_loss1),
+            "test_nll_bits_inner": float(te_loss1 / jnp.log(2.0)),
+            "train_acc2": float(metrics["accuracy_outer"]),
+            "objective_total_outer_nats": float(metrics["objective_total_outer_nats"]),
+            "data_nll_outer_nats": float(metrics["data_nll_outer_nats"]),
+            "test_acc2": float(te_acc2),
+            "test_nll_nats_outer": float(te_loss2),
+            "test_nll_bits_outer": float(te_loss2 / jnp.log(2.0)),
+            "hsic": float(metrics["hsic"]),
         }
         wandb_run.log(results)
 
         print(
             f"  Epoch {ep+1}/{cfg.training.epochs}"
-            f" | Inner acc tr {results['train_acc1']:.4f}"
-            f" te {results['test_acc1']:.4f}"
-            f" | Outer acc tr {results['train_acc2']:.4f}"
-            f" te {results['test_acc2']:.4f}"
+            f" | inner_train_acc {results['train_acc1']:.4f}"
+            f" inner_test_acc {results['test_acc1']:.4f}"
+            f" | inner_objective_total {results['objective_total_nats']:.4f}n"
+            f" inner_data_nll {results['data_nll_nats']:.4f}n"
+            f" inner_reg_net {results['reg_net_nats']:.4f}n"
+            f" | outer_train_acc {results['train_acc2']:.4f}"
+            f" outer_test_acc {results['test_acc2']:.4f}"
             f" | hsic {results['hsic']:.4f}"
             f" | tau {float(tau):.4f}"
             f"{'  [warmup]' if is_warmup else ('  [bridge]' if is_bridge else '')}"

@@ -68,5 +68,5 @@ def test_mdl_inner_step_matches_pair_when_hsic_is_zero():
     flat_pair, _ = jax.flatten_util.ravel_pytree(inner_pair.params)
 
     assert jnp.allclose(flat_single, flat_pair, atol=0.0, rtol=0.0)
-    assert float(m_single["loss"]) == float(m_pair["loss1"])
-    assert float(m_single["ce"]) == float(m_pair["ce1"])
+    assert float(m_single["objective_total_nats"]) == float(m_pair["objective_total_nats"])
+    assert float(m_single["data_nll_nats"]) == float(m_pair["data_nll_nats"])

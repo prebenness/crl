@@ -222,9 +222,13 @@ def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
     perm = jrandom.permutation(perm_rng, N)
     n_batches = max(N // bs, 1)
 
-    epoch_data_cl = 0.0
-    epoch_hyp_cl = 0.0
-    epoch_entropy = 0.0
+    epoch_obj = 0.0
+    epoch_data_nll_bits = 0.0
+    epoch_complexity_expected_bits = 0.0
+    epoch_entropy_weights_bits = 0.0
+    epoch_reg_complexity = 0.0
+    epoch_reg_entropy_bonus = 0.0
+    epoch_reg_net = 0.0
 
     for b in range(n_batches):
         idx = perm[b * bs:(b + 1) * bs] if N >= bs else jnp.arange(N)
@@ -233,14 +237,22 @@ def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
         rng, batch_rng = jrandom.split(rng)
         state, loss, aux = train_step(state, xb, yb, mb, batch_rng)
 
-        epoch_data_cl += float(aux["data_codelength"])
-        epoch_hyp_cl += float(aux["hyp_codelength"])
-        epoch_entropy += float(aux["entropy"])
+        epoch_obj += float(aux["objective_total_bits"])
+        epoch_data_nll_bits += float(aux["data_nll_bits"])
+        epoch_complexity_expected_bits += float(aux["complexity_expected_bits"])
+        epoch_entropy_weights_bits += float(aux["entropy_weights_bits"])
+        epoch_reg_complexity += float(aux["reg_complexity_weighted_bits"])
+        epoch_reg_entropy_bonus += float(aux["reg_entropy_bonus_bits"])
+        epoch_reg_net += float(aux["reg_net_bits"])
 
     return state, rng, {
-        "data_cl": epoch_data_cl / n_batches,
-        "hyp_cl": epoch_hyp_cl / n_batches,
-        "entropy": epoch_entropy / n_batches,
+        "objective_total_bits": epoch_obj / n_batches,
+        "data_nll_bits": epoch_data_nll_bits / n_batches,
+        "complexity_expected_bits": epoch_complexity_expected_bits / n_batches,
+        "entropy_weights_bits": epoch_entropy_weights_bits / n_batches,
+        "reg_complexity_weighted_bits": epoch_reg_complexity / n_batches,
+        "reg_entropy_bonus_bits": epoch_reg_entropy_bonus / n_batches,
+        "reg_net_bits": epoch_reg_net / n_batches,
     }
 
 
@@ -330,14 +342,20 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         )
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
-            # Compute discrete |H| periodically
-            hyp_disc = _compute_discrete_hyp_bits(state.params, grid, grid_values)
-            nll = metrics['data_cl']
-            mdl = nll + hyp_disc
+            # Compute discrete argmax complexity periodically for monitoring.
+            complexity_argmax_bits = _compute_discrete_hyp_bits(
+                state.params, grid, grid_values,
+            )
             print(
                 f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
-                f"NLL={nll:8.1f}b  |H|={hyp_disc:4d}b (soft:{metrics['hyp_cl']:.1f})  MDL={mdl:.1f}b | "
-                f"H_w={metrics['entropy']:5.1f}  τ={float(tau):.4f}"
+                f"objective_total_bits={metrics['objective_total_bits']:8.1f}b  "
+                f"data_nll_bits={metrics['data_nll_bits']:8.1f}b  "
+                f"reg_net_bits={metrics['reg_net_bits']:7.1f}b "
+                f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
+                f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
+                f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
+                f"complexity_argmax_bits={complexity_argmax_bits:4d}b  "
+                f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  τ={float(tau):.4f}"
             )
 
         if (epoch + 1) % args.eval_every == 0:
@@ -379,9 +397,18 @@ def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
     perm = jrandom.permutation(perm_rng, N)
     n_batches = max(N // bs, 1)
 
-    epoch_data_cl = 0.0
-    epoch_hyp_cl = 0.0
-    epoch_entropy = 0.0
+    epoch_obj = 0.0
+    epoch_data_nll_bits = 0.0
+    epoch_complexity_expected_bits = 0.0
+    epoch_entropy_weights_bits = 0.0
+    epoch_reg_complexity = 0.0
+    epoch_reg_entropy_bonus = 0.0
+    epoch_reg_net = 0.0
+    epoch_kl_pi_phi = 0.0
+    epoch_kl_phi_pbase = 0.0
+    epoch_phi_entropy_bits = 0.0
+    epoch_phi_min_prob = 0.0
+    epoch_phi_max_prob = 0.0
 
     for b in range(n_batches):
         idx = perm[b * bs:(b + 1) * bs] if N >= bs else jnp.arange(N)
@@ -390,14 +417,32 @@ def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
         rng, batch_rng = jrandom.split(rng)
         state, loss, aux = train_step(state, xb, yb, mb, batch_rng, p_base)
 
-        epoch_data_cl += float(aux["data_codelength"])
-        epoch_hyp_cl += float(aux["hyp_codelength"])
-        epoch_entropy += float(aux["entropy"])
+        epoch_obj += float(aux["objective_total_bits"])
+        epoch_data_nll_bits += float(aux["data_nll_bits"])
+        epoch_complexity_expected_bits += float(aux["complexity_expected_bits"])
+        epoch_entropy_weights_bits += float(aux["entropy_weights_bits"])
+        epoch_reg_complexity += float(aux["reg_complexity_weighted_bits"])
+        epoch_reg_entropy_bonus += float(aux["reg_entropy_bonus_bits"])
+        epoch_reg_net += float(aux["reg_net_bits"])
+        epoch_kl_pi_phi += float(aux["kl_pi_phi_bits"])
+        epoch_kl_phi_pbase += float(aux["kl_phi_pbase_bits"])
+        epoch_phi_entropy_bits += float(aux["phi_entropy_bits"])
+        epoch_phi_min_prob += float(aux["phi_min_prob"])
+        epoch_phi_max_prob += float(aux["phi_max_prob"])
 
     return state, rng, {
-        "data_cl": epoch_data_cl / n_batches,
-        "hyp_cl": epoch_hyp_cl / n_batches,
-        "entropy": epoch_entropy / n_batches,
+        "objective_total_bits": epoch_obj / n_batches,
+        "data_nll_bits": epoch_data_nll_bits / n_batches,
+        "complexity_expected_bits": epoch_complexity_expected_bits / n_batches,
+        "entropy_weights_bits": epoch_entropy_weights_bits / n_batches,
+        "reg_complexity_weighted_bits": epoch_reg_complexity / n_batches,
+        "reg_entropy_bonus_bits": epoch_reg_entropy_bonus / n_batches,
+        "reg_net_bits": epoch_reg_net / n_batches,
+        "kl_pi_phi_bits": epoch_kl_pi_phi / n_batches,
+        "kl_phi_pbase_bits": epoch_kl_phi_pbase / n_batches,
+        "phi_entropy_bits": epoch_phi_entropy_bits / n_batches,
+        "phi_min_prob": epoch_phi_min_prob / n_batches,
+        "phi_max_prob": epoch_phi_max_prob / n_batches,
     }
 
 
@@ -484,13 +529,24 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         )
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
-            hyp_disc = _compute_discrete_hyp_bits(state.params, grid, grid_values)
-            nll = metrics['data_cl']
-            mdl = nll + hyp_disc
+            complexity_argmax_bits = _compute_discrete_hyp_bits(
+                state.params, grid, grid_values,
+            )
             print(
                 f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
-                f"NLL={nll:8.1f}b  |H|={hyp_disc:4d}b (soft:{metrics['hyp_cl']:.1f})  MDL={mdl:.1f}b | "
-                f"H_w={metrics['entropy']:5.1f}  τ={float(tau):.4f}"
+                f"objective_total_bits={metrics['objective_total_bits']:8.1f}b  "
+                f"data_nll_bits={metrics['data_nll_bits']:8.1f}b  "
+                f"reg_net_bits={metrics['reg_net_bits']:7.1f}b "
+                f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
+                f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
+                f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
+                f"complexity_argmax_bits={complexity_argmax_bits:4d}b  "
+                f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  "
+                f"kl_pi_phi_bits={metrics['kl_pi_phi_bits']:.1f}b  "
+                f"kl_phi_pbase_bits={metrics['kl_phi_pbase_bits']:.1f}b  "
+                f"phi_entropy_bits={metrics['phi_entropy_bits']:.1f}b  "
+                f"phi∈[{metrics['phi_min_prob']:.2e},{metrics['phi_max_prob']:.2e}]  "
+                f"τ={float(tau):.4f}"
             )
 
         if (epoch + 1) % args.eval_every == 0:
@@ -672,11 +728,15 @@ def _print_resolved_parameters(args):
     print("-" * 60)
     print(f"  mode={args.mode}")
     if args.mode == "basic":
-        print(f"  objective: CE + mdl_lambda*|H| - entropy_bonus")
+        print(
+            "  objective_total_bits = data_nll_bits + "
+            "reg_complexity_weighted_bits - reg_entropy_bonus_bits"
+        )
         print(f"  mdl_lambda={args.mdl_lambda}")
     else:
         print(
-            "  objective: CE + lambda1*KL(pi||phi) + lambda2*KL(phi||P_base) - entropy_bonus"
+            "  objective_total_bits = data_nll_bits + "
+            "reg_complexity_weighted_bits - reg_entropy_bonus_bits"
         )
         print(f"  lambda1={args.lambda1}")
         print(f"  lambda2={args.lambda2}")
