@@ -363,7 +363,9 @@ def _main_inner(args, run_dir):
     print(f"  After split: {len(train_inputs)} train")
 
     # Validation and test sets
-    val_inputs, val_targets = make_validation_set(train_max_n, val_max_n=71)
+    val_inputs, val_targets = make_validation_set(
+        train_max_n, val_max_n=71, val_min_n=22,
+    )
     print(f"  Validation: {len(val_inputs)} strings (n={train_max_n+1}..71)")
 
     test_inputs, test_targets = make_test_set(max_n=args.test_max_n)

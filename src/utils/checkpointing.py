@@ -34,6 +34,8 @@ class TeeLogger:
     def write(self, data):
         self._orig.write(data)
         self._file.write(data)
+        # Keep the on-disk log tail-able during long runs.
+        self.flush()
 
     def flush(self):
         self._orig.flush()
@@ -77,9 +79,14 @@ def utc_timestamp() -> str:
 
 def make_experiment_dir(experiment: str, run_name: str,
                         results_root: str = "results") -> Path:
-    """Create and return a run directory under results/<experiment>/."""
-    run_dir = Path(results_root) / experiment / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
+    """Create and return a unique run directory under results/<experiment>/."""
+    base_dir = Path(results_root) / experiment / run_name
+    run_dir = base_dir
+    suffix = 1
+    while run_dir.exists():
+        run_dir = Path(f"{base_dir}_r{suffix}")
+        suffix += 1
+    run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
 

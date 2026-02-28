@@ -97,16 +97,21 @@ def make_test_set(max_n: int = 1500) -> tuple[list[list[int]], list[list[int]]]:
 
 
 def make_validation_set(
-    train_max_n: int, val_max_n: int = 71
+    train_max_n: int, val_max_n: int = 71, val_min_n: int | None = None,
 ) -> tuple[list[list[int]], list[list[int]]]:
-    """Validation set: all strings with train_max_n < n <= val_max_n.
+    """Validation set: all strings in a held-out n-range.
 
-    Lan et al.: "validation set contained all strings with 22 <= n <= 71"
-    (since max n in training was 21).
+    By default, this uses all strings with `train_max_n < n <= val_max_n`.
+    If `val_min_n` is provided, the lower bound is clamped to at least that
+    value. This is useful when reproducing Lan et al., where the validation
+    set was the fixed range `22 <= n <= 71`.
     """
     inputs = []
     targets = []
-    for n in range(train_max_n + 1, val_max_n + 1):
+    start_n = train_max_n + 1
+    if val_min_n is not None:
+        start_n = max(start_n, int(val_min_n))
+    for n in range(start_n, val_max_n + 1):
         inp, tgt = make_anbn_fixed_n(n)
         inputs.append(inp)
         targets.append(tgt)

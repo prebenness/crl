@@ -70,7 +70,7 @@ from src.mdl.training import (
     create_mdl_state,
     make_train_step,
     evaluate_deterministic_accuracy,
-    anneal_tau_st_phase,
+    anneal_tau,
 )
 from src.mdl.golden import (
     build_golden_network_params,
@@ -293,45 +293,35 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     warmup_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=1, soft_forward=True,
     )
-    bridge_train_step = make_train_step(
-        args.mdl_lambda, n_train=N, n_samples=1,
-        soft_forward=False, deterministic_st=True,
-    )
     st_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=args.n_samples, soft_forward=False,
     )
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
-    bridge_epochs = 1 if (warmup_epochs > 0 and warmup_epochs < total_epochs) else 0
-    st_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
+    st_epochs = total_epochs - warmup_epochs
 
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
-    if bridge_epochs:
-        print("  Phase 2 (bridge): 1 epoch, deterministic ST (hard forward, no Gumbel)")
-    print(f"  Phase 3 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(f"  tau: warmup fixed at {args.tau_start}, then ST anneal {args.tau_start} -> {args.tau_end}")
+    print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
+    print(f"  tau: global anneal {args.tau_start} -> {args.tau_end}")
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
     print("-" * 70)
 
     best_val_n_perfect = -1
+    best_val_gen_n = -1
     best_params = None
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
-        is_bridge = bridge_epochs and (epoch == warmup_epochs)
-        phase_name = "warmup" if is_warmup else ("bridge" if is_bridge else "ST")
+        phase_name = "warmup" if is_warmup else "ST"
 
-        # Keep warmup tau fixed; anneal only in ST phase.
-        tau = anneal_tau_st_phase(
-            epoch, total_epochs, warmup_epochs, args.tau_start, args.tau_end,
+        tau = anneal_tau(
+            epoch, total_epochs, args.tau_start, args.tau_end,
         )
 
         if is_warmup:
             train_step = warmup_train_step
-        elif is_bridge:
-            train_step = bridge_train_step
         else:
             train_step = st_train_step
 
@@ -368,11 +358,15 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             gen_n = val_result["gen_n"]
             fail_n = val_result["first_failure_n"]
             val_sym = "✓" if fail_n is None else f"✗ (fails@{fail_n})"
-            is_best = n_perfect > best_val_n_perfect
+            is_best = (
+                n_perfect > best_val_n_perfect
+                or (n_perfect == best_val_n_perfect and gen_n > best_val_gen_n)
+            )
             best_tag = "  ★ NEW BEST" if is_best else ""
             print(f"              ↳ val: gen_n={gen_n} {val_sym}  ({n_perfect}/{n_val} perfect){best_tag}")
             if is_best:
                 best_val_n_perfect = n_perfect
+                best_val_gen_n = gen_n
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
                     save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
@@ -477,10 +471,6 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=1, soft_forward=True,
     )
-    bridge_train_step = make_shared_train_step(
-        args.lambda1, args.lambda2, args.epsilon, n_train=N,
-        n_samples=1, soft_forward=False, deterministic_st=True,
-    )
     st_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=args.n_samples, soft_forward=False,
@@ -488,36 +478,30 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
-    bridge_epochs = 1 if (warmup_epochs > 0 and warmup_epochs < total_epochs) else 0
-    st_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
+    st_epochs = total_epochs - warmup_epochs
 
     print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
-    if bridge_epochs:
-        print("  Phase 2 (bridge): 1 epoch, deterministic ST (hard forward, no Gumbel)")
-    print(f"  Phase 3 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(f"  tau: warmup fixed at {args.tau_start}, then ST anneal {args.tau_start} -> {args.tau_end}")
+    print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
+    print(f"  tau: global anneal {args.tau_start} -> {args.tau_end}")
     print(f"  lr={args.lr}, lambda1={args.lambda1}, lambda2={args.lambda2}, "
           f"eps={args.epsilon}, batch_size={bs}")
     print("-" * 70)
 
     best_val_n_perfect = -1
+    best_val_gen_n = -1
     best_params = None
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
         is_warmup = epoch < warmup_epochs
-        is_bridge = bridge_epochs and (epoch == warmup_epochs)
-        phase_name = "warmup" if is_warmup else ("bridge" if is_bridge else "ST")
+        phase_name = "warmup" if is_warmup else "ST"
 
-        # Keep warmup tau fixed; anneal only in ST phase.
-        tau = anneal_tau_st_phase(
-            epoch, total_epochs, warmup_epochs, args.tau_start, args.tau_end,
+        tau = anneal_tau(
+            epoch, total_epochs, args.tau_start, args.tau_end,
         )
 
         if is_warmup:
             train_step = warmup_train_step
-        elif is_bridge:
-            train_step = bridge_train_step
         else:
             train_step = st_train_step
 
@@ -560,11 +544,15 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             gen_n = val_result["gen_n"]
             fail_n = val_result["first_failure_n"]
             val_sym = "✓" if fail_n is None else f"✗ (fails@{fail_n})"
-            is_best = n_perfect > best_val_n_perfect
+            is_best = (
+                n_perfect > best_val_n_perfect
+                or (n_perfect == best_val_n_perfect and gen_n > best_val_gen_n)
+            )
             best_tag = "  ★ NEW BEST" if is_best else ""
             print(f"              ↳ val: gen_n={gen_n} {val_sym}  ({n_perfect}/{n_val} perfect){best_tag}")
             if is_best:
                 best_val_n_perfect = n_perfect
+                best_val_gen_n = gen_n
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
                 if run_dir is not None:
                     save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
@@ -662,6 +650,10 @@ def _build_arg_parser(defaults=None):
     # Evaluation
     parser.add_argument("--test_max_n", type=int, default=1500,
                         help="Max n for test set (can be overridden in --eval mode)")
+    parser.add_argument("--val_min_n", type=int, default=22,
+                        help="Minimum n included in the structured validation set")
+    parser.add_argument("--val_max_n", type=int, default=71,
+                        help="Maximum n included in the structured validation set")
     parser.add_argument("--eval_every", type=int, default=100,
                         help="Evaluate every N epochs")
     parser.add_argument("--log_every", type=int, default=50,
@@ -881,9 +873,19 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     train_targets = train_targets[:n_train]
     print(f"  After 95/5 split: {len(train_inputs)} train")
 
-    # Structured validation set (all strings with train_max_n < n <= 71)
-    val_inputs, val_targets = make_validation_set(train_max_n, val_max_n=71)
-    print(f"  Structured val set: {len(val_inputs)} strings (n={train_max_n+1}..71)")
+    # Structured validation set
+    val_inputs, val_targets = make_validation_set(
+        train_max_n, val_max_n=args.val_max_n, val_min_n=args.val_min_n,
+    )
+    if val_inputs:
+        first_val_n = len(val_inputs[0]) // 2
+        last_val_n = len(val_inputs[-1]) // 2
+        print(
+            f"  Structured val set: {len(val_inputs)} strings "
+            f"(n={first_val_n}..{last_val_n})"
+        )
+    else:
+        print("  Structured val set: 0 strings")
 
     # Test set (skip generation for very large n - float64 simulation handles it)
     if args.test_max_n <= 10_000:
