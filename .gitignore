@@ -4,17 +4,10 @@ venvs/
 
 input_data/
 __pycache__/
-cfg.env
-.vscode
+.vscode/
 data/
 wandb/
 .claude/
 .pytest_cache/
 logs/
 results/
-CLAUDE.md
-future-todos.md
-codex.md
-context
-agents.md
-slurm-*.out
