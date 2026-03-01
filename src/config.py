@@ -74,6 +74,7 @@ class MDLConfig:
     tau_start: float = 2.0
     tau_end: float = 0.1
     warmup_epochs: int = 10
+    bridge_epochs: int | None = None
     n_samples: int = 1
 
 
