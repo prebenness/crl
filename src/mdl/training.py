@@ -121,18 +121,20 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
             keys = jrandom.split(rng, n_samples)
 
             def single_sample(key):
-                logits_k, aux_k = apply_fn(
+                logits_k, _ = apply_fn(
                     {"params": params}, x, tau=tau, train=True, rng=key,
                 )
                 data_nll_k = _compute_data_nll_bits(logits_k, y, mask)
-                return data_nll_k, aux_k
+                return data_nll_k
 
-            data_nll_samples, all_aux = jax.vmap(single_sample)(keys)
-            data_nll_bits = jnp.mean(data_nll_samples)
-
-            # model_aux is identical across samples (doesn't depend on
-            # Gumbel noise), so just take the first.
-            model_aux = jax.tree.map(lambda x: x[0], all_aux)
+            # Keep one full aux tree, but avoid stacking K copies of large
+            # tensors like all_probs across the Monte Carlo samples.
+            logits_0, model_aux = apply_fn(
+                {"params": params}, x, tau=tau, train=True, rng=keys[0],
+            )
+            data_nll_0 = _compute_data_nll_bits(logits_0, y, mask)
+            rest_data_nll = jax.vmap(single_sample)(keys[1:])
+            data_nll_bits = (data_nll_0 + jnp.sum(rest_data_nll)) / n_samples
         else:
             # Single Gumbel-Softmax sample
             logits, model_aux = apply_fn(

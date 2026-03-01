@@ -247,19 +247,25 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
         keys = jrandom.split(rng, n_samples)
 
         def one_sample(k):
-            logits_k, aux_k = apply_fn(
+            logits_k, _ = apply_fn(
                 {"params": params}, x, tau=tau, train=True, rng=k,
             )
             data_nll_k = optax.softmax_cross_entropy_with_integer_labels(
                 logits_k, y,
             ).mean()
-            return logits_k, data_nll_k, aux_k
+            return logits_k, data_nll_k
 
-        all_logits_K, data_nll_K, all_aux_K = jax.vmap(one_sample)(keys)
-        logits = jnp.mean(all_logits_K, axis=0)
-        data_nll_nats = jnp.mean(data_nll_K)
-        # probs/codelength are identical across Gumbel samples
-        aux = jax.tree.map(lambda a: a[0], all_aux_K)
+        # Keep one full aux tree, but avoid stacking K copies of large
+        # tensors like all_probs across the Monte Carlo samples.
+        logits_0, aux = apply_fn(
+            {"params": params}, x, tau=tau, train=True, rng=keys[0],
+        )
+        data_nll_0 = optax.softmax_cross_entropy_with_integer_labels(
+            logits_0, y,
+        ).mean()
+        rest_logits_K, rest_data_nll_K = jax.vmap(one_sample)(keys[1:])
+        logits = (logits_0 + jnp.sum(rest_logits_K, axis=0)) / n_samples
+        data_nll_nats = (data_nll_0 + jnp.sum(rest_data_nll_K)) / n_samples
     else:
         logits, aux = apply_fn(
             {"params": params}, x, tau=tau, train=True, rng=rng,

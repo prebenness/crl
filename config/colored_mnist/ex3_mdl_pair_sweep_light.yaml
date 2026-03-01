@@ -1,0 +1,58 @@
+# ---- Weights & Biases ----
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-mdl"
+
+# ---- Dataset ----
+# Available: colored_mnist (2-class), irm_colored_mnist (2-class),
+#            standard_mnist_bin (2-class), cmnist_ula (10-class)
+# num_classes must match dataset (enforced at startup).
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+# ---- Model ----
+# MDL inner model + standard outer with HSIC decorrelation
+model:
+  mode: "mdl_pair"
+  inner: "mdl_mlp"
+  outer: "ula_mlp"
+  num_classes: 10
+  outer_rep_dim: 100
+
+# ---- Training ----
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 0.0
+  weight_decay_outer: 0.0
+  epochs: 100
+  batch_size: 128
+  seed: 42
+
+# ---- HSIC regularisation (pair mode) ----
+hsic:
+  weight: 0.50
+
+# ---- PyTorch DataLoader for dataset materialisation ----
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2   # only used when num_workers > 0
+
+# ---- MDL config ----
+mdl:
+  n_max: 5               # rational grid numerator max
+  m_max: 5               # rational grid denominator max
+  tau_start: 2.0          # initial Gumbel temperature
+  tau_end: 0.1            # final Gumbel temperature
+  warmup_epochs: 500      # epochs with continuous relaxation
+  n_samples: 5           # MC samples for Gumbel noise
+
+# ---- Lambda sweep (MDL penalty weight) ----
+sweep:
+  lambda_min_exp: -3
+  lambda_max_exp: 3
+  lambda_steps: 10
+  log_sweep: true
