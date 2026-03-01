@@ -72,7 +72,7 @@ from src.mdl.training import (
     create_mdl_state,
     make_train_step,
     evaluate_deterministic_accuracy,
-    anneal_tau,
+    anneal_tau_st_phase,
 )
 from src.mdl.golden import (
     build_golden_network_params,
@@ -226,6 +226,55 @@ def get_train_max_n(inputs):
     return max_n
 
 
+def _reset_optimizer_state(state):
+    """Reset optimizer accumulators while keeping params and global step."""
+    return state.replace(opt_state=state.tx.init(state.params))
+
+
+def _resolve_bridge_epochs(requested_bridge_epochs, warmup_epochs, total_epochs):
+    """Resolve bridge length, defaulting to ceil(0.1 * warmup) when omitted."""
+    remaining_epochs = max(total_epochs - warmup_epochs, 0)
+    if remaining_epochs <= 0:
+        return 0
+
+    if requested_bridge_epochs is None:
+        if warmup_epochs <= 0:
+            bridge_epochs = 0
+        else:
+            bridge_epochs = max(1, math.ceil(0.1 * warmup_epochs))
+    else:
+        bridge_epochs = max(int(requested_bridge_epochs), 0)
+
+    return min(bridge_epochs, remaining_epochs)
+
+
+def _phase_name_for_epoch(epoch, warmup_epochs, bridge_epochs,
+                          deterministic_st, det_st_after_tau, tau):
+    """Return the ANBN training phase for the given epoch."""
+    if epoch < warmup_epochs:
+        return "warmup"
+    if epoch < warmup_epochs + bridge_epochs:
+        return "bridge"
+    if deterministic_st:
+        return "DST"
+    if det_st_after_tau is not None and float(tau) <= det_st_after_tau:
+        return "DST"
+    return "GST"
+
+
+def _should_reset_optimizer(prev_phase_name, phase_name):
+    """Reset Adam state on abrupt estimator changes."""
+    if prev_phase_name is None or prev_phase_name == phase_name:
+        return False
+    if prev_phase_name == "warmup":
+        return True
+    if prev_phase_name == "bridge" and phase_name == "GST":
+        return True
+    if prev_phase_name == "GST" and phase_name == "DST":
+        return True
+    return False
+
+
 
 def compute_discrete_mdl_score(eval_params, grid, grid_values):
     """Compute the discrete MDL hypothesis codelength from trained logits.
@@ -375,11 +424,23 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     print(f"  Number of LSTM+output parameters: {state.params['logits'].shape[0]}")
     print(f"  Logit array shape: {state.params['logits'].shape}")
 
-    # Create train steps for both phases
+    warmup_epochs = args.warmup_epochs
+    total_epochs = args.epochs
+    bridge_epochs = _resolve_bridge_epochs(
+        args.bridge_epochs, warmup_epochs, total_epochs,
+    )
+    tail_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
+    tau_hold_epochs = warmup_epochs + bridge_epochs
+
+    # Create train steps for all phases.
     warmup_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=1, soft_forward=True,
     )
-    use_det_st = args.deterministic_st or args.det_st_after_tau is not None
+    use_det_st = (
+        args.deterministic_st
+        or args.det_st_after_tau is not None
+        or bridge_epochs > 0
+    )
     st_train_step = make_train_step(
         args.mdl_lambda, n_train=N, n_samples=args.n_samples, soft_forward=False,
     )
@@ -393,22 +454,28 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             deterministic_st=True,
         )
 
-    warmup_epochs = args.warmup_epochs
-    total_epochs = args.epochs
-    st_epochs = total_epochs - warmup_epochs
-
-    print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
+    print(
+        f"\n  Phase 1 (warmup): {warmup_epochs} epochs, "
+        f"soft forward (no Gumbel, τ held at {args.tau_start})"
+    )
+    print(
+        f"  Phase 2 (bridge): {bridge_epochs} epochs, "
+        f"deterministic straight-through (τ held at {args.tau_start})"
+    )
     if args.deterministic_st:
-        print(f"  Phase 2 (ST):     {st_epochs} epochs, deterministic straight-through")
+        print(f"  Phase 3 (tail):   {tail_epochs} epochs, deterministic straight-through")
     elif args.det_st_after_tau is not None:
         print(
-            "  Phase 2 (ST):     "
-            f"{st_epochs} epochs, Gumbel ST then deterministic ST when "
+            "  Phase 3 (tail):   "
+            f"{tail_epochs} epochs, Gumbel ST then deterministic ST when "
             f"τ<={args.det_st_after_tau}"
         )
     else:
-        print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(f"  tau: global anneal {args.tau_start} -> {args.tau_end}")
+        print(f"  Phase 3 (tail):   {tail_epochs} epochs, {args.n_samples} Gumbel samples")
+    print(
+        f"  tau: hold at {args.tau_start} through warmup+bridge, "
+        f"then anneal to {args.tau_end}"
+    )
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
     print("-" * 70)
 
@@ -418,35 +485,55 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     best_complexity_bits = math.inf
     best_params = None
     long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
+    prev_phase_name = None
+    if start_epoch > 0:
+        prev_tau = anneal_tau_st_phase(
+            start_epoch - 1, total_epochs, tau_hold_epochs,
+            args.tau_start, args.tau_end,
+        )
+        prev_phase_name = _phase_name_for_epoch(
+            start_epoch - 1,
+            warmup_epochs,
+            bridge_epochs,
+            args.deterministic_st,
+            args.det_st_after_tau,
+            prev_tau,
+        )
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
-        is_warmup = epoch < warmup_epochs
-        tau = anneal_tau(
-            epoch, total_epochs, args.tau_start, args.tau_end,
+        tau = anneal_tau_st_phase(
+            epoch, total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
+        )
+        phase_name = _phase_name_for_epoch(
+            epoch,
+            warmup_epochs,
+            bridge_epochs,
+            args.deterministic_st,
+            args.det_st_after_tau,
+            tau,
         )
 
-        if is_warmup:
+        if _should_reset_optimizer(prev_phase_name, phase_name):
+            state = _reset_optimizer_state(state)
+            print(
+                f"              ↳ [OPT] reset Adam state at "
+                f"{prev_phase_name} -> {phase_name}"
+            )
+
+        if phase_name == "warmup":
             train_step = warmup_train_step
-            phase_name = "warmup"
-        elif args.deterministic_st:
+        elif phase_name in ("bridge", "DST"):
             train_step = det_st_train_step
-            phase_name = "DST"
-        elif (
-            args.det_st_after_tau is not None
-            and float(tau) <= args.det_st_after_tau
-        ):
-            train_step = det_st_train_step
-            phase_name = "DST"
         else:
             train_step = st_train_step
-            phase_name = "GST"
 
         state = state.replace(tau=tau)
 
         state, rng, metrics = _run_epoch(
             state, x_train, y_train, mask_train, N, bs, rng, train_step,
         )
+        prev_phase_name = phase_name
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             # Compute discrete argmax complexity periodically for monitoring.
@@ -622,11 +709,23 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
     p_base = compute_p_base(grid_values)
 
+    warmup_epochs = args.warmup_epochs
+    total_epochs = args.epochs
+    bridge_epochs = _resolve_bridge_epochs(
+        args.bridge_epochs, warmup_epochs, total_epochs,
+    )
+    tail_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
+    tau_hold_epochs = warmup_epochs + bridge_epochs
+
     warmup_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=1, soft_forward=True,
     )
-    use_det_st = args.deterministic_st or args.det_st_after_tau is not None
+    use_det_st = (
+        args.deterministic_st
+        or args.det_st_after_tau is not None
+        or bridge_epochs > 0
+    )
     st_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
         n_samples=args.n_samples, soft_forward=False,
@@ -643,22 +742,28 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             deterministic_st=True,
         )
 
-    warmup_epochs = args.warmup_epochs
-    total_epochs = args.epochs
-    st_epochs = total_epochs - warmup_epochs
-
-    print(f"\n  Phase 1 (warmup): {warmup_epochs} epochs, soft forward (no Gumbel)")
+    print(
+        f"\n  Phase 1 (warmup): {warmup_epochs} epochs, "
+        f"soft forward (no Gumbel, τ held at {args.tau_start})"
+    )
+    print(
+        f"  Phase 2 (bridge): {bridge_epochs} epochs, "
+        f"deterministic straight-through (τ held at {args.tau_start})"
+    )
     if args.deterministic_st:
-        print(f"  Phase 2 (ST):     {st_epochs} epochs, deterministic straight-through")
+        print(f"  Phase 3 (tail):   {tail_epochs} epochs, deterministic straight-through")
     elif args.det_st_after_tau is not None:
         print(
-            "  Phase 2 (ST):     "
-            f"{st_epochs} epochs, Gumbel ST then deterministic ST when "
+            "  Phase 3 (tail):   "
+            f"{tail_epochs} epochs, Gumbel ST then deterministic ST when "
             f"τ<={args.det_st_after_tau}"
         )
     else:
-        print(f"  Phase 2 (ST):     {st_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(f"  tau: global anneal {args.tau_start} -> {args.tau_end}")
+        print(f"  Phase 3 (tail):   {tail_epochs} epochs, {args.n_samples} Gumbel samples")
+    print(
+        f"  tau: hold at {args.tau_start} through warmup+bridge, "
+        f"then anneal to {args.tau_end}"
+    )
     print(f"  lr={args.lr}, lambda1={args.lambda1}, lambda2={args.lambda2}, "
           f"eps={args.epsilon}, batch_size={bs}")
     print("-" * 70)
@@ -669,29 +774,48 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     best_complexity_bits = math.inf
     best_params = None
     long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
+    prev_phase_name = None
+    if start_epoch > 0:
+        prev_tau = anneal_tau_st_phase(
+            start_epoch - 1, total_epochs, tau_hold_epochs,
+            args.tau_start, args.tau_end,
+        )
+        prev_phase_name = _phase_name_for_epoch(
+            start_epoch - 1,
+            warmup_epochs,
+            bridge_epochs,
+            args.deterministic_st,
+            args.det_st_after_tau,
+            prev_tau,
+        )
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
-        is_warmup = epoch < warmup_epochs
-        tau = anneal_tau(
-            epoch, total_epochs, args.tau_start, args.tau_end,
+        tau = anneal_tau_st_phase(
+            epoch, total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
+        )
+        phase_name = _phase_name_for_epoch(
+            epoch,
+            warmup_epochs,
+            bridge_epochs,
+            args.deterministic_st,
+            args.det_st_after_tau,
+            tau,
         )
 
-        if is_warmup:
+        if _should_reset_optimizer(prev_phase_name, phase_name):
+            state = _reset_optimizer_state(state)
+            print(
+                f"              ↳ [OPT] reset Adam state at "
+                f"{prev_phase_name} -> {phase_name}"
+            )
+
+        if phase_name == "warmup":
             train_step = warmup_train_step
-            phase_name = "warmup"
-        elif args.deterministic_st:
+        elif phase_name in ("bridge", "DST"):
             train_step = det_st_train_step
-            phase_name = "DST"
-        elif (
-            args.det_st_after_tau is not None
-            and float(tau) <= args.det_st_after_tau
-        ):
-            train_step = det_st_train_step
-            phase_name = "DST"
         else:
             train_step = st_train_step
-            phase_name = "GST"
 
         state = state.replace(tau=tau)
 
@@ -699,6 +823,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             state, x_train, y_train, mask_train, N, bs, rng,
             train_step, p_base,
         )
+        prev_phase_name = phase_name
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             complexity_argmax_bits = _compute_discrete_hyp_bits(
@@ -868,6 +993,9 @@ def _build_arg_parser(defaults=None):
                         help="Switch from Gumbel ST to deterministic ST once tau falls below this threshold")
     parser.add_argument("--warmup_epochs", type=int, default=500,
                         help="Soft warmup epochs before switching to ST")
+    parser.add_argument("--bridge_epochs", type=int, default=None,
+                        help="Deterministic ST bridge epochs after warmup "
+                             "(default: ceil(0.1 * warmup_epochs), min 1 when warmup > 0; pass 0 to disable)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     # Shared-weight mode parameters
@@ -1070,6 +1198,7 @@ def main():
             "analyze_max_n": "--analyze_max_n",
             "epochs": "--epochs",
             "warmup_epochs": "--warmup_epochs",
+            "bridge_epochs": "--bridge_epochs",
             "lr": "--lr",
             "mdl_lambda": "--mdl_lambda",
             "lambda1": "--lambda1",
