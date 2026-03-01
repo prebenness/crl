@@ -16,7 +16,7 @@ echo "Starting job at time:" && date +%Y-%m-%d_%H:%M:%S
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export PYTHONUNBUFFERED=1
-CONFIG_PATH="${CONFIG_PATH:-config/colored_mnist/ex3_mdl_pair_sweep_light.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-config/colored_mnist/ex3_mdl_pair_sweep.yaml}"
 
 # Avoid W&B's stdout wrapping in non-interactive batch jobs.
 export WANDB_CONSOLE=off
