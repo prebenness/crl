@@ -636,6 +636,7 @@ def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
     epoch_obj = 0.0
     epoch_data_nll_bits = 0.0
     epoch_complexity_expected_bits = 0.0
+    epoch_code_cross_entropy_bits = 0.0
     epoch_entropy_weights_bits = 0.0
     epoch_reg_complexity = 0.0
     epoch_reg_entropy_bonus = 0.0
@@ -656,6 +657,7 @@ def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
         epoch_obj += float(aux["objective_total_bits"])
         epoch_data_nll_bits += float(aux["data_nll_bits"])
         epoch_complexity_expected_bits += float(aux["complexity_expected_bits"])
+        epoch_code_cross_entropy_bits += float(aux["code_cross_entropy_bits"])
         epoch_entropy_weights_bits += float(aux["entropy_weights_bits"])
         epoch_reg_complexity += float(aux["reg_complexity_weighted_bits"])
         epoch_reg_entropy_bonus += float(aux["reg_entropy_bonus_bits"])
@@ -670,6 +672,7 @@ def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
         "objective_total_bits": epoch_obj / n_batches,
         "data_nll_bits": epoch_data_nll_bits / n_batches,
         "complexity_expected_bits": epoch_complexity_expected_bits / n_batches,
+        "code_cross_entropy_bits": epoch_code_cross_entropy_bits / n_batches,
         "entropy_weights_bits": epoch_entropy_weights_bits / n_batches,
         "reg_complexity_weighted_bits": epoch_reg_complexity / n_batches,
         "reg_entropy_bonus_bits": epoch_reg_entropy_bonus / n_batches,
@@ -707,7 +710,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     print(f"  Logit array shape: {state.params['logits'].shape}")
     print(f"  Phi logits shape: {state.params['phi_logits'].shape}")
 
-    p_base = compute_p_base(grid_values)
+    p_base = compute_p_base(grid_codelengths)
 
     warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
@@ -837,6 +840,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
                 f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
                 f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
+                f"code_cross_entropy_bits={metrics['code_cross_entropy_bits']:.1f}b  "
                 f"complexity_argmax_bits={complexity_argmax_bits:4d}b  "
                 f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  "
                 f"kl_pi_phi_bits={metrics['kl_pi_phi_bits']:.1f}b  "
@@ -1000,9 +1004,9 @@ def _build_arg_parser(defaults=None):
                         help="Random seed")
     # Shared-weight mode parameters
     parser.add_argument("--lambda1", type=float, default=1.0,
-                        help="Weight-sharing KL weight (shared mode)")
+                        help="Shared code-term weight (cross-entropy to phi, shared mode)")
     parser.add_argument("--lambda2", type=float, default=1.0,
-                        help="Dictionary cost KL weight (shared mode)")
+                        help="Dictionary-prior KL weight (shared mode)")
     parser.add_argument("--epsilon", type=float, default=1e-6,
                         help="Min probability for adaptive prior (shared mode)")
     # Evaluation

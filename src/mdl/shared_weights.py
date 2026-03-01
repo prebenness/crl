@@ -3,20 +3,20 @@
 Extends the basic categorical MDL approach by introducing a learned shared
 prior phi over the rational grid S. Instead of penalizing each weight's
 codelength independently, we use a composite objective that encourages
-weight-sharing through KL divergence terms.
+weight-sharing through a shared code distribution.
 
 Composite objective (Section 8.1):
 
     J(alpha, phi; beta) = E[L_D(theta)]
-                        + lambda1 * sum_i DKL(pi_i || phi)
+                        + lambda1 * sum_i CE_2(pi_i, phi)
                         + lambda2 * DKL(phi || P_base)
                         - (1/beta) * sum_i H(pi_i)
 
 where:
     pi_i = softmax(alpha_i)        per-weight categorical distribution
     phi in Delta^{M-1}_epsilon     learned shared adaptive prior (epsilon-bounded)
-    P_base(s_m) ~ 1/(|s_m| + 1)   fixed hyper-prior favoring simple rationals
-    lambda1                        weight-sharing KL weight
+    P_base(s_m) ~ 2^{-ell(s_m)}   Lan-style fixed hyper-prior
+    lambda1                        shared code-term weight
     lambda2                        dictionary cost weight
 
 The adaptive prior phi is parameterized via unconstrained logits and mapped
@@ -24,8 +24,8 @@ onto the epsilon-bounded simplex:
 
     phi = softmax(phi_logits) * (1 - M * epsilon) + epsilon
 
-This ensures phi_m >= epsilon for all m, preventing KL divergence from
-blowing up when some grid values are unused.
+This ensures phi_m >= epsilon for all m, preventing cross-entropy / KL
+terms from blowing up when some grid values are unused.
 """
 
 import jax
@@ -41,20 +41,22 @@ from src.mdl.data import NUM_SYMBOLS
 # Hyper-prior and simplex utilities
 # ---------------------------------------------------------------------------
 
-def compute_p_base(grid_values):
-    """Fixed hyper-prior P_base(s_m) proportional to 1 / (|s_m| + 1).
+def compute_p_base(grid_codelengths):
+    """Fixed hyper-prior P_base(s_m) proportional to 2^{-ell(s_m)}.
 
-    Assigns higher probability to simpler rationals (those closer to 0
-    or with small absolute value like 0, +/-1).
+    This matches the proposal's Lan-style base prior. Up to a constant,
+    ``-log2 P_base(s_m)`` equals the rational codelength ``ell(s_m)``.
 
     Args:
-        grid_values: float32 array of shape (M,) with rational grid values.
+        grid_codelengths: float32 array of shape (M,) with Lan codelengths.
 
     Returns:
         p_base: float32 array of shape (M,), normalized probability vector.
     """
-    grid_values = jnp.asarray(grid_values)
-    unnormalized = 1.0 / (jnp.abs(grid_values) + 1.0)
+    grid_codelengths = jnp.asarray(grid_codelengths, dtype=jnp.float32)
+    min_bits = jnp.min(grid_codelengths)
+    # Subtracting min_bits preserves normalization while improving stability.
+    unnormalized = jnp.exp2(-(grid_codelengths - min_bits))
     p_base = unnormalized / jnp.sum(unnormalized)
     return p_base
 
@@ -102,6 +104,22 @@ def _kl_divergence(p, q):
     """
     eps = 1e-10
     return jnp.sum(p * jnp.log2((p + eps) / (q + eps)), axis=-1)
+
+
+def _cross_entropy_bits(p, q):
+    """Cross-entropy CE_2(p, q) in bits.
+
+    CE_2(p, q) = -sum_m p_m * log2(q_m)
+
+    Args:
+        p: float32 (..., M) probability distributions.
+        q: float32 (..., M) probability distributions.
+
+    Returns:
+        ce: float32 (...) cross-entropy per distribution.
+    """
+    eps = 1e-10
+    return -jnp.sum(p * jnp.log2(q + eps), axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -200,14 +218,14 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
     The composite objective is:
 
         J = E[L_D(theta)]
-          + lambda1 * sum_i DKL(pi_i || phi)
+          + lambda1 * sum_i CE_2(pi_i, phi)
           + lambda2 * DKL(phi || P_base)
           - (1/beta) * sum_i H(pi_i)
 
     where beta = 1/tau and phi is epsilon-bounded.
 
     Args:
-        lambda1: weight for the per-weight KL term (weight sharing).
+        lambda1: weight for the shared code-length term.
         lambda2: weight for the dictionary cost KL term.
         epsilon: minimum probability for each grid element in phi.
         n_train: total number of training sequences (for batch scaling).
@@ -264,9 +282,9 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         # Shared adaptive prior (epsilon-bounded)
         phi = epsilon_bound_simplex(params["phi_logits"], epsilon)  # (M,)
 
-        # KL(pi_i || phi) for each weight, summed
-        kl_per_weight = _kl_divergence(all_probs, phi[None, :])
-        kl_weight_sharing = jnp.sum(kl_per_weight)
+        # Shared code term: sum_i CE_2(pi_i, phi)
+        code_ce_per_weight = _cross_entropy_bits(all_probs, phi[None, :])
+        code_cross_entropy_bits = jnp.sum(code_ce_per_weight)
 
         # KL(phi || P_base)
         p_base = jnp.asarray(p_base)
@@ -276,6 +294,8 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         log_probs = jnp.log2(all_probs + 1e-10)
         entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
         entropy_weights_bits = jnp.sum(entropy_per_param)
+        kl_per_weight = code_ce_per_weight - entropy_per_param
+        kl_weight_sharing = jnp.sum(kl_per_weight)
         entropy_bonus_bits = tau * entropy_weights_bits
 
         # Batch scaling
@@ -284,7 +304,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
 
         # Composite objective (bits) with explicit decomposition.
         complexity_expected_bits = (
-            lambda1 * kl_weight_sharing + lambda2 * kl_dictionary
+            lambda1 * code_cross_entropy_bits + lambda2 * kl_dictionary
         )
         reg_complexity_weighted = batch_scale * complexity_expected_bits
         reg_entropy_bonus = batch_scale * entropy_bonus_bits
@@ -296,6 +316,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
             "objective_total_bits": objective_total_bits,
             "data_nll_bits": data_nll_bits,
             "complexity_expected_bits": complexity_expected_bits,
+            "code_cross_entropy_bits": code_cross_entropy_bits,
             "entropy_weights_bits": entropy_weights_bits,
             "reg_complexity_weighted_bits": reg_complexity_weighted,
             "reg_entropy_bonus_bits": reg_entropy_bonus,
@@ -321,7 +342,7 @@ def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
     """Create a JIT-compiled training step for the shared-weight objective.
 
     Args:
-        lambda1: weight for the per-weight KL term.
+        lambda1: weight for the shared code-length term.
         lambda2: weight for the dictionary cost KL term.
         epsilon: minimum probability for phi.
         n_train: total number of training sequences (for batch scaling).

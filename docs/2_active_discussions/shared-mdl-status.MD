@@ -15,24 +15,22 @@ Shared-weight MDL is not currently competitive with basic MDL.
 
 This is far below the current basic-MDL frontier.
 
-## Why Tuning Alone Is Not Enough
+## Why Tuning Alone Was Not Enough
 
-A zero-KL diagnostic (`lambda1 = 0`, `lambda2 = 0`) still failed to recover basic-MDL-like behavior. That suggests the problem is structural, not just bad hyperparameters.
+A zero-KL diagnostic (`lambda1 = 0`, `lambda2 = 0`) still failed to recover basic-MDL-like behavior. That indicated the problem was structural, not just bad hyperparameters.
 
-## Important Theory / Code Mismatch
+## Current Theory / Code Alignment
 
-The proposal defines the shared prior base distribution as:
+The shared-MDL implementation has now been updated to match the revised proposal:
 
-- `P_base(s) ∝ 2^{-ell(s)}`
+- shared code term: `sum_i CE_2(pi_i, phi)`
+- base prior: `P_base(s) ∝ 2^{-ell(s)}`
+- dictionary term: `KL(phi || P_base)`
 
-The current implementation instead uses:
-
-- `P_base(s) ∝ 1 / (|s| + 1)`
-
-Until that mismatch is resolved, shared-mode outcomes should not be treated as a clean test of the proposed shared-MDL theory.
+That removes the earlier objective mismatch. Existing shared-mode experiment results were obtained before that fix, so they should not be used as evidence about the corrected method.
 
 ## Immediate Next Work
 
-1. Align the implemented `P_base` with the proposal.
-2. Re-evaluate shared mode only after that objective mismatch is fixed.
-3. Then compare basic vs shared under matched schedules and seeds.
+1. Re-run shared mode under the corrected objective.
+2. Compare against basic MDL under matched schedules and seeds.
+3. Only then judge whether shared mode is viable or whether it still needs additional tuning.

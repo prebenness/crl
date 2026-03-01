@@ -7,7 +7,7 @@ Covers:
     - Golden network: correct output probabilities and 100% accuracy
     - Data generation: correct a^n b^n strings from PCFG
     - Deterministic accuracy: correct masking (input b positions only)
-    - Shared weights: P_base normalization, epsilon-bounded simplex, KL
+    - Shared weights: P_base from codelengths, epsilon-bounded simplex, KL/CE
 """
 
 import pytest
@@ -263,18 +263,39 @@ class TestSharedWeights:
     def test_p_base_normalization(self):
         """P_base should sum to 1."""
         from src.mdl.shared_weights import compute_p_base
-        grid = jnp.array([-2.0, -1.0, 0.0, 0.5, 1.0, 2.0])
-        p = compute_p_base(grid)
+        codelengths = jnp.array([5.0, 7.0, 9.0, 11.0])
+        p = compute_p_base(codelengths)
         np.testing.assert_allclose(float(jnp.sum(p)), 1.0, atol=1e-6)
 
-    def test_p_base_favors_simple(self):
-        """P_base should assign higher probability to simpler rationals (near 0)."""
+    def test_p_base_matches_lan_codelength_prior(self):
+        """P_base should be proportional to 2^{-ell(s)}."""
         from src.mdl.shared_weights import compute_p_base
-        grid = jnp.array([-10.0, -1.0, 0.0, 1.0, 10.0])
-        p = compute_p_base(grid)
-        # 0 should have highest probability
-        assert float(p[2]) > float(p[1])  # P(0) > P(-1)
-        assert float(p[1]) > float(p[0])  # P(-1) > P(-10)
+        codelengths = jnp.array([5.0, 7.0, 11.0])
+        p = compute_p_base(codelengths)
+        weights = np.array([2.0 ** -5.0, 2.0 ** -7.0, 2.0 ** -11.0], dtype=np.float32)
+        expected = weights / weights.sum()
+        np.testing.assert_allclose(np.array(p), expected, atol=1e-6)
+
+    def test_cross_entropy_equals_entropy_plus_kl(self):
+        """CE_2(p, q) should equal H_2(p) + KL(p || q)."""
+        from src.mdl.shared_weights import _cross_entropy_bits, _kl_divergence
+        p = jnp.array([0.2, 0.3, 0.5], dtype=jnp.float32)
+        q = jnp.array([0.6, 0.3, 0.1], dtype=jnp.float32)
+        ce = _cross_entropy_bits(p, q)
+        h = -jnp.sum(p * jnp.log2(p))
+        kl = _kl_divergence(p, q)
+        np.testing.assert_allclose(float(ce), float(h + kl), atol=1e-6)
+
+    def test_p_base_recovers_expected_codelength_up_to_constant(self):
+        """CE_2(pi, P_base) should equal E[ell] plus a constant offset."""
+        from src.mdl.shared_weights import _cross_entropy_bits, compute_p_base
+        codelengths = jnp.array([5.0, 7.0, 11.0], dtype=jnp.float32)
+        p_base = compute_p_base(codelengths)
+        pi = jnp.array([0.2, 0.3, 0.5], dtype=jnp.float32)
+        ce = _cross_entropy_bits(pi, p_base)
+        expected_len = jnp.sum(pi * codelengths)
+        z = jnp.sum(jnp.exp2(-codelengths))
+        np.testing.assert_allclose(float(ce), float(expected_len + jnp.log2(z)), atol=1e-6)
 
     def test_epsilon_bound_lower(self):
         """All phi values should be >= epsilon."""

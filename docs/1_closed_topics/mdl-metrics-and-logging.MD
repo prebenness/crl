@@ -36,7 +36,7 @@ So:
 - `data_nll_*`: negative log-likelihood / cross-entropy data term.
 - `complexity_expected_*`:
   - Basic MDL (`a^n b^n`): `E[|H|] = sum_i sum_m pi_{i,m} * l(s_m)`.
-  - Shared MDL (`a^n b^n`): `lambda1 * KL(pi||phi) + lambda2 * KL(phi||P_base)` before batch scaling.
+  - Shared MDL (`a^n b^n`): `lambda1 * code_cross_entropy_bits + lambda2 * KL(phi||P_base)` before batch scaling.
   - ColoredMNIST MDL: expected code-length penalty for MLP weights.
 - `reg_complexity_weighted_*`: complexity contribution after train-size/batch scaling (and lambda weighting).
 - `entropy_weights_*`: raw weight entropy (`sum_i H(pi_i)`).
@@ -46,6 +46,7 @@ So:
 
 Shared-MDL extra terms:
 
+- `code_cross_entropy_bits`: `sum_i CE_2(pi_i, phi) = -sum_i sum_m pi_{i,m} log2 phi_m`.
 - `kl_pi_phi_bits`: `sum_i KL(pi_i || phi)`.
 - `kl_phi_pbase_bits`: `KL(phi || P_base)`.
 - `phi_entropy_bits`: entropy of shared prior `phi`.
@@ -61,7 +62,7 @@ ANBN basic mode (`differentiable_mdl.py`, bits):
 
 ANBN shared mode (`differentiable_mdl.py`, bits):
 
-`objective_total_bits = data_nll_bits + (B/N) * (lambda1 * kl_pi_phi_bits + lambda2 * kl_phi_pbase_bits) - (B/N) * tau * entropy_weights_bits`
+`objective_total_bits = data_nll_bits + (B/N) * (lambda1 * code_cross_entropy_bits + lambda2 * kl_phi_pbase_bits) - (B/N) * tau * entropy_weights_bits`
 
 ColoredMNIST MDL (`colored_mnist.py`, nats):
 
