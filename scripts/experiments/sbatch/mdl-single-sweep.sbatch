@@ -23,9 +23,6 @@ export WANDB_CONSOLE=off
 # The offline backend still hangs on long ex3 batch runs; disable W&B unless
 # explicitly overridden for interactive debugging.
 export WANDB_MODE=${WANDB_MODE:-disabled}
-# Per-epoch logs go to the per-run train.log file; do not mirror them to the
-# Slurm stdout stream, which can block long jobs.
-export CRL_TEE_STDOUT=${CRL_TEE_STDOUT:-0}
 
 # Set venv for partition
 source /global/D1/homes/prebenmn/workspace/crl/venvs/a40q/bin/activate
