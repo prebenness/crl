@@ -35,10 +35,13 @@ from src.models.mdl_classifiers import GumbelSoftmaxMLP
 from src.mdl.coding import grid_values_and_codelengths
 from src.training.train_state import (
     create_state_inner, create_state_outer, create_state_mdl,
+    create_state_mdl_shared,
 )
 from src.training.steps import (
     make_train_step, make_train_step_pair, make_eval_step,
     make_train_step_mdl, make_train_step_mdl_pair, make_eval_step_mdl,
+    make_train_step_mdl_shared, make_train_step_mdl_shared_pair,
+    make_eval_step_mdl_shared,
 )
 from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
@@ -167,7 +170,7 @@ def _make_sweep_plot(results, cfg, out_path):
     xs = np.array([r["lambda"] for r in results])
 
     plt.figure()
-    if cfg.model.mode in ("pair", "mdl_pair"):
+    if cfg.model.mode.endswith("pair"):
         plt.scatter(xs, [r["train_acc2"] for r in results],
                     label="Outer train", marker="o")
         plt.scatter(xs, [r["test_acc2"] for r in results],
@@ -266,6 +269,23 @@ def main(argv=None):
         mdl_epoch_train = make_train_epoch_mdl(mdl_step_train)
         mdl_eval_epoch = make_eval_epoch(mdl_eval_step)
 
+    if mode in ("mdl_shared", "mdl_shared_pair"):
+        mdl_shared_step_warmup = make_train_step_mdl_shared(
+            cfg, soft_forward=True,
+        )
+        mdl_shared_step_bridge = make_train_step_mdl_shared(
+            cfg, soft_forward=False, deterministic_st=True,
+        )
+        mdl_shared_step_train = make_train_step_mdl_shared(
+            cfg, soft_forward=False,
+        )
+        mdl_shared_eval_step = make_eval_step_mdl_shared(cfg)
+
+        mdl_shared_epoch_warmup = make_train_epoch_mdl(mdl_shared_step_warmup)
+        mdl_shared_epoch_bridge = make_train_epoch_mdl(mdl_shared_step_bridge)
+        mdl_shared_epoch_train = make_train_epoch_mdl(mdl_shared_step_train)
+        mdl_shared_eval_epoch = make_eval_epoch(mdl_shared_eval_step)
+
     if mode == "mdl_pair":
         mdl_pair_step_warmup = make_train_step_mdl_pair(cfg, soft_forward=True)
         mdl_pair_step_bridge = make_train_step_mdl_pair(
@@ -277,6 +297,29 @@ def main(argv=None):
         mdl_pair_epoch_warmup = make_train_epoch_mdl_pair(mdl_pair_step_warmup)
         mdl_pair_epoch_bridge = make_train_epoch_mdl_pair(mdl_pair_step_bridge)
         mdl_pair_epoch_train = make_train_epoch_mdl_pair(mdl_pair_step_train)
+        outer_eval_epoch = make_eval_epoch(vib_eval_step)
+
+    if mode == "mdl_shared_pair":
+        mdl_shared_pair_step_warmup = make_train_step_mdl_shared_pair(
+            cfg, soft_forward=True,
+        )
+        mdl_shared_pair_step_bridge = make_train_step_mdl_shared_pair(
+            cfg, soft_forward=False, deterministic_st=True,
+        )
+        mdl_shared_pair_step_train = make_train_step_mdl_shared_pair(
+            cfg, soft_forward=False,
+        )
+        vib_eval_step = make_eval_step(cfg)
+
+        mdl_shared_pair_epoch_warmup = make_train_epoch_mdl_pair(
+            mdl_shared_pair_step_warmup,
+        )
+        mdl_shared_pair_epoch_bridge = make_train_epoch_mdl_pair(
+            mdl_shared_pair_step_bridge,
+        )
+        mdl_shared_pair_epoch_train = make_train_epoch_mdl_pair(
+            mdl_shared_pair_step_train,
+        )
         outer_eval_epoch = make_eval_epoch(vib_eval_step)
 
     # Load data
@@ -417,6 +460,31 @@ def main(argv=None):
                     train_epoch_bridge_fn=mdl_pair_epoch_bridge,
                     train_epoch_fn=mdl_pair_epoch_train,
                     eval_inner_epoch_fn=mdl_eval_epoch,
+                    eval_outer_epoch_fn=outer_eval_epoch,
+                    run_dir=run_dir,
+                )
+            elif mode == "mdl_shared":
+                res = run_train_eval_mdl(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, cfg, lamb, wandb_run=run,
+                    create_state_fn=create_state_mdl_shared,
+                    train_epoch_warmup_fn=mdl_shared_epoch_warmup,
+                    train_epoch_bridge_fn=mdl_shared_epoch_bridge,
+                    train_epoch_fn=mdl_shared_epoch_train,
+                    eval_epoch_fn=mdl_shared_eval_epoch,
+                    run_dir=run_dir,
+                )
+            elif mode == "mdl_shared_pair":
+                outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                res = run_train_eval_mdl_pair(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, outer_model, cfg, lamb, wandb_run=run,
+                    create_inner_fn=create_state_mdl_shared,
+                    create_outer_fn=create_state_outer,
+                    train_epoch_warmup_fn=mdl_shared_pair_epoch_warmup,
+                    train_epoch_bridge_fn=mdl_shared_pair_epoch_bridge,
+                    train_epoch_fn=mdl_shared_pair_epoch_train,
+                    eval_inner_epoch_fn=mdl_shared_eval_epoch,
                     eval_outer_epoch_fn=outer_eval_epoch,
                     run_dir=run_dir,
                 )

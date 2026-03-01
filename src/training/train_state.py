@@ -58,6 +58,38 @@ def create_state_mdl(rng, model, input_shape, cfg):
     )
 
 
+def create_state_mdl_shared(rng, model, input_shape, cfg):
+    """Initialize shared-MDL model state with model logits + phi logits.
+
+    This mirrors the ANBN shared-weight setup: the underlying MDL MLP keeps
+    its categorical weight logits, and a learned shared prior ``phi`` is
+    represented by a separate trainable ``phi_logits`` vector in the same
+    optimizer state.
+    """
+    model_params = model.init(
+        rng,
+        jnp.ones(input_shape, jnp.float32),
+        tau=cfg.mdl.tau_start,
+        train=False,
+    )["params"]
+    grid_size = int(len(model.grid_values))
+    params = {
+        "logits": model_params["logits"],
+        "phi_logits": jnp.zeros((grid_size,), dtype=jnp.float32),
+    }
+    tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
+    opt_state = tx.init(params)
+
+    return MDLTrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
+        tau=jnp.array(cfg.mdl.tau_start, dtype=jnp.float32),
+    )
+
+
 def create_state_outer(rng, model, input_shape, cfg):
     """Initialize outer (standard classifier) model state."""
     params = model.init(

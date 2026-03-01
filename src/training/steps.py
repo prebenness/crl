@@ -11,6 +11,8 @@ import jax.lax as lax
 from jax.scipy.special import logsumexp
 import optax
 
+from src.mdl.coding import grid_values_and_codelengths
+from src.mdl.shared_weights import compute_p_base, epsilon_bound_simplex
 from src.loss_fns.reg_loss_fns import class_cond_hsic_rbf
 
 
@@ -294,6 +296,153 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
     )
 
 
+def _kl_divergence_nats(p, q):
+    """KL divergence in nats."""
+    eps = 1e-10
+    return jnp.sum(p * jnp.log((p + eps) / (q + eps)), axis=-1)
+
+
+def _cross_entropy_nats(p, q):
+    """Cross-entropy in nats."""
+    eps = 1e-10
+    return -jnp.sum(p * jnp.log(q + eps), axis=-1)
+
+
+def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, mdl_lambda, lambda2,
+                     epsilon, p_base, n_train, n_samples=1,
+                     soft_forward=False, deterministic_st=False):
+    """Shared-weight MDL inner-model loss in nats.
+
+    objective_total_nats
+        = data_nll_nats
+        + reg_complexity_weighted_nats
+        - reg_entropy_bonus_nats
+
+    where the shared complexity term is:
+        mdl_lambda * sum_i CE(pi_i, phi) + lambda2 * KL(phi || P_base)
+
+    The data term is averaged over the batch, so the MDL terms use scale 1/N.
+    """
+
+    model_params = {"logits": params["logits"]}
+
+    def _compute_shared_complexity(model_aux, tau_val):
+        all_probs = model_aux["all_probs"]  # (n_params, M)
+        phi = epsilon_bound_simplex(params["phi_logits"], epsilon)  # (M,)
+        p_base_arr = jnp.asarray(p_base, dtype=jnp.float32)
+
+        code_ce_per_param = _cross_entropy_nats(all_probs, phi[None, :])
+        code_cross_entropy_nats = jnp.sum(code_ce_per_param)
+
+        log_probs = jnp.log(all_probs + 1e-10)
+        entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
+        entropy_weights_nats = jnp.sum(entropy_per_param)
+
+        kl_pi_phi_nats = jnp.sum(code_ce_per_param - entropy_per_param)
+        kl_phi_pbase_nats = _kl_divergence_nats(phi, p_base_arr)
+        phi_entropy_nats = -jnp.sum(phi * jnp.log(phi + 1e-10))
+
+        complexity_expected_nats = (
+            mdl_lambda * code_cross_entropy_nats + lambda2 * kl_phi_pbase_nats
+        )
+        reg_entropy_bonus_unscaled_nats = tau_val * entropy_weights_nats
+        return (
+            complexity_expected_nats,
+            code_cross_entropy_nats,
+            entropy_weights_nats,
+            reg_entropy_bonus_unscaled_nats,
+            kl_pi_phi_nats,
+            kl_phi_pbase_nats,
+            phi_entropy_nats,
+            jnp.min(phi),
+            jnp.max(phi),
+        )
+
+    hyp_scale = 1.0 / jnp.maximum(n_train, 1)
+
+    if soft_forward:
+        logits, aux = apply_fn(
+            {"params": model_params}, x, tau=tau, train=True, rng=rng,
+            soft_forward=True,
+        )
+        data_nll_nats = optax.softmax_cross_entropy_with_integer_labels(
+            logits, y,
+        ).mean()
+    elif deterministic_st:
+        logits, aux = apply_fn(
+            {"params": model_params}, x, tau=tau, train=True,
+            deterministic_st=True,
+        )
+        data_nll_nats = optax.softmax_cross_entropy_with_integer_labels(
+            logits, y,
+        ).mean()
+    elif n_samples > 1:
+        keys = jrandom.split(rng, n_samples)
+
+        def one_sample(k):
+            logits_k, _ = apply_fn(
+                {"params": model_params}, x, tau=tau, train=True, rng=k,
+            )
+            data_nll_k = optax.softmax_cross_entropy_with_integer_labels(
+                logits_k, y,
+            ).mean()
+            return logits_k, data_nll_k
+
+        logits_0, aux = apply_fn(
+            {"params": model_params}, x, tau=tau, train=True, rng=keys[0],
+        )
+        data_nll_0 = optax.softmax_cross_entropy_with_integer_labels(
+            logits_0, y,
+        ).mean()
+        rest_logits_K, rest_data_nll_K = jax.vmap(one_sample)(keys[1:])
+        logits = (logits_0 + jnp.sum(rest_logits_K, axis=0)) / n_samples
+        data_nll_nats = (data_nll_0 + jnp.sum(rest_data_nll_K)) / n_samples
+    else:
+        logits, aux = apply_fn(
+            {"params": model_params}, x, tau=tau, train=True, rng=rng,
+        )
+        data_nll_nats = optax.softmax_cross_entropy_with_integer_labels(
+            logits, y,
+        ).mean()
+
+    (
+        complexity_expected_nats,
+        code_cross_entropy_nats,
+        entropy_weights_nats,
+        reg_entropy_bonus_unscaled_nats,
+        kl_pi_phi_nats,
+        kl_phi_pbase_nats,
+        phi_entropy_nats,
+        phi_min_prob,
+        phi_max_prob,
+    ) = _compute_shared_complexity(aux, tau)
+
+    objective_total_nats = (
+        data_nll_nats
+        + hyp_scale * complexity_expected_nats
+        - hyp_scale * reg_entropy_bonus_unscaled_nats
+    )
+
+    z = aux.get("z", None)
+
+    return (
+        objective_total_nats,
+        (
+            logits,
+            data_nll_nats,
+            complexity_expected_nats,
+            code_cross_entropy_nats,
+            entropy_weights_nats,
+            kl_pi_phi_nats,
+            kl_phi_pbase_nats,
+            phi_entropy_nats,
+            phi_min_prob,
+            phi_max_prob,
+            z,
+        ),
+    )
+
+
 def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
     """Return a JIT-compiled single-model MDL train_step.
 
@@ -347,6 +496,84 @@ def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
             "reg_complexity_weighted_bits": reg_complexity_weighted_nats / ln2,
             "reg_entropy_bonus_bits": reg_entropy_bonus_nats / ln2,
             "reg_net_bits": reg_net_nats / ln2,
+            "accuracy": acc,
+        }
+        return state, metrics
+
+    return train_step
+
+
+def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
+    """Return a JIT-compiled single-model shared-MDL train_step."""
+    n_samples = cfg.mdl.n_samples
+    lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
+    epsilon = float(cfg.mdl.shared_epsilon)
+    _, grid_codelengths = grid_values_and_codelengths(cfg.mdl.n_max, cfg.mdl.m_max)
+    p_base = compute_p_base(grid_codelengths)
+
+    @jax.jit
+    def train_step(state, batch, rng, mdl_lambda, n_train):
+        x, y = batch
+        mdl_lambda_arr = jnp.asarray(mdl_lambda, dtype=jnp.float32)
+
+        def loss_fn(params):
+            return _mdl_shared_loss(
+                state.apply_fn, params, x, y, rng, state.tau,
+                mdl_lambda_arr, lambda2, epsilon, p_base, n_train,
+                n_samples, soft_forward, deterministic_st,
+            )
+
+        (
+            objective_total_nats,
+            (
+                logits,
+                data_nll_nats,
+                complexity_expected_nats,
+                code_cross_entropy_nats,
+                entropy_weights_nats,
+                kl_pi_phi_nats,
+                kl_phi_pbase_nats,
+                phi_entropy_nats,
+                phi_min_prob,
+                phi_max_prob,
+                _z,
+            ),
+        ), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        state = state.apply_gradients(grads=grads)
+
+        ln2 = jnp.log(2.0)
+        hyp_scale = 1.0 / jnp.maximum(n_train, 1)
+        reg_entropy_bonus_unscaled_nats = state.tau * entropy_weights_nats
+        reg_complexity_weighted_nats = hyp_scale * complexity_expected_nats
+        reg_entropy_bonus_nats = hyp_scale * reg_entropy_bonus_unscaled_nats
+        reg_net_nats = reg_complexity_weighted_nats - reg_entropy_bonus_nats
+
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        metrics = {
+            "objective_total_nats": objective_total_nats,
+            "data_nll_nats": data_nll_nats,
+            "complexity_expected_nats": complexity_expected_nats,
+            "code_cross_entropy_nats": code_cross_entropy_nats,
+            "entropy_weights_nats": entropy_weights_nats,
+            "reg_complexity_weighted_nats": reg_complexity_weighted_nats,
+            "reg_entropy_bonus_nats": reg_entropy_bonus_nats,
+            "reg_net_nats": reg_net_nats,
+            "kl_pi_phi_nats": kl_pi_phi_nats,
+            "kl_phi_pbase_nats": kl_phi_pbase_nats,
+            "phi_entropy_nats": phi_entropy_nats,
+            "phi_min_prob": phi_min_prob,
+            "phi_max_prob": phi_max_prob,
+            "objective_total_bits": objective_total_nats / ln2,
+            "data_nll_bits": data_nll_nats / ln2,
+            "complexity_expected_bits": complexity_expected_nats / ln2,
+            "code_cross_entropy_bits": code_cross_entropy_nats / ln2,
+            "entropy_weights_bits": entropy_weights_nats / ln2,
+            "reg_complexity_weighted_bits": reg_complexity_weighted_nats / ln2,
+            "reg_entropy_bonus_bits": reg_entropy_bonus_nats / ln2,
+            "reg_net_bits": reg_net_nats / ln2,
+            "kl_pi_phi_bits": kl_pi_phi_nats / ln2,
+            "kl_phi_pbase_bits": kl_phi_pbase_nats / ln2,
+            "phi_entropy_bits": phi_entropy_nats / ln2,
             "accuracy": acc,
         }
         return state, metrics
@@ -452,6 +679,116 @@ def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
     return jax.jit(train_step_pair, static_argnames=("num_classes",))
 
 
+def make_train_step_mdl_shared_pair(cfg, soft_forward=False,
+                                    deterministic_st=False):
+    """Return a JIT-compiled dual-model train step: shared-MDL inner + outer."""
+    n_samples = cfg.mdl.n_samples
+    lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
+    epsilon = float(cfg.mdl.shared_epsilon)
+    _, grid_codelengths = grid_values_and_codelengths(cfg.mdl.n_max, cfg.mdl.m_max)
+    p_base = compute_p_base(grid_codelengths)
+
+    def train_step_pair(inner_state, outer_state, batch, rng, mdl_lambda,
+                        n_train, hsic_w, num_classes):
+        x, y = batch
+        hsic_w = jnp.asarray(hsic_w, jnp.float32)
+        mdl_lambda_arr = jnp.asarray(mdl_lambda, dtype=jnp.float32)
+        rng_inner = rng
+
+        def loss_fn1(params):
+            return _mdl_shared_loss(
+                inner_state.apply_fn, params, x, y, rng_inner, inner_state.tau,
+                mdl_lambda_arr, lambda2, epsilon, p_base, n_train,
+                n_samples, soft_forward, deterministic_st,
+            )
+
+        (
+            objective_total_nats,
+            (
+                logits1,
+                data_nll_nats,
+                complexity_expected_nats,
+                code_cross_entropy_nats,
+                entropy_weights_nats,
+                kl_pi_phi_nats,
+                kl_phi_pbase_nats,
+                phi_entropy_nats,
+                phi_min_prob,
+                phi_max_prob,
+                z1,
+            ),
+        ), grads1 = jax.value_and_grad(loss_fn1, has_aux=True)(inner_state.params)
+        inner_state = inner_state.apply_gradients(grads=grads1)
+
+        ln2 = jnp.log(2.0)
+        hyp_scale = 1.0 / jnp.maximum(n_train, 1)
+        reg_entropy_bonus_unscaled_nats = inner_state.tau * entropy_weights_nats
+        reg_complexity_weighted_nats = hyp_scale * complexity_expected_nats
+        reg_entropy_bonus_nats = hyp_scale * reg_entropy_bonus_unscaled_nats
+        reg_net_nats = reg_complexity_weighted_nats - reg_entropy_bonus_nats
+
+        z1_sg = lax.stop_gradient(z1)
+
+        def loss_fn2(params):
+            logits2, aux2 = outer_state.apply_fn(
+                {"params": params}, x, train=True,
+            )
+            z2 = aux2["z"]
+
+            ce2 = optax.softmax_cross_entropy_with_integer_labels(
+                logits2, y
+            ).mean()
+            hsic = class_cond_hsic_rbf(
+                z1_sg, z2, y, num_classes=num_classes,
+            )
+
+            total = ce2 * (1 - hsic_w) + hsic * hsic_w
+            return total, (logits2, ce2, hsic)
+
+        (loss2, (logits2, ce2, hsic_loss)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "objective_total_nats": objective_total_nats,
+            "data_nll_nats": data_nll_nats,
+            "complexity_expected_nats": complexity_expected_nats,
+            "code_cross_entropy_nats": code_cross_entropy_nats,
+            "entropy_weights_nats": entropy_weights_nats,
+            "reg_complexity_weighted_nats": reg_complexity_weighted_nats,
+            "reg_entropy_bonus_nats": reg_entropy_bonus_nats,
+            "reg_net_nats": reg_net_nats,
+            "kl_pi_phi_nats": kl_pi_phi_nats,
+            "kl_phi_pbase_nats": kl_phi_pbase_nats,
+            "phi_entropy_nats": phi_entropy_nats,
+            "phi_min_prob": phi_min_prob,
+            "phi_max_prob": phi_max_prob,
+            "objective_total_bits": objective_total_nats / ln2,
+            "data_nll_bits": data_nll_nats / ln2,
+            "complexity_expected_bits": complexity_expected_nats / ln2,
+            "code_cross_entropy_bits": code_cross_entropy_nats / ln2,
+            "entropy_weights_bits": entropy_weights_nats / ln2,
+            "reg_complexity_weighted_bits": reg_complexity_weighted_nats / ln2,
+            "reg_entropy_bonus_bits": reg_entropy_bonus_nats / ln2,
+            "reg_net_bits": reg_net_nats / ln2,
+            "kl_pi_phi_bits": kl_pi_phi_nats / ln2,
+            "kl_phi_pbase_bits": kl_phi_pbase_nats / ln2,
+            "phi_entropy_bits": phi_entropy_nats / ln2,
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": ce2,
+            "hsic": hsic_loss,
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
 def make_eval_step_mdl(cfg):
     """Return a JIT-compiled eval step for MDL models (deterministic argmax)."""
     @jax.jit
@@ -459,6 +796,22 @@ def make_eval_step_mdl(cfg):
         x, y = batch
         logits, _ = state.apply_fn(
             {"params": state.params}, x, tau=1.0, train=False,
+        )
+        nll = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        return nll, acc
+
+    return eval_step
+
+
+def make_eval_step_mdl_shared(cfg):
+    """Return a JIT-compiled eval step for shared-MDL models."""
+    @jax.jit
+    def eval_step(state, batch, rng):
+        x, y = batch
+        logits, _ = state.apply_fn(
+            {"params": {"logits": state.params["logits"]}},
+            x, tau=1.0, train=False,
         )
         nll = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
         acc = (jnp.argmax(logits, -1) == y).mean()

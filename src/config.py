@@ -76,6 +76,8 @@ class MDLConfig:
     warmup_epochs: int = 10
     bridge_epochs: int | None = None
     n_samples: int = 1
+    shared_lambda2: float = 100.0
+    shared_epsilon: float = 1e-6
 
 
 @dataclass
