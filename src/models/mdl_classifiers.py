@@ -14,7 +14,8 @@ import flax.linen as nn
 from typing import Any
 
 
-def kaiming_categorical_init(grid_values, layer_dims, peak_logit=10.0):
+def kaiming_categorical_init(grid_values, layer_dims, peak_logit=10.0,
+                             grid_codelengths=None, cl_scale=0.0):
     """Flax initializer that peaks categorical logits at Kaiming He targets.
 
     The standard normal(stddev=0.1) init gives near-uniform softmax over the
@@ -26,12 +27,20 @@ def kaiming_categorical_init(grid_values, layer_dims, peak_logit=10.0):
       2. Finds the nearest grid value to each target.
       3. Sets the logit at that grid index to peak_logit, rest to 0.
 
+    When cl_scale > 0 and grid_codelengths is provided, non-peaked logits
+    are set to -cl_scale * l(s_m) instead of 0, biasing the initial
+    categorical toward simple (low-codelength) rationals as second choices.
+    Reference: informed by Louizos et al. (2019) "Relaxed Quantization
+    for Discretized Neural Networks" (arXiv:1810.01875).
+
     Uses pure JAX ops so the function is traceable under JIT.
 
     Args:
         grid_values: (M,) array of rational grid values
         layer_dims: [input_dim, h1, bottleneck, h3, num_classes]
         peak_logit: logit value at the target grid index (rest get 0)
+        grid_codelengths: (M,) array of per-grid-point codelengths (bits)
+        cl_scale: scale for codelength-informed background logits
     """
     grid_jnp = jnp.asarray(grid_values)
 
@@ -60,8 +69,14 @@ def kaiming_categorical_init(grid_values, layer_dims, peak_logit=10.0):
             jnp.abs(targets[:, None] - grid_jnp[None, :]), axis=-1,
         )
 
-        # Set logit at nearest grid index to peak_logit, rest stay at 0
-        logits = jnp.zeros((n_total, M), dtype=dtype)
+        # Background: codelength-informed or zeros
+        if grid_codelengths is not None and cl_scale > 0:
+            cl = jnp.asarray(grid_codelengths, dtype=dtype)
+            logits = jnp.broadcast_to(
+                (-cl_scale * cl)[None, :], (n_total, M),
+            ).copy()
+        else:
+            logits = jnp.zeros((n_total, M), dtype=dtype)
         logits = logits.at[jnp.arange(n_total), nearest_idx].set(peak_logit)
         return logits
 
@@ -84,6 +99,12 @@ class GumbelSoftmaxMLP(nn.Module):
         h1: first hidden layer width
         bottleneck: bottleneck layer width (representation for HSIC)
         h3: third hidden layer width
+        mode_forward: if True, use mode of π (not Gumbel argmax) in the
+            forward pass during stochastic ST.  Reference: Lee et al. (2021)
+            "Semi-Relaxed Quantization with DropBits" (arXiv:1911.12990).
+        init_cl_scale: scale for codelength-informed logit background.
+            0 = zeros (legacy Kaiming-only), >0 = bias non-peaked logits
+            toward simple rationals.
     """
     num_classes: int
     grid_values: Any   # (M,) array
@@ -91,6 +112,8 @@ class GumbelSoftmaxMLP(nn.Module):
     h1: int = 100
     bottleneck: int = 100
     h3: int = 100
+    mode_forward: bool = False
+    init_cl_scale: float = 0.0
 
     @nn.compact
     def __call__(self, x, tau, train=True, rng=None,
@@ -130,7 +153,11 @@ class GumbelSoftmaxMLP(nn.Module):
 
         all_logits = self.param(
             "logits",
-            kaiming_categorical_init(self.grid_values, layer_dims),
+            kaiming_categorical_init(
+                self.grid_values, layer_dims,
+                grid_codelengths=self.grid_codelengths,
+                cl_scale=self.init_cl_scale,
+            ),
             (n_total, M),
         )
 
@@ -153,7 +180,15 @@ class GumbelSoftmaxMLP(nn.Module):
             gumbel_noise = jrandom.gumbel(rng, shape=(n_total, M))
             perturbed = (all_logits + gumbel_noise) / tau
             y_soft = jax.nn.softmax(perturbed, axis=-1)
-            idx = jnp.argmax(y_soft, axis=-1)
+            # Mode forward: use argmax of *unperturbed* logits (mode of π)
+            # instead of argmax of Gumbel-perturbed logits.  Avoids
+            # catastrophic forward-pass samples.
+            # Ref: Lee et al. (2021) "Semi-Relaxed Quantization" §3.1
+            idx = jnp.where(
+                self.mode_forward,
+                jnp.argmax(all_logits, axis=-1),
+                jnp.argmax(y_soft, axis=-1),
+            )
             y_hard = jax.nn.one_hot(idx, M)
             y_st = y_hard - lax.stop_gradient(y_soft) + y_soft
             all_weights = jnp.sum(y_st * grid[None, :], axis=-1)

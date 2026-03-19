@@ -78,6 +78,8 @@ class MDLConfig:
     n_samples: int = 1
     shared_lambda2: float = 100.0
     shared_epsilon: float = 1e-6
+    mode_forward: bool = False
+    init_cl_scale: float = 0.0
 
 
 @dataclass

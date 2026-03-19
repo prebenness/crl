@@ -995,6 +995,12 @@ def _build_arg_parser(defaults=None):
                         help="Use deterministic straight-through instead of Gumbel ST")
     parser.add_argument("--det_st_after_tau", type=float, default=None,
                         help="Switch from Gumbel ST to deterministic ST once tau falls below this threshold")
+    parser.add_argument("--mode_forward", action="store_true",
+                        help="Use mode of pi (not Gumbel argmax) in forward pass "
+                             "(Lee et al. 2021 Semi-Relaxed Quantization)")
+    parser.add_argument("--init_cl_scale", type=float, default=0.0,
+                        help="Scale for codelength-informed logit initialization "
+                             "(0 = legacy noise-only, >0 = bias toward simple rationals)")
     parser.add_argument("--warmup_epochs", type=int, default=500,
                         help="Soft warmup epochs before switching to ST")
     parser.add_argument("--bridge_epochs", type=int, default=None,
@@ -1214,6 +1220,8 @@ def main():
             "n_samples": "--n_samples",
             "deterministic_st": "--deterministic_st",
             "det_st_after_tau": "--det_st_after_tau",
+            "mode_forward": "--mode_forward",
+            "init_cl_scale": "--init_cl_scale",
             "deterministic": "--deterministic",
             "long_val_n": "--long_val_n",
             "eval_every": "--eval_every",
@@ -1384,6 +1392,8 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         output_size=NUM_SYMBOLS,
         grid_values=grid_values,
         grid_codelengths=grid_codelengths,
+        mode_forward=args.mode_forward,
+        init_cl_scale=args.init_cl_scale,
     )
 
     rng = jrandom.PRNGKey(args.seed)

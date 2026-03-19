@@ -16,6 +16,28 @@ import flax.linen as nn
 from typing import Any
 
 
+def codelength_informed_init(grid_codelengths, scale=1.0):
+    """Initialize logits proportional to -scale * l(s_m).
+
+    Makes the initial categorical approximate P_base, concentrating mass
+    on simple (low-codelength) rationals like 0, ±1, ±1/2.  When scale=0
+    this falls back to pure noise (similar to the old normal(0.1) init).
+
+    Reference: informed by Louizos et al. (2019) "Relaxed Quantization
+    for Discretized Neural Networks" (arXiv:1810.01875) which notes that
+    initialization strongly affects which grid region the optimizer explores.
+    """
+    cl = jnp.asarray(grid_codelengths)
+
+    def init_fn(rng, shape, dtype=jnp.float32):
+        n_total, M = shape
+        base_logits = -scale * cl  # (M,)
+        noise = jrandom.normal(rng, shape=(n_total, M)) * 0.1
+        return jnp.broadcast_to(base_logits[None, :], (n_total, M)) + noise
+
+    return init_fn
+
+
 class GumbelSoftmaxLSTM(nn.Module):
     """LSTM where every weight/bias is a categorical over a rational grid.
 
@@ -28,12 +50,19 @@ class GumbelSoftmaxLSTM(nn.Module):
         output_size: output dimension (3 for {#, a, b})
         grid_values: float32 array (M,) of rational grid values
         grid_codelengths: float32 array (M,) of per-weight codelengths
+        mode_forward: if True, use mode of π (not Gumbel argmax) in the
+            forward pass during stochastic ST.  Reference: Lee et al. (2021)
+            "Semi-Relaxed Quantization with DropBits" (arXiv:1911.12990).
+        init_cl_scale: scale for codelength-informed initialization.
+            0 = noise-only (legacy), >0 = bias toward simple rationals.
     """
     hidden_size: int
     input_size: int
     output_size: int
     grid_values: Any  # (M,) array
     grid_codelengths: Any  # (M,) array
+    mode_forward: bool = False
+    init_cl_scale: float = 0.0
 
     @nn.compact
     def __call__(self, x, tau, train=True, rng=None,
@@ -76,13 +105,17 @@ class GumbelSoftmaxLSTM(nn.Module):
         n_total = n_lstm_w + n_lstm_b + n_out_w + n_out_b
 
         # Single logit array for all parameters.
-        # Random initialization breaks the symmetry that traps the all-zero
+        # When init_cl_scale > 0, logits are biased toward simple rationals
+        # (codelength-informed init).  When init_cl_scale == 0, falls back to
+        # small random noise that breaks the symmetry trapping the all-zero
         # LSTM at a saddle point (h=0 always, gradient of data term = 0).
-        all_logits = self.param(
-            "logits",
-            nn.initializers.normal(stddev=0.1),
-            (n_total, M),
-        )
+        if self.init_cl_scale > 0:
+            init_fn = codelength_informed_init(
+                self.grid_codelengths, scale=self.init_cl_scale,
+            )
+        else:
+            init_fn = nn.initializers.normal(stddev=0.1)
+        all_logits = self.param("logits", init_fn, (n_total, M))
 
         grid = jnp.asarray(self.grid_values)
 
@@ -105,12 +138,22 @@ class GumbelSoftmaxLSTM(nn.Module):
                 gumbel_noise = jrandom.gumbel(key, shape=(M,))
                 perturbed = (logit_row + gumbel_noise) / tau
                 y_soft = jax.nn.softmax(perturbed, axis=-1)
-                idx = jnp.argmax(y_soft, axis=-1)
+                # Mode forward: use argmax of *unperturbed* logits (mode of π)
+                # instead of argmax of Gumbel-perturbed logits.  This avoids
+                # catastrophic forward-pass samples where Gumbel noise selects
+                # a grid point far from the distribution mode.
+                # Ref: Lee et al. (2021) "Semi-Relaxed Quantization" §3.1
+                idx = jax.lax.cond(
+                    mode_fwd,
+                    lambda: jnp.argmax(logit_row, axis=-1),
+                    lambda: jnp.argmax(y_soft, axis=-1),
+                )
                 y_hard = jax.nn.one_hot(idx, M)
                 y_st = y_hard - jax.lax.stop_gradient(y_soft) + y_soft
                 w = jnp.dot(y_st, grid)
                 return w
 
+            mode_fwd = jnp.bool_(self.mode_forward)
             all_weights = jax.vmap(sample_one)(all_logits, keys)
         else:
             # Deterministic: pick argmax

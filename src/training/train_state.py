@@ -1,5 +1,6 @@
 """Custom Flax train states and state constructors."""
 
+import numpy as np
 import jax.numpy as jnp
 from flax.training import train_state
 import optax
@@ -73,9 +74,14 @@ def create_state_mdl_shared(rng, model, input_shape, cfg):
         train=False,
     )["params"]
     grid_size = int(len(model.grid_values))
+    # Initialize φ logits ∝ log P_base = -l(s_m) * ln(2), so the shared
+    # prior starts near P_base rather than uniform.  The optimizer only needs
+    # to learn deviations from the coding-scheme-induced prior.
+    cl = np.asarray(model.grid_codelengths, dtype=np.float32)
+    phi_init = jnp.asarray(-cl * np.log(2.0), dtype=jnp.float32)
     params = {
         "logits": model_params["logits"],
-        "phi_logits": jnp.zeros((grid_size,), dtype=jnp.float32),
+        "phi_logits": phi_init,
     }
     tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
     opt_state = tx.init(params)

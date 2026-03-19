@@ -68,6 +68,8 @@ def _make_mdl_mlp(cfg):
         num_classes=cfg.model.num_classes,
         grid_values=gv,
         grid_codelengths=gc,
+        mode_forward=cfg.mdl.mode_forward,
+        init_cl_scale=cfg.mdl.init_cl_scale,
     )
 
 
