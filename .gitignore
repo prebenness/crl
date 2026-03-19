@@ -11,3 +11,5 @@ wandb/
 .pytest_cache/
 logs/
 results/
+
+agent-context.lnk
