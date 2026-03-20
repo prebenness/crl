@@ -38,17 +38,24 @@ class ULAMLPClassifier(nn.Module):
       - logits -> num_classes
 
     Same signature as StdClassifier: (rep_dim, num_classes).
-    For strict fairness to uLA, rep_dim must be 100 (we assert it).
+    Hidden widths are fixed at 100 for strict fidelity to the uLA protocol.
+    If rep_dim != 100 a warning is emitted; the value is ignored.
     """
     rep_dim: int
     num_classes: int
 
     @nn.compact
     def __call__(self, x, train: bool = True):
+        if self.rep_dim != 100:
+            import warnings
+            warnings.warn(
+                f"ULAMLPClassifier ignores rep_dim={self.rep_dim}; "
+                f"hidden width is fixed at 100 for uLA protocol fidelity."
+            )
         # Expect x in NHWC from your pipeline: (B, 28, 28, 3)
         x = x.reshape((x.shape[0], -1))  # flatten
 
-        # uLA: 3 hidden layers, 100 neurons each
+        # uLA: 3 hidden layers, 100 neurons each (fixed for paper compatibility)
         x = nn.Dense(100)(x); x = nn.relu(x)
         x = nn.Dense(100)(x); z = nn.relu(x)
         h = nn.Dense(100)(z); h = nn.relu(h)

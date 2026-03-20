@@ -54,19 +54,19 @@ Shared-MDL extra terms:
 
 ### 4) Exact per-mode formulas
 
-Notation: `B` = batch size, `N` = train set size, `tau = 1/beta`.
+Notation: `N` = train set size, `tau = 1/beta`.  All paths use averaged data NLL + `1/N` scaling on regularization terms.
 
 ANBN basic mode (`differentiable_mdl.py`, bits):
 
-`objective_total_bits = data_nll_bits + (B/N) * mdl_lambda * complexity_expected_bits - (B/N) * tau * entropy_weights_bits`
+`objective_total_bits = mean_data_nll_bits + (1/N) * mdl_lambda * complexity_expected_bits - (1/N) * tau * entropy_weights_bits`
 
 ANBN shared mode (`differentiable_mdl.py`, bits):
 
-`objective_total_bits = data_nll_bits + (B/N) * (lambda1 * code_cross_entropy_bits + lambda2 * kl_phi_pbase_bits) - (B/N) * tau * entropy_weights_bits`
+`objective_total_bits = mean_data_nll_bits + (1/N) * (lambda1 * code_cross_entropy_bits + lambda2 * kl_phi_pbase_bits) - (1/N) * tau * entropy_weights_bits`
 
 ColoredMNIST MDL (`colored_mnist.py`, nats):
 
-`objective_total_nats = data_nll_nats + (1/N) * mdl_lambda * complexity_expected_nats - (1/N) * tau * entropy_weights_nats`
+`objective_total_nats = mean_data_nll_nats + (1/N) * mdl_lambda * complexity_expected_nats - (1/N) * tau * entropy_weights_nats`
 
 ### 5) Units
 

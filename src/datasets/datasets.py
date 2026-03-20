@@ -1,3 +1,5 @@
+import warnings
+
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import MNIST
 from torchvision import transforms
@@ -306,6 +308,13 @@ def build_dataset(name: str, train: bool, p_corr: float = 0.9, seed: int = 0):
         raise KeyError(
             f"Unknown dataset '{name}'. Available: {list(factories.keys())}"
         )
+    # cmnist_ula test set is always unbiased (uniform colors) per the uLA
+    # protocol; p_corr is ignored for the test split.
+    if name == "cmnist_ula" and not train and p_corr != 0.1:
+        warnings.warn(
+            f"cmnist_ula test set is always unbiased (uniform colors); "
+            f"p_test={p_corr} is ignored. Set p_test=0.1 to silence this warning."
+        )
     return factories[name]()
 
 
@@ -313,6 +322,10 @@ def make_epoch_batches(x, y, batch_size, seed):
     """
     Fast host-side permutation, device-side gather.
     Avoids jax.random.permutation (slow + sync).
+
+    Note: drops remainder samples (n % batch_size).  Since a fresh random
+    permutation is used each epoch, different samples are dropped each time,
+    so all samples are seen over multiple epochs.
     """
     n = x.shape[0]
     rng = np.random.default_rng(int(seed))
@@ -330,3 +343,31 @@ def make_epoch_batches(x, y, batch_size, seed):
     xb = x_shuf.reshape((n_batches, batch_size) + x.shape[1:])
     yb = y_shuf.reshape((n_batches, batch_size))
     return xb, yb
+
+
+def make_eval_batches(x, y, batch_size):
+    """Create deterministic (unshuffled) eval batches covering all samples.
+
+    The last batch is zero-padded to ``batch_size``.  Returns ``(xb, yb, counts)``
+    where ``counts[i]`` is the number of valid samples in batch ``i``.
+    All batches except the last have ``counts[i] == batch_size``.
+    """
+    n = x.shape[0]
+    remainder = n % batch_size
+    if remainder != 0:
+        pad_n = batch_size - remainder
+        x_pad = jnp.zeros((pad_n,) + x.shape[1:], dtype=x.dtype)
+        y_pad = jnp.zeros((pad_n,), dtype=y.dtype)
+        x = jnp.concatenate([x, x_pad], axis=0)
+        y = jnp.concatenate([y, y_pad], axis=0)
+
+    n_padded = x.shape[0]
+    n_batches = n_padded // batch_size
+    xb = x.reshape((n_batches, batch_size) + x.shape[1:])
+    yb = y.reshape((n_batches, batch_size))
+
+    # counts: batch_size for all full batches, remainder for the last
+    counts = jnp.full((n_batches,), batch_size, dtype=jnp.int32)
+    if remainder != 0:
+        counts = counts.at[-1].set(remainder)
+    return xb, yb, counts

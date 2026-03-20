@@ -1,16 +1,17 @@
 """Training loop for the differentiable MDL experiment.
 
 Implements the relaxed objective J_beta from the proposal:
-    J_beta(alpha) = E[L_MDL(theta)] - (1/beta) * sum_i H(pi_i)
+    J_beta(alpha) = E[L_MDL(theta)] + lambda * E[sum l(theta_i)]
+                    - tau * sum_i H(pi_i)
 
-where:
-    L_MDL(theta) = L_D(theta) + lambda * sum_i l(theta_i)
+where tau = 1/beta.  The entropy bonus (subtracted) encourages
+exploration by penalizing peaked weight distributions.
 
 In practice:
     - L_D is estimated via Gumbel-Softmax ST (biased but practical)
     - The coding term sum_i l(theta_i) is computed exactly in expectation
       (since it's linear in pi): E[sum l(theta_i)] = sum_i sum_m pi_{i,m} l(s_m)
-    - The entropy bonus is computed analytically
+    - The entropy bonus (subtracted) is computed analytically
 """
 
 import jax
@@ -58,17 +59,17 @@ def _compute_complexity_and_entropy_bits(model_aux, tau):
     entropy_per_param_bits = -jnp.sum(all_probs * log_probs, axis=-1)
     entropy_weights_bits = jnp.sum(entropy_per_param_bits)
 
-    # beta = 1/tau, so 1/beta = tau
+    # Entropy bonus (subtracted): tau * H, where tau = 1/beta
     entropy_bonus_bits = tau * entropy_weights_bits
 
     return complexity_expected_bits, entropy_weights_bits, entropy_bonus_bits
 
 
 def _compute_data_nll_bits(logits, y, mask):
-    """Compute data NLL (cross-entropy) in bits for one forward pass."""
+    """Compute data NLL (cross-entropy) in bits, averaged over valid positions."""
     ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     ce_bits = ce_nats / jnp.log(2.0)
-    return jnp.sum(ce_bits * mask)
+    return jnp.sum(ce_bits * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
 def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
@@ -76,9 +77,12 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
     """Create the MDL loss function.
 
     The loss combines:
-    1. Data term: cross-entropy (= negative log-likelihood = codelength of data)
-    2. Hypothesis term: expected codelength of weights under categorical dist
-    3. Entropy bonus: -(1/beta) * H(pi) to encourage exploration
+    1. Data term: cross-entropy averaged over valid positions (bits)
+    2. Hypothesis term: expected codelength of weights, scaled by 1/N
+    3. Entropy bonus (subtracted): tau * H(pi), scaled by 1/N
+
+    Uses averaged data NLL + 1/N scaling on regularization terms, matching
+    the cMNIST convention.
 
     When n_samples > 1, the data term is averaged over multiple independent
     Gumbel-Softmax samples to reduce gradient variance.
@@ -90,7 +94,7 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
     Args:
         mdl_lambda: trade-off parameter for hypothesis codelength
-        n_train: total number of training sequences (for batch scaling)
+        n_train: total number of training sequences (for 1/N reg scaling)
         n_samples: number of Gumbel samples to average data term over
         soft_forward: if True, use continuous relaxation (no Gumbel)
         deterministic_st: if True, use deterministic straight-through
@@ -99,8 +103,7 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
     n_train = float(max(n_train, 1))
 
     def loss_fn(params, apply_fn, x, y, mask, tau, rng):
-        B = x.shape[0]
-        batch_scale = B / n_train
+        hyp_scale = 1.0 / n_train
 
         if soft_forward:
             # Single forward pass with continuous relaxation
@@ -146,9 +149,9 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
         complexity_expected_bits, entropy_weights_bits, entropy_bonus_bits = \
             _compute_complexity_and_entropy_bits(model_aux, tau)
 
-        # Total relaxed MDL objective with batch scaling.
-        reg_complexity_weighted = mdl_lambda * batch_scale * complexity_expected_bits
-        reg_entropy_bonus = batch_scale * entropy_bonus_bits
+        # Total relaxed MDL objective: averaged data NLL + 1/N scaling on reg terms.
+        reg_complexity_weighted = mdl_lambda * hyp_scale * complexity_expected_bits
+        reg_entropy_bonus = hyp_scale * entropy_bonus_bits
         reg_net = reg_complexity_weighted - reg_entropy_bonus
         objective_total_bits = data_nll_bits + reg_net
 

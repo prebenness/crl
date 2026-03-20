@@ -218,7 +218,7 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
         entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
         entropy_weights_nats = jnp.sum(entropy_per_param)
 
-        # beta = 1/tau, so 1/beta = tau
+        # Entropy bonus (subtracted): tau * H, where tau = 1/beta
         reg_entropy_bonus_unscaled_nats = tau_val * entropy_weights_nats
         return (
             complexity_expected_nats,
@@ -449,7 +449,7 @@ def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
     Call for warmup (soft_forward=True), optional bridge (deterministic_st=True),
     and regular stochastic ST training.
     """
-    n_samples = cfg.mdl.n_samples
+    n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
 
     @jax.jit
     def train_step(state, batch, rng, mdl_lambda, n_train):
@@ -505,7 +505,7 @@ def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
 
 def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
     """Return a JIT-compiled single-model shared-MDL train_step."""
-    n_samples = cfg.mdl.n_samples
+    n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
     lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
     epsilon = float(cfg.mdl.shared_epsilon)
     _, grid_codelengths = grid_values_and_codelengths(cfg.mdl.n_max, cfg.mdl.m_max)
@@ -583,7 +583,7 @@ def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
 
 def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
     """Return a JIT-compiled dual-model train step: MDL inner + standard outer with HSIC."""
-    n_samples = cfg.mdl.n_samples
+    n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
 
     def train_step_pair(inner_state, outer_state, batch, rng, mdl_lambda,
                         n_train, hsic_w, num_classes):
@@ -682,7 +682,7 @@ def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
 def make_train_step_mdl_shared_pair(cfg, soft_forward=False,
                                     deterministic_st=False):
     """Return a JIT-compiled dual-model train step: shared-MDL inner + outer."""
-    n_samples = cfg.mdl.n_samples
+    n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
     lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
     epsilon = float(cfg.mdl.shared_epsilon)
     _, grid_codelengths = grid_values_and_codelengths(cfg.mdl.n_max, cfg.mdl.m_max)

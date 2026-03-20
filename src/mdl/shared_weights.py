@@ -7,10 +7,12 @@ weight-sharing through a shared code distribution.
 
 Composite objective (Section 8.1):
 
-    J(alpha, phi; beta) = E[L_D(theta)]
-                        + lambda1 * sum_i CE_2(pi_i, phi)
-                        + lambda2 * DKL(phi || P_base)
-                        - (1/beta) * sum_i H(pi_i)
+    J(alpha, phi; tau) = E[L_D(theta)]
+                       + lambda1 * sum_i CE_2(pi_i, phi)
+                       + lambda2 * DKL(phi || P_base)
+                       - tau * sum_i H(pi_i)
+
+where tau = 1/beta.  The entropy bonus (subtracted) encourages exploration.
 
 where:
     pi_i = softmax(alpha_i)        per-weight categorical distribution
@@ -210,10 +212,10 @@ def create_shared_mdl_state(
 # ---------------------------------------------------------------------------
 
 def _shared_compute_data_nll_bits(logits, y, mask):
-    """Compute data NLL (cross-entropy) in bits for one forward pass."""
+    """Compute data NLL (cross-entropy) in bits, averaged over valid positions."""
     ce_nats = optax.softmax_cross_entropy_with_integer_labels(logits, y)
     ce_bits = ce_nats / jnp.log(2.0)
-    return jnp.sum(ce_bits * mask)
+    return jnp.sum(ce_bits * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
 def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
@@ -226,9 +228,10 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         J = E[L_D(theta)]
           + lambda1 * sum_i CE_2(pi_i, phi)
           + lambda2 * DKL(phi || P_base)
-          - (1/beta) * sum_i H(pi_i)
+          - tau * sum_i H(pi_i)
 
-    where beta = 1/tau and phi is epsilon-bounded.
+    where tau = 1/beta.  The entropy bonus (subtracted) encourages exploration.
+    phi is epsilon-bounded.
 
     Args:
         lambda1: weight for the shared code-length term.
@@ -296,7 +299,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         p_base = jnp.asarray(p_base)
         kl_dictionary = _kl_divergence(phi, p_base)
 
-        # Entropy bonus
+        # Entropy bonus (subtracted): tau * sum_i H(pi_i)
         log_probs = jnp.log2(all_probs + 1e-10)
         entropy_per_param = -jnp.sum(all_probs * log_probs, axis=-1)
         entropy_weights_bits = jnp.sum(entropy_per_param)
@@ -304,16 +307,15 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         kl_weight_sharing = jnp.sum(kl_per_weight)
         entropy_bonus_bits = tau * entropy_weights_bits
 
-        # Batch scaling
-        B = x.shape[0]
-        batch_scale = B / n_train
+        # Averaged data NLL + 1/N scaling on reg terms (matches cMNIST convention).
+        hyp_scale = 1.0 / n_train
 
         # Composite objective (bits) with explicit decomposition.
         complexity_expected_bits = (
             lambda1 * code_cross_entropy_bits + lambda2 * kl_dictionary
         )
-        reg_complexity_weighted = batch_scale * complexity_expected_bits
-        reg_entropy_bonus = batch_scale * entropy_bonus_bits
+        reg_complexity_weighted = hyp_scale * complexity_expected_bits
+        reg_entropy_bonus = hyp_scale * entropy_bonus_bits
         reg_net = reg_complexity_weighted - reg_entropy_bonus
         objective_total_bits = data_nll_bits + reg_net
 

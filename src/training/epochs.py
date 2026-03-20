@@ -103,8 +103,17 @@ def make_train_epoch_mdl_pair(train_step_pair_fn):
 
 
 def make_eval_epoch(eval_step_fn):
-    """Return a JIT-compiled eval_epoch using the given eval_step."""
-    def eval_epoch(state, xb, yb, rng):
+    """Return a JIT-compiled eval_epoch using the given eval_step.
+
+    Args:
+        eval_step_fn: per-batch eval function returning (loss, acc).
+
+    The returned ``eval_epoch(state, xb, yb, rng, counts)`` expects a
+    ``counts`` array (from ``make_eval_batches``) giving the number of
+    valid samples per batch.  Loss and accuracy are weighted by counts so
+    that zero-padding in the last batch does not bias the result.
+    """
+    def eval_epoch(state, xb, yb, rng, counts):
         n_batches = xb.shape[0]
         rngs = jrandom.split(rng, n_batches)
 
@@ -114,6 +123,11 @@ def make_eval_epoch(eval_step_fn):
             return carry, (loss, acc)
 
         _, (losses, accs) = lax.scan(body, None, (xb, yb, rngs))
-        return losses.mean(), accs.mean()
+
+        # Weighted mean: each batch's mean loss/acc is weighted by
+        # the number of valid samples it contains.
+        weights = counts.astype(jnp.float32)
+        total = weights.sum()
+        return (losses * weights).sum() / total, (accs * weights).sum() / total
 
     return jax.jit(eval_epoch)

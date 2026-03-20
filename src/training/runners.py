@@ -6,7 +6,7 @@ import math
 import jax.numpy as jnp
 from jax import random as jrandom
 
-from src.datasets.datasets import make_epoch_batches
+from src.datasets.datasets import make_epoch_batches, make_eval_batches
 from src.mdl.training import anneal_tau_st_phase
 from src.utils.checkpointing import save_checkpoint, save_results, checkpoint_path
 
@@ -61,19 +61,20 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
 
     state = create_state_fn(rng_init, model, input_shape, cfg)
 
+    # Deterministic eval batches covering all test samples (padded).
+    xt, yt, te_counts = make_eval_batches(
+        x_test, y_test, cfg.training.batch_size,
+    )
+
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
         seed_tr = cfg.training.seed * 10_000 + ep
-        seed_te = cfg.training.seed * 20_000 + ep
 
         rng, rng_epoch = jrandom.split(rng)
 
         xb, yb = make_epoch_batches(
             x_train, y_train, cfg.training.batch_size, seed_tr,
-        )
-        xt, yt = make_epoch_batches(
-            x_test, y_test, cfg.training.batch_size, seed_te,
         )
 
         state, metrics = train_epoch_fn(
@@ -81,7 +82,7 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
         )
 
         rng, rng_eval = jrandom.split(rng)
-        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval)
+        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval, te_counts)
 
         results = {
             "epoch": ep + 1,
@@ -130,17 +131,17 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
     inner_state = create_inner_fn(r1, inner_model, input_shape, cfg)
     outer_state = create_outer_fn(r2, outer_model, input_shape, cfg)
 
+    xt, yt, te_counts = make_eval_batches(
+        x_test, y_test, cfg.training.batch_size,
+    )
+
     for ep in range(cfg.training.epochs):
         t0 = time.time()
         seed_tr = cfg.training.seed * 10_000 + ep
-        seed_te = cfg.training.seed * 20_000 + ep
         rng, rng_epoch = jrandom.split(rng)
 
         xb, yb = make_epoch_batches(
             x_train, y_train, cfg.training.batch_size, seed_tr,
-        )
-        xt, yt = make_epoch_batches(
-            x_test, y_test, cfg.training.batch_size, seed_te,
         )
 
         inner_state, outer_state, metrics = train_epoch_pair_fn(
@@ -151,10 +152,10 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
 
         rng, rng_eval1, rng_eval2 = jrandom.split(rng, 3)
         te_loss1, te_acc1 = eval_epoch_fn(
-            inner_state, xt, yt, rng_eval1,
+            inner_state, xt, yt, rng_eval1, te_counts,
         )
         te_loss2, te_acc2 = eval_epoch_fn(
-            outer_state, xt, yt, rng_eval2,
+            outer_state, xt, yt, rng_eval2, te_counts,
         )
 
         results = {
@@ -221,6 +222,10 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
     tau_hold_epochs = cfg.mdl.warmup_epochs + bridge_epochs
     prev_phase_name = None
 
+    xt, yt, te_counts = make_eval_batches(
+        x_test, y_test, cfg.training.batch_size,
+    )
+
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
@@ -244,14 +249,10 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             epoch_fn = train_epoch_fn
 
         seed_tr = cfg.training.seed * 10_000 + ep
-        seed_te = cfg.training.seed * 20_000 + ep
         rng_train, rng_epoch = jrandom.split(rng_train)
 
         xb, yb = make_epoch_batches(
             x_train, y_train, cfg.training.batch_size, seed_tr,
-        )
-        xt, yt = make_epoch_batches(
-            x_test, y_test, cfg.training.batch_size, seed_te,
         )
 
         state, metrics = epoch_fn(
@@ -260,7 +261,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
         prev_phase_name = phase
 
         rng_eval, rng_eval_epoch = jrandom.split(rng_eval)
-        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval_epoch)
+        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval_epoch, te_counts)
 
         results = {
             "epoch": ep + 1,
@@ -337,6 +338,10 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
     tau_hold_epochs = cfg.mdl.warmup_epochs + bridge_epochs
     prev_phase_name = None
 
+    xt, yt, te_counts = make_eval_batches(
+        x_test, y_test, cfg.training.batch_size,
+    )
+
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
@@ -363,14 +368,10 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             epoch_fn = train_epoch_fn
 
         seed_tr = cfg.training.seed * 10_000 + ep
-        seed_te = cfg.training.seed * 20_000 + ep
         rng_train, rng_epoch = jrandom.split(rng_train)
 
         xb, yb = make_epoch_batches(
             x_train, y_train, cfg.training.batch_size, seed_tr,
-        )
-        xt, yt = make_epoch_batches(
-            x_test, y_test, cfg.training.batch_size, seed_te,
         )
 
         inner_state, outer_state, metrics = epoch_fn(
@@ -383,10 +384,10 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
         rng_eval, rng_eval_inner = jrandom.split(rng_eval)
         rng_eval_outer = jrandom.fold_in(rng_eval_inner, 1)
         te_loss1, te_acc1 = eval_inner_epoch_fn(
-            inner_state, xt, yt, rng_eval_inner,
+            inner_state, xt, yt, rng_eval_inner, te_counts,
         )
         te_loss2, te_acc2 = eval_outer_epoch_fn(
-            outer_state, xt, yt, rng_eval_outer,
+            outer_state, xt, yt, rng_eval_outer, te_counts,
         )
 
         results = {

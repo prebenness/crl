@@ -15,7 +15,7 @@ Our approach:
     - Each weight parameterized as categorical over finite rational grid S
     - Gumbel-Softmax ST for data term gradients
     - Coding term (expected codelength) computed exactly under categorical dist
-    - Entropy bonus annealed via temperature tau = 1/beta
+    - Entropy bonus (subtracted): tau * H(pi), annealed via temperature tau = 1/beta
 
 Modes:
     --mode basic   : basic categorical MDL (Sections 2-5 of proposal)
@@ -341,14 +341,11 @@ def evaluate_golden_baseline(test_max_n, p):
     return mdl, golden_result
 
 
-def _compute_discrete_hyp_bits(params, grid, grid_values):
+def _compute_discrete_hyp_bits(params, grid_codelengths):
     """Compute discrete |H| from current logits (argmax weights)."""
     logits = params["logits"] if "logits" in params else params
     idx = jnp.argmax(logits, axis=-1)
-    total = 0
-    for i in range(len(idx)):
-        total += rational_codelength(grid[int(idx[i])])
-    return total
+    return float(jnp.sum(grid_codelengths[idx]))
 
 
 def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
@@ -441,15 +438,17 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         or args.det_st_after_tau is not None
         or bridge_epochs > 0
     )
+    # mode_forward makes the forward pass deterministic; K>1 samples are redundant.
+    effective_n_samples = 1 if args.mode_forward else args.n_samples
     st_train_step = make_train_step(
-        args.mdl_lambda, n_train=N, n_samples=args.n_samples, soft_forward=False,
+        args.mdl_lambda, n_train=N, n_samples=effective_n_samples, soft_forward=False,
     )
     det_st_train_step = None
     if use_det_st:
         det_st_train_step = make_train_step(
             args.mdl_lambda,
             n_train=N,
-            n_samples=args.n_samples,
+            n_samples=effective_n_samples,
             soft_forward=False,
             deterministic_st=True,
         )
@@ -538,7 +537,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             # Compute discrete argmax complexity periodically for monitoring.
             complexity_argmax_bits = _compute_discrete_hyp_bits(
-                state.params, grid, grid_values,
+                state.params, grid_codelengths,
             )
             print(
                 f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
@@ -560,7 +559,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             n_perfect = val_result["n_perfect"]
             gen_n = val_result["gen_n"]
             current_complexity_bits = _compute_discrete_hyp_bits(
-                state.params, grid, grid_values,
+                state.params, grid_codelengths,
             )
             val_summary = _format_val_summary(val_result, val_inputs)
             n_val = val_summary["n_val"]
@@ -729,9 +728,10 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         or args.det_st_after_tau is not None
         or bridge_epochs > 0
     )
+    effective_n_samples = 1 if args.mode_forward else args.n_samples
     st_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
-        n_samples=args.n_samples, soft_forward=False,
+        n_samples=effective_n_samples, soft_forward=False,
     )
     det_st_train_step = None
     if use_det_st:
@@ -740,7 +740,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             args.lambda2,
             args.epsilon,
             n_train=N,
-            n_samples=args.n_samples,
+            n_samples=effective_n_samples,
             soft_forward=False,
             deterministic_st=True,
         )
@@ -830,7 +830,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             complexity_argmax_bits = _compute_discrete_hyp_bits(
-                state.params, grid, grid_values,
+                state.params, grid_codelengths,
             )
             print(
                 f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
@@ -859,7 +859,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             n_perfect = val_result["n_perfect"]
             gen_n = val_result["gen_n"]
             current_complexity_bits = _compute_discrete_hyp_bits(
-                model_params, grid, grid_values,
+                model_params, grid_codelengths,
             )
             val_summary = _format_val_summary(val_result, val_inputs)
             n_val = val_summary["n_val"]
