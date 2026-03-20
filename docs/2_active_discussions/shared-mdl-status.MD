@@ -50,4 +50,3 @@ That removes the earlier objective mismatch. Pre-fix shared-mode experiment resu
 
 1. Compare corrected shared mode against basic MDL under matched schedules and seeds.
 2. Sweep `lambda2` around the viable band (`20` to `100`) to measure how broad that anchor-stable region is.
-3. ~~Consider a shared-specific initialization for `phi` at `P_base`~~ — Done: both ANBN (`shared_weights.py`) and cMNIST (`train_state.py`) paths now use P_base-informed φ init.

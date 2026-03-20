@@ -22,6 +22,7 @@ This is the current frontier point.
 1. The result is empirically strong, but not yet proven golden.
 2. Performance appears sensitive to regularization strength (`mdl_lambda`) and training schedule.
 3. The historical baseline schedule near `mdl_lambda ~= 0.144` is unstable and can collapse into trivial solutions.
+4. **Batch scaling convention changed (2026-03-20)**: ANBN now uses averaged data NLL + `1/N` reg scaling (matching cMNIST). The 701-bit result above was obtained under the old summed NLL + `B/N` convention. Hyperparameters (`mdl_lambda`, `lr`) will need recalibration under the new convention.
 
 ## Latest Code Change
 

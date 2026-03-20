@@ -19,8 +19,8 @@
 - Characterize what distinguishes very high-generalization runs from brittle ones.
 
 5. Shared-MDL validation
-- First fix the objective mismatch.
-- Then test whether shared mode can match or exceed basic MDL under matched settings.
+- Objective mismatch is fixed (CE_2 + P_base correction, P_base-informed φ init).
+- Test whether shared mode can match or exceed basic MDL under matched settings.
 
 ## ColoredMNIST / Robustness
 

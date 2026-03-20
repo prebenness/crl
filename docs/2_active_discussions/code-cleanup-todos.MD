@@ -4,26 +4,6 @@ Updated 2026-03-20. Ordered by estimated effort (smallest first). Research-roadm
 
 ---
 
-## Done
-
-### Session 2026-03-19
-- ~~Unify φ initialization in ANBN shared mode~~ — `shared_weights.py` now uses P_base-informed init, matching cMNIST path.
-- ~~Rename `mdl_lambda` → `lambda1` in cMNIST shared paths~~ — `_mdl_shared_loss`, `make_train_step_mdl_shared`, `make_train_step_mdl_shared_pair` in `steps.py`.
-
-### Session 2026-03-20
-- ~~Entropy variable naming~~ — All docstrings/comments now consistently use "entropy bonus (subtracted): tau * H(pi)" framing.
-- ~~Short-circuit `n_samples` for `mode_forward`~~ — All 4 cMNIST step factories and both ANBN train-step creation sites now set `n_samples=1` when `mode_forward=True`.
-- ~~Vectorize `_compute_discrete_hyp_bits`~~ — Replaced Python loop with `grid_codelengths[idx]` lookup.
-- ~~Full fixed test sets during evaluation~~ — New `make_eval_batches` pads last batch + returns counts. `make_eval_epoch` weights by counts. All 4 cMNIST runners updated.
-- ~~Train tail-batch handling~~ — Documented in `make_epoch_batches`: random permutation means different samples dropped each epoch; acceptable for training.
-- ~~Clarify `p_test` for `cmnist_ula`~~ — Warning emitted when `p_test != 0.1` since `CMNISTuLA` always uses unbiased test per uLA protocol.
-- ~~Enforce `rep_dim` for ULA~~ — `ULAMLPClassifier` now warns if `rep_dim != 100`; hidden widths fixed at 100 for paper compatibility.
-- ~~Unify batch scaling convention~~ — ANBN now uses averaged data NLL + `1/N` reg scaling, matching cMNIST. **Note: existing ANBN hyperparameters (lambda, lr) will need recalibration.**
-
----
-
-## Outstanding
-
 ### M — half day
 
 **1. Improve shared-MDL reporting semantics**
