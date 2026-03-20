@@ -696,7 +696,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     bs = args.batch_size if args.batch_size > 0 else N
 
     state = create_shared_mdl_state(
-        init_rng, model, grid_values,
+        init_rng, model, grid_values, grid_codelengths,
         seq_len=max_seq_len,
         batch_size=min(bs, N),
         lr=args.lr,
@@ -1414,7 +1414,7 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
             )
         else:
             state = create_shared_mdl_state(
-                init_rng, model, grid_values,
+                init_rng, model, grid_values, grid_codelengths,
                 seq_len=x_train.shape[1],
                 batch_size=min(bs, N),
                 lr=args.lr,

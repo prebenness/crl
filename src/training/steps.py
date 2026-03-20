@@ -308,7 +308,7 @@ def _cross_entropy_nats(p, q):
     return -jnp.sum(p * jnp.log(q + eps), axis=-1)
 
 
-def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, mdl_lambda, lambda2,
+def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, lambda1, lambda2,
                      epsilon, p_base, n_train, n_samples=1,
                      soft_forward=False, deterministic_st=False):
     """Shared-weight MDL inner-model loss in nats.
@@ -319,7 +319,7 @@ def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, mdl_lambda, lambda2,
         - reg_entropy_bonus_nats
 
     where the shared complexity term is:
-        mdl_lambda * sum_i CE(pi_i, phi) + lambda2 * KL(phi || P_base)
+        lambda1 * sum_i CE(pi_i, phi) + lambda2 * KL(phi || P_base)
 
     The data term is averaged over the batch, so the MDL terms use scale 1/N.
     """
@@ -343,7 +343,7 @@ def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, mdl_lambda, lambda2,
         phi_entropy_nats = -jnp.sum(phi * jnp.log(phi + 1e-10))
 
         complexity_expected_nats = (
-            mdl_lambda * code_cross_entropy_nats + lambda2 * kl_phi_pbase_nats
+            lambda1 * code_cross_entropy_nats + lambda2 * kl_phi_pbase_nats
         )
         reg_entropy_bonus_unscaled_nats = tau_val * entropy_weights_nats
         return (
@@ -512,14 +512,14 @@ def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
     p_base = compute_p_base(grid_codelengths)
 
     @jax.jit
-    def train_step(state, batch, rng, mdl_lambda, n_train):
+    def train_step(state, batch, rng, lambda1, n_train):
         x, y = batch
-        mdl_lambda_arr = jnp.asarray(mdl_lambda, dtype=jnp.float32)
+        lambda1_arr = jnp.asarray(lambda1, dtype=jnp.float32)
 
         def loss_fn(params):
             return _mdl_shared_loss(
                 state.apply_fn, params, x, y, rng, state.tau,
-                mdl_lambda_arr, lambda2, epsilon, p_base, n_train,
+                lambda1_arr, lambda2, epsilon, p_base, n_train,
                 n_samples, soft_forward, deterministic_st,
             )
 
@@ -688,17 +688,17 @@ def make_train_step_mdl_shared_pair(cfg, soft_forward=False,
     _, grid_codelengths = grid_values_and_codelengths(cfg.mdl.n_max, cfg.mdl.m_max)
     p_base = compute_p_base(grid_codelengths)
 
-    def train_step_pair(inner_state, outer_state, batch, rng, mdl_lambda,
+    def train_step_pair(inner_state, outer_state, batch, rng, lambda1,
                         n_train, hsic_w, num_classes):
         x, y = batch
         hsic_w = jnp.asarray(hsic_w, jnp.float32)
-        mdl_lambda_arr = jnp.asarray(mdl_lambda, dtype=jnp.float32)
+        lambda1_arr = jnp.asarray(lambda1, dtype=jnp.float32)
         rng_inner = rng
 
         def loss_fn1(params):
             return _mdl_shared_loss(
                 inner_state.apply_fn, params, x, y, rng_inner, inner_state.tau,
-                mdl_lambda_arr, lambda2, epsilon, p_base, n_train,
+                lambda1_arr, lambda2, epsilon, p_base, n_train,
                 n_samples, soft_forward, deterministic_st,
             )
 
