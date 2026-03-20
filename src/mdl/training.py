@@ -72,6 +72,37 @@ def _compute_data_nll_bits(logits, y, mask):
     return jnp.sum(ce_bits * mask) / jnp.maximum(jnp.sum(mask), 1.0)
 
 
+def compute_data_nll_bits_smoothed(logits, y, mask, smoothing=1e-10):
+    """Compute data NLL in bits with Abudy et al. (2025) smoothing convention.
+
+    For evaluation/comparison only.  Applies additive smoothing to output
+    probabilities before taking log, matching the convention in Abudy et al.
+    (2025, Section 4): "we smooth the network output distribution by adding
+    10^-10 to zero probabilities."
+
+    This differs from ``_compute_data_nll_bits`` which uses ``log_softmax``
+    (numerically stable, preferred for training, but not identical to the
+    paper's smoothing for |D:H| reporting).
+
+    Args:
+        logits: (B, T, V) output logits.
+        y: (B, T) integer target labels.
+        mask: (B, T) float mask (1 for valid positions, 0 for padding).
+        smoothing: additive constant (default 1e-10, matching Abudy et al.).
+
+    Returns:
+        Scalar: averaged NLL in bits over valid positions.
+    """
+    probs = jax.nn.softmax(logits, axis=-1)                   # (B, T, V)
+    probs_smoothed = probs + smoothing                         # no re-norm
+    log_probs_bits = jnp.log2(probs_smoothed)                  # (B, T, V)
+    # Gather log-prob of the correct token at each position
+    nll_bits = -jnp.take_along_axis(
+        log_probs_bits, y[..., None], axis=-1,
+    ).squeeze(-1)                                              # (B, T)
+    return jnp.sum(nll_bits * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+
 def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
                  soft_forward: bool = False, deterministic_st: bool = False):
     """Create the MDL loss function.
