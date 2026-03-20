@@ -28,6 +28,7 @@ This ensures phi_m >= epsilon for all m, preventing cross-entropy / KL
 terms from blowing up when some grid values are unused.
 """
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random as jrandom
@@ -144,6 +145,7 @@ def create_shared_mdl_state(
     rng,
     model,
     grid_values,
+    grid_codelengths,
     seq_len,
     batch_size,
     lr,
@@ -158,13 +160,14 @@ def create_shared_mdl_state(
             "phi_logits": (M,),        # shared prior logits (unconstrained)
         }
 
-    phi_logits is initialized to zeros, which corresponds to a uniform
-    adaptive prior at the start of training.
+    phi_logits is initialized proportional to log P_base = -l(s_m) * ln(2),
+    so the shared prior starts near P_base rather than uniform.
 
     Args:
         rng: PRNG key.
         model: GumbelSoftmaxLSTM instance.
         grid_values: float32 array (M,) of rational grid values.
+        grid_codelengths: float32 array (M,) of Lan codelengths per grid value.
         seq_len: sequence length for dummy initialization.
         batch_size: batch size for dummy initialization.
         lr: learning rate for Adam optimizer.
@@ -181,8 +184,11 @@ def create_shared_mdl_state(
         train=False,
     )["params"]
 
-    M = len(grid_values)
-    phi_logits = jnp.zeros((M,), dtype=jnp.float32)
+    # Initialize φ logits ∝ log P_base = -l(s_m) * ln(2), so the shared
+    # prior starts near P_base rather than uniform.  Matches the cMNIST
+    # path in create_state_mdl_shared.
+    cl = np.asarray(grid_codelengths, dtype=np.float32)
+    phi_logits = jnp.asarray(-cl * np.log(2.0), dtype=jnp.float32)
 
     # Joint params dict: model logits + phi_logits side by side.
     params = {
