@@ -326,3 +326,46 @@ class TestSharedWeights:
         q = jnp.array([0.5, 0.5])
         kl = _kl_divergence(p, q)
         assert float(kl) > 0
+
+
+# ---------------------------------------------------------------------------
+# Smoothed evaluation NLL tests
+# ---------------------------------------------------------------------------
+
+class TestSmoothedNLL:
+    """Verify compute_data_nll_bits_smoothed matches Abudy et al. (2025) convention."""
+
+    def test_agrees_with_logsoftmax_on_normal_logits(self):
+        """On well-behaved logits, smoothed and log_softmax NLL should nearly agree."""
+        from src.mdl.training import _compute_data_nll_bits, compute_data_nll_bits_smoothed
+        logits = jnp.array([[[2.0, 1.0, 0.5], [0.1, 3.0, -1.0]]])  # (1,2,3)
+        y = jnp.array([[0, 1]])
+        mask = jnp.array([[1.0, 1.0]])
+        nll_logsoftmax = _compute_data_nll_bits(logits, y, mask)
+        nll_smoothed = compute_data_nll_bits_smoothed(logits, y, mask)
+        np.testing.assert_allclose(
+            float(nll_smoothed), float(nll_logsoftmax), atol=1e-5,
+        )
+
+    def test_finite_on_extreme_logits(self):
+        """Even with extreme logits producing near-zero probs, result is finite."""
+        from src.mdl.training import compute_data_nll_bits_smoothed
+        # logit=-100 gives softmax near 0 for that class
+        logits = jnp.array([[[100.0, -100.0, -100.0]]])
+        y = jnp.array([[1]])  # target is the near-zero class
+        mask = jnp.array([[1.0]])
+        nll = compute_data_nll_bits_smoothed(logits, y, mask)
+        assert jnp.isfinite(nll), "Smoothed NLL should be finite"
+        assert float(nll) > 0
+
+    def test_matches_manual_computation(self):
+        """Smoothed NLL should match manual softmax + add eps + -log2."""
+        from src.mdl.training import compute_data_nll_bits_smoothed
+        logits = jnp.array([[[1.0, 2.0, 3.0]]])
+        y = jnp.array([[0]])
+        mask = jnp.array([[1.0]])
+        # Manual
+        probs = jax.nn.softmax(logits[0, 0])
+        expected = float(-jnp.log2(probs[0] + 1e-10))
+        result = float(compute_data_nll_bits_smoothed(logits, y, mask))
+        np.testing.assert_allclose(result, expected, atol=1e-6)

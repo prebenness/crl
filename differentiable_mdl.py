@@ -73,6 +73,7 @@ from src.mdl.training import (
     make_train_step,
     evaluate_deterministic_accuracy,
     anneal_tau_st_phase,
+    compute_data_nll_bits_smoothed,
 )
 from src.mdl.golden import (
     build_golden_network_params,
@@ -92,6 +93,17 @@ from src.mdl.analysis import (
     extract_weights,
     evaluate_range_f64,
     find_failure_n,
+)
+from src.mdl.evaluation import (
+    compute_grammar_weighted_nll_bits,
+    compute_optimal_dh_test,
+    compute_optimal_dh_train,
+    compute_train_dh,
+    compute_trained_h_bits,
+    compute_delta_pct,
+    evaluate_golden_under_regularisers,
+    format_abudy_comparison_table,
+    format_golden_regulariser_table,
 )
 from src.utils.checkpointing import (
     TeeLogger,
@@ -342,10 +354,44 @@ def evaluate_golden_baseline(test_max_n, p):
 
 
 def _compute_discrete_hyp_bits(params, grid_codelengths):
-    """Compute discrete |H| from current logits (argmax weights)."""
+    """Compute discrete |H| from current logits (argmax weights).
+
+    This is the Lan-style codelength: sum_i l(s_{argmax_i}).  In shared mode,
+    this does NOT reflect the shared-objective complexity — use
+    ``_compute_shared_discrete_complexity_bits`` for that.
+    """
     logits = params["logits"] if "logits" in params else params
     idx = jnp.argmax(logits, axis=-1)
     return float(jnp.sum(grid_codelengths[idx]))
+
+
+def _compute_shared_discrete_complexity_bits(
+    params, grid_codelengths, p_base, lambda1, lambda2, epsilon,
+):
+    """Compute discrete shared-objective complexity at argmax convergence.
+
+    At convergence each pi_i is concentrated on its argmax grid point, so:
+        code_ce  = sum_i CE_2(one_hot_i, phi) = sum_i -log2(phi[argmax_i])
+        kl_dict  = KL(phi || P_base)
+        shared_complexity = lambda1 * code_ce + lambda2 * kl_dict
+
+    Returns a dict with component breakdown.
+    """
+    from src.mdl.shared_weights import epsilon_bound_simplex, _kl_divergence
+
+    logits = params["logits"]
+    idx = jnp.argmax(logits, axis=-1)
+
+    phi = epsilon_bound_simplex(params["phi_logits"], epsilon)
+    phi_at_argmax = phi[idx]                                   # (n_params,)
+    code_ce = float(-jnp.sum(jnp.log2(phi_at_argmax + 1e-30)))
+    kl_dict = float(_kl_divergence(phi, jnp.asarray(p_base)))
+
+    return {
+        "shared_complexity": lambda1 * code_ce + lambda2 * kl_dict,
+        "code_ce": code_ce,
+        "kl_dict": kl_dict,
+    }
 
 
 def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
@@ -829,8 +875,12 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         prev_phase_name = phase_name
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
-            complexity_argmax_bits = _compute_discrete_hyp_bits(
+            lan_hyp_bits = _compute_discrete_hyp_bits(
                 state.params, grid_codelengths,
+            )
+            shared_disc = _compute_shared_discrete_complexity_bits(
+                state.params, grid_codelengths, p_base,
+                args.lambda1, args.lambda2, args.epsilon,
             )
             print(
                 f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
@@ -841,7 +891,9 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
                 f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
                 f"code_cross_entropy_bits={metrics['code_cross_entropy_bits']:.1f}b  "
-                f"complexity_argmax_bits={complexity_argmax_bits:4d}b  "
+                f"|H|_Lan={lan_hyp_bits:4d}b  "
+                f"shared_complexity={shared_disc['shared_complexity']:.1f}b "
+                f"(code_ce={shared_disc['code_ce']:.1f} + kl_dict={shared_disc['kl_dict']:.1f})  "
                 f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  "
                 f"kl_pi_phi_bits={metrics['kl_pi_phi_bits']:.1f}b  "
                 f"kl_phi_pbase_bits={metrics['kl_phi_pbase_bits']:.1f}b  "
@@ -860,6 +912,10 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             gen_n = val_result["gen_n"]
             current_complexity_bits = _compute_discrete_hyp_bits(
                 model_params, grid_codelengths,
+            )
+            val_shared_disc = _compute_shared_discrete_complexity_bits(
+                state.params, grid_codelengths, p_base,
+                args.lambda1, args.lambda2, args.epsilon,
             )
             val_summary = _format_val_summary(val_result, val_inputs)
             n_val = val_summary["n_val"]
@@ -891,10 +947,12 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                     long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
                 else:
                     long_val_suffix = ", long_n=[skipped]"
+            lan_total = current_complexity_bits + integer_code_length(args.hidden_size)
             print(
                 f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
                 f"({n_perfect}/{n_val} perfect, "
-                f"|H|={current_complexity_bits + integer_code_length(args.hidden_size)}b"
+                f"|H|_Lan={lan_total}b, "
+                f"shared_complexity={val_shared_disc['shared_complexity']:.1f}b"
                 f"{long_val_suffix})"
                 f"{best_tag}"
             )
@@ -1446,7 +1504,9 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
     # --- Final evaluation ---
     metrics = run_final_evaluation(
         args, state, best_params,
-        grid, grid_values, test_inputs, test_targets,
+        grid, grid_values, grid_codelengths,
+        test_inputs, test_targets,
+        train_inputs, train_targets,
         golden_mdl, golden_result,
     )
     if run_dir is not None:
@@ -1455,7 +1515,9 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
 
 
 def run_final_evaluation(args, state, best_params,
-                         grid, grid_values, test_inputs, test_targets,
+                         grid, grid_values, grid_codelengths,
+                         test_inputs, test_targets,
+                         train_inputs, train_targets,
                          golden_mdl, golden_result):
     """Run final test evaluation and print the comparison table.
 
@@ -1481,11 +1543,23 @@ def run_final_evaluation(args, state, best_params,
     n_nonzero = int(jnp.sum(discrete_weights != 0))
     print(f"\nDiscrete weights ({len(discrete_weights)} total, {n_nonzero} non-zero)")
 
-    # Compute discrete MDL score
+    # Compute discrete MDL score (Lan-style)
     total_hyp_bits = compute_discrete_mdl_score(eval_model_params, grid, grid_values)
     arch_bits = integer_code_length(args.hidden_size)
     total_mdl_bits = arch_bits + total_hyp_bits
-    print(f"  Discrete |H|: {total_mdl_bits} bits ({arch_bits} arch + {total_hyp_bits} weights)")
+    print(f"  Discrete |H| (Lan): {total_mdl_bits} bits ({arch_bits} arch + {total_hyp_bits} weights)")
+
+    if args.mode == "shared":
+        from src.mdl.shared_weights import compute_p_base
+        p_base = compute_p_base(grid_codelengths)
+        shared_disc = _compute_shared_discrete_complexity_bits(
+            eval_params, grid_codelengths, p_base,
+            args.lambda1, args.lambda2, args.epsilon,
+        )
+        print(
+            f"  Shared-code complexity: {shared_disc['shared_complexity']:.1f} bits "
+            f"(code_ce={shared_disc['code_ce']:.1f} + kl_dict={shared_disc['kl_dict']:.1f})"
+        )
 
     # Test accuracy
     test_max_n = args.test_max_n
@@ -1550,6 +1624,69 @@ def run_final_evaluation(args, state, best_params,
           f"{our_n_perfect:>10d}/{test_max_n}")
     print("=" * 70)
 
+    # --- Paper-comparable metrics (Abudy et al. 2025) ---
+    print("\n" + "=" * 70)
+    print("PAPER-COMPARABLE METRICS (Abudy et al. 2025)")
+    print("=" * 70)
+
+    # Golden baselines
+    golden_opt_test = compute_optimal_dh_test(
+        max_n=test_max_n, p=args.p, batch_size=64,
+    )
+    print(f"  Golden test |D:H|: {golden_opt_test['data_dh_bits']:.4f} bits")
+    print(f"  Golden |H| (LSTM): {golden_opt_test['h_bits']} bits")
+
+    golden_opt_train = compute_optimal_dh_train(
+        train_inputs, train_targets, p=args.p, batch_size=64,
+    )
+    print(f"  Golden train |D:H|: {golden_opt_train['train_dh_data_bits']:.2f} bits")
+
+    # Trained network |D:H| via discrete forward pass
+    def our_discrete_fwd(x):
+        logits_out, _ = state.apply_fn(
+            {"params": eval_model_params}, x, tau=1.0, train=False,
+        )
+        return logits_out
+
+    our_test_result = compute_grammar_weighted_nll_bits(
+        our_discrete_fwd, max_n=test_max_n, p=args.p, batch_size=64,
+    )
+    our_test_data_dh = our_test_result["data_dh_bits"]
+
+    our_train_result = compute_train_dh(
+        our_discrete_fwd, train_inputs, train_targets, batch_size=64,
+    )
+    our_train_data_dh = our_train_result["train_dh_data_bits"]
+
+    our_h = compute_trained_h_bits(
+        eval_model_params, grid_codelengths, args.hidden_size,
+    )
+
+    delta_test = compute_delta_pct(
+        our_test_data_dh, golden_opt_test["data_dh_bits"],
+    )
+    delta_train = compute_delta_pct(
+        our_train_data_dh, golden_opt_train["train_dh_data_bits"],
+    )
+
+    print(f"\n  Our test |D:H|:  {our_test_data_dh:.4f} bits  "
+          f"(Δ_test = {delta_test:+.1f}%)")
+    print(f"  Our train |D:H|: {our_train_data_dh:.2f} bits  "
+          f"(Δ_train = {delta_train:+.1f}%)")
+    print(f"  Our |H|:         {our_h['h_bits']} bits "
+          f"({our_h['arch_bits']} arch + {our_h['weight_bits']} weights)")
+
+    # Summary table
+    table = format_abudy_comparison_table(
+        our_test_data_dh=our_test_data_dh,
+        our_train_data_dh=our_train_data_dh,
+        our_h_bits=our_h["h_bits"],
+        opt_test_data_dh=golden_opt_test["data_dh_bits"],
+        opt_train_data_dh=golden_opt_train["train_dh_data_bits"],
+        golden_h_bits=golden_opt_test["h_bits"],
+    )
+    print(f"\n{table}")
+
     # --- Analytical network analysis ---
     if getattr(args, "analyze", False):
         analysis_result = analyze_model(
@@ -1566,6 +1703,14 @@ def run_final_evaluation(args, state, best_params,
         "weight_bits": int(total_hyp_bits),
         "first_failure_n": first_failure,
         "mean_det_accuracy": float(mean_acc),
+        # Paper-comparable metrics
+        "test_data_dh_bits": float(our_test_data_dh),
+        "train_data_dh_bits": float(our_train_data_dh),
+        "delta_test_pct": float(delta_test),
+        "delta_train_pct": float(delta_train),
+        "golden_test_data_dh_bits": float(golden_opt_test["data_dh_bits"]),
+        "golden_train_data_dh_bits": float(golden_opt_train["train_dh_data_bits"]),
+        "golden_h_bits": int(golden_opt_test["h_bits"]),
     }
 
 

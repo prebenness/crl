@@ -12,21 +12,18 @@ Consolidated from `code-cleanup-todos.MD`, `research-roadmap.MD`, and `experimen
 
 Code cleanup, notation fixes, and performance optimization of existing functionality.
 
-### 1.1 Improve shared-MDL reporting semantics (M — half day)
+### ~~1.1 Improve shared-MDL reporting semantics~~ — Done (2026-03-20)
 
-- Source: former `engineering-roadmap.MD` item 7.
-- In shared mode, report both discrete `|H|` and shared-objective compression terms clearly. Avoid implying a single `|H|` fully describes the shared objective.
+Shared training log, validation print, and final evaluation now show both `|H|_Lan` (Lan-style discrete codelength) and `shared_complexity` (lambda1 * code_ce + lambda2 * kl_dict). New helper `_compute_shared_discrete_complexity_bits` in `differentiable_mdl.py`.
 
 ### 1.2 `lax.fori_loop` epoch fusion for full-batch ANBN training (L — 1+ day)
 
 - Source: former `engineering-roadmap.MD` item 1.
 - Reduce Python overhead in long ANBN runs. Keep chunk boundaries aligned with logging/eval.
 
-### 1.3 Verify smoothing convention for evaluation (M)
+### ~~1.3 Verify smoothing convention for evaluation~~ — Done (2026-03-20)
 
-- Abudy et al. (2025) add 10^-10 to output probabilities before computing log-loss to avoid log(0) when a network assigns zero probability to the correct next token (marked with * in their tables, line 795).
-- Current state: our `_compute_data_nll_bits` in `src/mdl/training.py` uses `optax.softmax_cross_entropy_with_integer_labels`, which computes `log_softmax` (numerically stable, never exactly 0 unless logits are -inf). This is probably fine for training but should be verified for evaluation.
-- Ensure evaluation code applies the same smoothing convention as Abudy et al. (2025) when computing |D:H| scores for comparison.
+Training keeps `log_softmax` (optax, numerically stable). New `compute_data_nll_bits_smoothed` in `src/mdl/training.py` applies Abudy et al. (2025) convention (additive 1e-10, no re-normalization) for |D:H| evaluation. 3 tests added in `test_mdl.py`.
 
 ---
 
@@ -226,73 +223,25 @@ For each new task, create:
 
 We track the raw ingredients but don't combine them into the formats used by the papers.
 
-#### Analytical optimal |D:H| (HIGH PRIORITY)
+#### ~~Analytical optimal |D:H|~~ — Done (2026-03-20)
 
-- **What:** the total MDL score achieved by the golden network on the true test distribution: `|D:H|_optimal = |D:H_golden|_test + |H_golden|`.
-  - `|D:H_golden|_test` = cross-entropy of the golden network's output distribution against the true grammar distribution, summed over the exhaustive test set. In bits.
-  - `|H_golden|` = discrete hypothesis codelength of the golden network under Lan-style encoding.
-- **Why:** this is the denominator of Δ%, the primary metric in Abudy et al.'s (2025) results tables (line 795).
-- **Current state:** `src/mdl/golden.py` has `golden_mdl_score()` which computes |H| for the aⁿbⁿ golden network. We need to also compute the data term on the test set.
-- **Reference values from Abudy et al. (2025) (line 803–833):**
-  - aⁿbⁿ: |H|=139, test |D:H|=2.94
-  - aⁿbⁿcⁿ: |H|=241, test |D:H|=2.94
-  - Dyck-1: |H|=113, test |D:H|=1.77
-  - Dyck-2: |H|=579, test |D:H|=2.32
-  - Arithmetic: |H|=967, test |D:H|=3.96
-  - Toy-English: |H|=870, test |D:H|=4.49
-- **Implementation:**
-  - Add `compute_golden_data_codelength(golden_forward_fn, test_inputs, test_targets, grammar_weights)` to `src/mdl/golden.py` (or a new `src/mdl/evaluation.py`).
-  - This runs the golden network on each test string, computes per-position CE in bits, and sums weighted by grammar probability.
-  - Add `compute_optimal_mdl_score(task)` that returns `|H_golden| + |D:H_golden|_test` for each task.
+Implemented in `src/mdl/evaluation.py`: `compute_optimal_dh_test(max_n, p)` returns golden network's grammar-weighted test NLL (data term) and |H|. Validated: golden test |D:H| ≈ 2.94 bits (matching Abudy et al. 2025, arXiv:2505.13398v2, line 803). Note: our LSTM golden |H| = 1137 bits (not 139 — that's Abudy et al.'s free-form RNN golden).
 
-#### Composite |D:H| score for trained networks (HIGH PRIORITY)
+#### ~~Composite |D:H| score for trained networks~~ — Done (2026-03-20)
 
-- **What:** `|D:H|_trained = data_nll_bits_test + |H|_argmax` as a single number.
-  - `data_nll_bits_test` = CE loss of the argmax-discretised trained network on the test set, in bits.
-  - `|H|_argmax` = hypothesis codelength of the argmax-discretised weights under Lan-style encoding.
-- **Why:** makes our results directly comparable to both papers' table format.
-- **Current state:**
-  - `data_nll_bits` is logged during training but on train batches, not the test set.
-  - `complexity_argmax_bits` is logged as a monitoring quantity (see `docs/1_closed_topics/mdl-metrics-and-logging.MD` line 45).
-  - **Missing:** evaluation of both terms on the full test set with argmax-discretised weights.
-- **Implementation:**
-  - Add `evaluate_mdl_score(apply_fn, params, grid_values, grid_codelengths, test_inputs, test_targets, grammar_weights)` to `src/mdl/evaluation.py`.
-  - Steps: (1) discretise weights via argmax, (2) compute |H| = sum of `ell(grid_values[argmax(logits)])`, (3) run forward pass with discrete weights on full test set, (4) compute CE in bits weighted by grammar probabilities, (5) return `|D:H| = |H| + data_nll_bits_test`.
+Implemented in `src/mdl/evaluation.py`: `evaluate_trained_network_dh(apply_fn, params, grid_codelengths, hidden_size, test_max_n, p)` computes grammar-weighted test NLL + Lan-style |H| for argmax-discretised trained networks.
 
-#### Δ% — relative gap to optimum (HIGH PRIORITY)
+#### ~~Δ% — relative gap to optimum~~ — Done (2026-03-20)
 
-- **What:** `Δ(%) = (|D:H|_trained - |D:H|_optimal) / |D:H|_optimal × 100`.
-- **Why:** headline metric in Abudy et al. (2025) Tables 1–2 (lines ~300–340). Reported separately for train and test.
-- **Depends on:** analytical optimal |D:H| and composite |D:H| score.
-- **Implementation:**
-  - Compute both train and test Δ%: `Δ_train = (train_score - optimal_train) / optimal_train × 100` and `Δ_test = (test_score - optimal_test) / optimal_test × 100`.
-  - Note: Abudy et al. (2025) report Δ_train and Δ_test separately (columns in their tables).
-  - Report in evaluation logs and summary tables.
+Implemented in `src/mdl/evaluation.py`: `compute_delta_pct(score, optimal)`. Also `format_abudy_comparison_table(...)` for paper-style output with train/test Δ% columns. Convention: Δ% operates on the data term |D:H|, not total.
 
-#### Golden network reference scores under each regulariser (MEDIUM PRIORITY)
+#### ~~Golden network reference scores under each regulariser~~ — Done (2026-03-20)
 
-- **What:** evaluate the golden network's total loss under CE, CE+L1, CE+L2, and CE+MDL.
-- **Why:** the core argument of Lan et al. (2024) is that only MDL has the golden network at or near the optimum. Reproducing this with our differentiable objective strengthens the paper.
-- **Reference:** Lan et al. (2024) Table 4 (appendix), and Abudy et al. (2025) Table in lines 803–837 where golden values are in parentheses.
-- **Implementation:**
-  - For each regulariser r ∈ {none, L1, L2, MDL}:
-    - Set the network weights to the golden network's values.
-    - Compute `total_loss_r = CE(golden, test_set) + r(golden_weights)`.
-    - For MDL: `r = lambda * sum_i ell(golden_weight_i)`.
-    - For L1: `r = lambda * sum_i |golden_weight_i|`.
-    - For L2: `r = lambda * sum_i golden_weight_i^2`.
-  - Report as a table matching Lan et al. (2024) Table 4 format.
+Implemented in `src/mdl/evaluation.py`: `evaluate_golden_under_regularisers(max_n, p)` returns CE, L1 norm, L2 norm squared, and MDL |H|. Also `format_golden_regulariser_table(result)`. Note: norms are for our LSTM golden (Lan et al. 2024), not directly comparable to Abudy et al.'s free-form RNN.
 
-#### Grammar-weighted test set evaluation (MEDIUM PRIORITY)
+#### ~~Grammar-weighted test set evaluation~~ — Done (2026-03-20)
 
-- **What:** weight each test string by its probability under the true grammar when computing aggregate metrics.
-- **Why:** Abudy et al. (2025) compute |D:H| = Σ_string P(string) × (-log2 P(string | model)), i.e. the expected codelength under the true distribution. Our current `evaluate_deterministic_accuracy` treats all strings uniformly.
-- **How for aⁿbⁿ:** string of length n has probability P(n) = p × (1-p)^n where p=0.3. Weight each test string's CE contribution by P(n) / Z where Z normalises over the test range.
-- **Implementation:**
-  - Add `grammar_weights(task, n_values)` function returning a weight vector.
-  - For aⁿbⁿ and aⁿbⁿcⁿ: geometric distribution P(n) = 0.3 × 0.7^n.
-  - For Dyck-1/2, Arithmetic, Toy-English: compute P(string) from the PCFG by multiplying production probabilities along the derivation. This requires tracking the derivation during generation or computing it from the string.
-  - Pass weights to `evaluate_mdl_score`.
+Implemented in `src/mdl/evaluation.py`: `compute_anbn_grammar_weights(max_n, p, min_n=0)` returns raw PCFG weights P(n) = p*(1-p)^n. `compute_grammar_weighted_nll_bits(forward_fn, max_n, p)` computes |D:H|_test = Σ P(n) × NLL_total(n) including n=0. Uses Abudy et al. (2025) smoothing convention (additive 1e-10). Also `compute_train_dh(...)` for raw NLL sum over training corpus, and `compute_optimal_dh_train(...)` for golden's train baseline.
 
 ### 3.D Baseline Comparisons
 
