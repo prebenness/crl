@@ -485,51 +485,61 @@ def _print_metric_legend(mode):
 
 
 def _fmt_epoch_header(epoch, phase, tau, frozen_str=None):
-    """Format the epoch header line."""
-    line = f"--- Epoch {epoch:5d}  [{phase}]  τ={float(tau):.4f} ---"
+    """Format the epoch header line (with leading blank line for separation)."""
+    line = f"\n--- Epoch {epoch:5d}  [{phase}]  τ={float(tau):.4f} ---"
     if frozen_str is not None:
         line += f"  {frozen_str}"
     return line
 
 
 def _fmt_train_line(metrics, complexity_argmax_bits):
-    """Format the training metrics lines (two lines, indented)."""
+    """Format training metrics (two lines, vertically aligned columns).
+
+    Three columns with right-aligned labels so = signs and numbers align:
+      col1: {label:>8}={number:>8}   (J / |H|_disc / acc_soft)
+      col2: {label:>8}={number:>8}   (L_D / |H|_exp / acc_hard)
+      col3: {label:>6}={number:>8}   (λ|H|/N / H(π) / gen_n)
+    4-space gaps between columns, 10-char prefix.
+    """
     return (
-        f"  train  J={float(metrics['objective_total_bits']):10.4f}  "
-        f"L_D={float(metrics['data_nll_bits']):8.4f}  "
-        f"λ|H|/N={float(metrics['reg_net_bits']):10.4f}\n"
-        f"         |H|_disc={int(complexity_argmax_bits)}  "
-        f"|H|_exp={float(metrics['complexity_expected_bits']):.2f}  "
-        f"H(π)={float(metrics['entropy_weights_bits']):.2f}"
+        f"  train   {'J':>8}={float(metrics['objective_total_bits']):8.4f}"
+        f"    {'L_D':>8}={float(metrics['data_nll_bits']):8.4f}"
+        f"    {'λ|H|/N':>6}={float(metrics['reg_net_bits']):8.4f}\n"
+        f"          {'|H|_disc':>8}={int(complexity_argmax_bits):>8}"
+        f"    {'|H|_exp':>8}={float(metrics['complexity_expected_bits']):8.2f}"
+        f"    {'H(π)':>6}={float(metrics['entropy_weights_bits']):8.2f}"
     )
 
 
 def _fmt_train_line_shared(metrics, lan_hyp_bits, shared_disc):
-    """Format training metrics lines for shared-weight mode."""
+    """Format training metrics for shared-weight mode."""
     return (
-        f"  train  J={float(metrics['objective_total_bits']):10.4f}  "
-        f"L_D={float(metrics['data_nll_bits']):8.4f}  "
-        f"λ|H|/N={float(metrics['reg_net_bits']):10.4f}\n"
-        f"         |H|_disc={int(lan_hyp_bits)}  "
-        f"shared={shared_disc['shared_complexity']:.2f} "
-        f"(CE={shared_disc['code_ce']:.2f}+KL={shared_disc['kl_dict']:.2f})  "
-        f"H(π)={float(metrics['entropy_weights_bits']):.2f}  "
-        f"H(φ)={float(metrics['phi_entropy_bits']):.2f}  "
-        f"φ∈[{metrics['phi_min_prob']:.1e},{metrics['phi_max_prob']:.1e}]"
+        f"  train   {'J':>8}={float(metrics['objective_total_bits']):8.4f}"
+        f"    {'L_D':>8}={float(metrics['data_nll_bits']):8.4f}"
+        f"    {'λ|H|/N':>6}={float(metrics['reg_net_bits']):8.4f}\n"
+        f"          {'|H|_disc':>8}={int(lan_hyp_bits):>8}"
+        f"    {'shared':>8}={shared_disc['shared_complexity']:8.2f}"
+        f"  (CE={shared_disc['code_ce']:.2f}+KL={shared_disc['kl_dict']:.2f})"
+        f"    {'H(π)':>6}={float(metrics['entropy_weights_bits']):8.2f}"
+        f"    {'H(φ)':>6}={float(metrics['phi_entropy_bits']):8.2f}"
+        f"    φ∈[{metrics['phi_min_prob']:.1e},{metrics['phi_max_prob']:.1e}]"
     )
 
 
 def _fmt_val_line(n_perfect, n_val, gen_n, complexity_total_bits,
                   soft_acc=None, long_val_suffix="", best_tag=""):
-    """Format a validation summary line."""
-    soft_str = f"acc_soft={soft_acc:.4f}  " if soft_acc is not None else ""
+    """Format a validation summary line (same column grid as train)."""
+    acc_hard_val = f"{n_perfect}/{n_val}"
+    if soft_acc is not None:
+        col1 = f"{'acc_soft':>8}={soft_acc:8.4f}"
+    else:
+        col1 = " " * 17
+    col2 = f"{'acc_hard':>8}={acc_hard_val:>8}"
+    col3 = f"{'gen_n':>6}={gen_n:>8}"
+    extra = f"    |H|={int(complexity_total_bits):>5}"
     return (
-        f"  val    {soft_str}"
-        f"acc_hard={n_perfect}/{n_val}  "
-        f"gen_n={gen_n}  "
-        f"|H|={int(complexity_total_bits)}"
-        f"{long_val_suffix}"
-        f"{best_tag}"
+        f"  val     {col1}    {col2}    {col3}"
+        f"{extra}{long_val_suffix}{best_tag}"
     )
 
 
