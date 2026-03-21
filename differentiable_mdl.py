@@ -496,9 +496,9 @@ def _fmt_train_line(metrics, complexity_argmax_bits):
     """Format training metrics (two lines, vertically aligned columns).
 
     Three columns with right-aligned labels so = signs and numbers align:
-      col1: {label:>8}={number:>8}   (J / |H|_disc / acc_soft)
-      col2: {label:>8}={number:>8}   (L_D / |H|_exp / acc_hard)
-      col3: {label:>6}={number:>8}   (λ|H|/N / H(π) / gen_n)
+      col1: {label:>8}={number:>8}   (J / |H|_disc / acc_hard)
+      col2: {label:>8}={number:>8}   (L_D / |H|_exp / gen_n)
+      col3: {label:>6}={number:>8}   (λ|H|/N / H(π) / |H|)
     4-space gaps between columns, 10-char prefix.
     """
     return (
@@ -527,62 +527,16 @@ def _fmt_train_line_shared(metrics, lan_hyp_bits, shared_disc):
 
 
 def _fmt_val_line(n_perfect, n_val, gen_n, complexity_total_bits,
-                  soft_acc=None, long_val_suffix="", best_tag=""):
+                  long_val_suffix="", best_tag=""):
     """Format a validation summary line (same column grid as train)."""
     acc_hard_val = f"{n_perfect}/{n_val}"
-    if soft_acc is not None:
-        col1 = f"{'acc_soft':>8}={soft_acc:8.4f}"
-    else:
-        col1 = " " * 17
-    col2 = f"{'acc_hard':>8}={acc_hard_val:>8}"
-    col3 = f"{'gen_n':>6}={gen_n:>8}"
-    extra = f"    |H|={int(complexity_total_bits):>5}"
+    col1 = f"{'acc_hard':>8}={acc_hard_val:>8}"
+    col2 = f"{'gen_n':>8}={gen_n:>8}"
+    col3 = f"{'|H|':>6}={int(complexity_total_bits):>8}"
     return (
         f"  val     {col1}    {col2}    {col3}"
-        f"{extra}{long_val_suffix}{best_tag}"
+        f"{long_val_suffix}{best_tag}"
     )
-
-
-def _compute_soft_val_accuracy(apply_fn, params, val_inputs, val_targets, tau):
-    """Compute mean b-phase accuracy using soft-forward (continuous relaxation).
-
-    This gives a smooth training signal: the soft weights interpolate on the
-    grid, so predictions change continuously as the categorical distributions
-    shift, even when the hard argmax doesn't change.
-    """
-    from src.mdl.data import SYMBOL_B
-
-    N = len(val_inputs)
-    if N == 0:
-        return 0.0
-
-    max_len = max(len(s) for s in val_inputs)
-    x_pad = np.zeros((N, max_len), dtype=np.int32)
-    y_pad = np.zeros((N, max_len), dtype=np.int32)
-    det_mask = np.zeros((N, max_len), dtype=np.float32)
-
-    for i, (inp, tgt) in enumerate(zip(val_inputs, val_targets)):
-        L = len(inp)
-        x_pad[i, :L] = inp
-        y_pad[i, :L] = tgt
-        for t in range(L):
-            if inp[t] == SYMBOL_B:
-                det_mask[i, t] = 1.0
-
-    x_jnp = jnp.array(x_pad)
-    y_jnp = jnp.array(y_pad)
-    det_mask_jnp = jnp.array(det_mask)
-
-    logits, _ = apply_fn(
-        {"params": params}, x_jnp, tau=tau,
-        train=True, soft_forward=True,
-    )
-    preds = jnp.argmax(logits, axis=-1)
-    correct = (preds == y_jnp).astype(jnp.float32)
-    n_det = jnp.sum(det_mask_jnp, axis=-1)
-    n_correct = jnp.sum(correct * det_mask_jnp, axis=-1)
-    per_string_acc = jnp.where(n_det > 0, n_correct / n_det, 1.0)
-    return float(jnp.mean(per_string_acc))
 
 
 def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengths,
@@ -605,14 +559,6 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
     gen_n = val_result["gen_n"]
     current_complexity_bits = _compute_discrete_hyp_bits(
         state.params, grid_codelengths,
-    )
-
-    # Soft-forward accuracy (smooth metric).
-    # Use fixed τ=1.0 so soft weights always interpolate meaningfully on the
-    # grid.  At low training τ the softmax is too peaked and soft ≈ hard.
-    soft_acc = _compute_soft_val_accuracy(
-        state.apply_fn, state.params, val_inputs, val_targets,
-        tau=1.0,
     )
 
     n_val = len(val_inputs)
@@ -645,7 +591,6 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
     print(_fmt_val_line(
         n_perfect, n_val, gen_n,
         current_complexity_bits + integer_code_length(hidden_size),
-        soft_acc=soft_acc,
         long_val_suffix=long_val_suffix,
         best_tag=best_tag,
     ))
@@ -741,13 +686,18 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     print(f"  Number of LSTM+output parameters: {state.params['logits'].shape[0]}")
     print(f"  Logit array shape: {state.params['logits'].shape}")
 
-    warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
-    bridge_epochs = _resolve_bridge_epochs(
-        args.bridge_epochs, warmup_epochs, total_epochs,
-    )
+    if args.warmup_only:
+        warmup_epochs = total_epochs
+        bridge_epochs = 0
+        tau_hold_epochs = 0  # anneal tau from epoch 0
+    else:
+        warmup_epochs = args.warmup_epochs
+        bridge_epochs = _resolve_bridge_epochs(
+            args.bridge_epochs, warmup_epochs, total_epochs,
+        )
+        tau_hold_epochs = warmup_epochs + bridge_epochs
     tail_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
-    tau_hold_epochs = warmup_epochs + bridge_epochs
 
     # Create train steps for all phases.
     warmup_train_step = make_train_step(
@@ -773,28 +723,34 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             deterministic_st=True,
         )
 
-    print(
-        f"\n  Phase 1 (warmup): {warmup_epochs} epochs, "
-        f"soft forward (no Gumbel, τ held at {args.tau_start})"
-    )
-    print(
-        f"  Phase 2 (bridge): {bridge_epochs} epochs, "
-        f"deterministic straight-through (τ held at {args.tau_start})"
-    )
-    if args.deterministic_st:
-        print(f"  Phase 3 (tail):   {tail_epochs} epochs, deterministic straight-through")
-    elif args.det_st_after_tau is not None:
+    if args.warmup_only:
         print(
-            "  Phase 3 (tail):   "
-            f"{tail_epochs} epochs, Gumbel ST then deterministic ST when "
-            f"τ<={args.det_st_after_tau}"
+            f"\n  Warmup-only mode: {total_epochs} epochs, "
+            f"soft forward (no Gumbel), τ annealed {args.tau_start} → {args.tau_end}"
         )
     else:
-        print(f"  Phase 3 (tail):   {tail_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(
-        f"  tau: hold at {args.tau_start} through warmup+bridge, "
-        f"then anneal to {args.tau_end}"
-    )
+        print(
+            f"\n  Phase 1 (warmup): {warmup_epochs} epochs, "
+            f"soft forward (no Gumbel, τ held at {args.tau_start})"
+        )
+        print(
+            f"  Phase 2 (bridge): {bridge_epochs} epochs, "
+            f"deterministic straight-through (τ held at {args.tau_start})"
+        )
+        if args.deterministic_st:
+            print(f"  Phase 3 (tail):   {tail_epochs} epochs, deterministic straight-through")
+        elif args.det_st_after_tau is not None:
+            print(
+                "  Phase 3 (tail):   "
+                f"{tail_epochs} epochs, Gumbel ST then deterministic ST when "
+                f"τ<={args.det_st_after_tau}"
+            )
+        else:
+            print(f"  Phase 3 (tail):   {tail_epochs} epochs, {args.n_samples} Gumbel samples")
+        print(
+            f"  tau: hold at {args.tau_start} through warmup+bridge, "
+            f"then anneal to {args.tau_end}"
+        )
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
     _print_metric_legend("basic")
 
@@ -1150,13 +1106,18 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
     p_base = compute_p_base(grid_codelengths)
 
-    warmup_epochs = args.warmup_epochs
     total_epochs = args.epochs
-    bridge_epochs = _resolve_bridge_epochs(
-        args.bridge_epochs, warmup_epochs, total_epochs,
-    )
+    if args.warmup_only:
+        warmup_epochs = total_epochs
+        bridge_epochs = 0
+        tau_hold_epochs = 0
+    else:
+        warmup_epochs = args.warmup_epochs
+        bridge_epochs = _resolve_bridge_epochs(
+            args.bridge_epochs, warmup_epochs, total_epochs,
+        )
+        tau_hold_epochs = warmup_epochs + bridge_epochs
     tail_epochs = max(total_epochs - warmup_epochs - bridge_epochs, 0)
-    tau_hold_epochs = warmup_epochs + bridge_epochs
 
     warmup_train_step = make_shared_train_step(
         args.lambda1, args.lambda2, args.epsilon, n_train=N,
@@ -1184,28 +1145,34 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             deterministic_st=True,
         )
 
-    print(
-        f"\n  Phase 1 (warmup): {warmup_epochs} epochs, "
-        f"soft forward (no Gumbel, τ held at {args.tau_start})"
-    )
-    print(
-        f"  Phase 2 (bridge): {bridge_epochs} epochs, "
-        f"deterministic straight-through (τ held at {args.tau_start})"
-    )
-    if args.deterministic_st:
-        print(f"  Phase 3 (tail):   {tail_epochs} epochs, deterministic straight-through")
-    elif args.det_st_after_tau is not None:
+    if args.warmup_only:
         print(
-            "  Phase 3 (tail):   "
-            f"{tail_epochs} epochs, Gumbel ST then deterministic ST when "
-            f"τ<={args.det_st_after_tau}"
+            f"\n  Warmup-only mode: {total_epochs} epochs, "
+            f"soft forward (no Gumbel), τ annealed {args.tau_start} → {args.tau_end}"
         )
     else:
-        print(f"  Phase 3 (tail):   {tail_epochs} epochs, {args.n_samples} Gumbel samples")
-    print(
-        f"  tau: hold at {args.tau_start} through warmup+bridge, "
-        f"then anneal to {args.tau_end}"
-    )
+        print(
+            f"\n  Phase 1 (warmup): {warmup_epochs} epochs, "
+            f"soft forward (no Gumbel, τ held at {args.tau_start})"
+        )
+        print(
+            f"  Phase 2 (bridge): {bridge_epochs} epochs, "
+            f"deterministic straight-through (τ held at {args.tau_start})"
+        )
+        if args.deterministic_st:
+            print(f"  Phase 3 (tail):   {tail_epochs} epochs, deterministic straight-through")
+        elif args.det_st_after_tau is not None:
+            print(
+                "  Phase 3 (tail):   "
+                f"{tail_epochs} epochs, Gumbel ST then deterministic ST when "
+                f"τ<={args.det_st_after_tau}"
+            )
+        else:
+            print(f"  Phase 3 (tail):   {tail_epochs} epochs, {args.n_samples} Gumbel samples")
+        print(
+            f"  tau: hold at {args.tau_start} through warmup+bridge, "
+            f"then anneal to {args.tau_end}"
+        )
     print(f"  lr={args.lr}, lambda1={args.lambda1}, lambda2={args.lambda2}, "
           f"eps={args.epsilon}, batch_size={bs}")
     _print_metric_legend("shared")
@@ -1299,11 +1266,6 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 long_val_probe = _evaluate_long_val_probes(
                     model_params, grid, grid_values, long_val_probe_ns,
                 )
-            # Soft-forward accuracy (smooth metric, fixed τ=1.0)
-            soft_acc = _compute_soft_val_accuracy(
-                state.apply_fn, model_params, val_inputs, val_targets,
-                tau=1.0,
-            )
             is_best = _should_update_best(
                 n_perfect,
                 gen_n,
@@ -1324,7 +1286,6 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             lan_total = current_complexity_bits + integer_code_length(args.hidden_size)
             print(_fmt_val_line(
                 n_perfect, n_val, gen_n, lan_total,
-                soft_acc=soft_acc,
                 long_val_suffix=long_val_suffix,
                 best_tag=best_tag,
             ))
@@ -1433,6 +1394,9 @@ def _build_arg_parser(defaults=None):
                              "(0 = legacy noise-only, >0 = bias toward simple rationals)")
     parser.add_argument("--warmup_epochs", type=int, default=500,
                         help="Soft warmup epochs before switching to ST")
+    parser.add_argument("--warmup_only", action="store_true", default=False,
+                        help="Run entire training in warmup mode (soft forward) "
+                             "with tau annealing from tau_start to tau_end")
     parser.add_argument("--bridge_epochs", type=int, default=None,
                         help="Deterministic ST bridge epochs after warmup "
                              "(default: ceil(0.1 * warmup_epochs), min 1 when warmup > 0; pass 0 to disable)")
