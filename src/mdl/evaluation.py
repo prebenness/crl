@@ -60,6 +60,7 @@ def compute_per_string_nll_bits(
     targets,
     batch_size: int = 64,
     smoothing: float = 1e-10,
+    verbose: bool = False,
 ) -> np.ndarray:
     """Compute total NLL in bits per string (sum over positions).
 
@@ -72,12 +73,17 @@ def compute_per_string_nll_bits(
         targets: list of variable-length int lists (target sequences).
         batch_size: strings per batch for padded evaluation.
         smoothing: additive constant for probability smoothing.
+        verbose: if True, print batch progress.
 
     Returns:
         (N,) float64 array of per-string total NLL in bits.
     """
+    import time as _time
+
     N = len(inputs)
     nll_per_string = np.zeros(N, dtype=np.float64)
+    n_batches = (N + batch_size - 1) // batch_size
+    t0 = _time.monotonic() if verbose else None
 
     for batch_start in range(0, N, batch_size):
         batch_end = min(batch_start + batch_size, N)
@@ -114,6 +120,19 @@ def compute_per_string_nll_bits(
         per_string = jnp.sum(nll_bits * mask_jnp, axis=-1)  # (B,)
         nll_per_string[batch_start:batch_end] = np.array(per_string)
 
+        if verbose:
+            batch_idx = batch_start // batch_size + 1
+            report_interval = max(1, n_batches // 5)
+            if batch_idx % report_interval == 0 or batch_idx == n_batches:
+                elapsed = _time.monotonic() - t0
+                eta = elapsed / batch_idx * (n_batches - batch_idx)
+                print(
+                    f"    batch {batch_idx}/{n_batches} "
+                    f"(max_len={max_len}, "
+                    f"elapsed={elapsed:.0f}s, ETA={eta:.0f}s)",
+                    flush=True,
+                )
+
     return nll_per_string
 
 
@@ -126,6 +145,7 @@ def compute_grammar_weighted_nll_bits(
     max_n: int,
     p: float = 0.3,
     batch_size: int = 64,
+    verbose: bool = False,
 ) -> dict:
     """Grammar-weighted |D:H| data term on the exhaustive test set.
 
@@ -142,10 +162,13 @@ def compute_grammar_weighted_nll_bits(
         max_n: largest n in the test set.
         p: PCFG termination probability.
         batch_size: strings per batch.
+        verbose: if True, print batch progress.
 
     Returns:
         dict with data_dh_bits, nll_per_string, grammar_weights, max_n.
     """
+    if verbose:
+        print(f"  Computing grammar-weighted |D:H|_test (n=1..{max_n})...")
     test_inputs = []
     test_targets = []
     for n in range(1, max_n + 1):
@@ -157,6 +180,7 @@ def compute_grammar_weighted_nll_bits(
 
     nll_per_string = compute_per_string_nll_bits(
         forward_fn, test_inputs, test_targets, batch_size=batch_size,
+        verbose=verbose,
     )
 
     data_dh = float(np.sum(weights * nll_per_string))
@@ -178,6 +202,7 @@ def compute_train_dh(
     train_inputs,
     train_targets,
     batch_size: int = 64,
+    verbose: bool = False,
 ) -> dict:
     """Compute train |D:H| as raw NLL sum over training strings.
 
@@ -189,12 +214,14 @@ def compute_train_dh(
         train_inputs: list of input sequences from the training set.
         train_targets: list of target sequences from the training set.
         batch_size: strings per batch.
+        verbose: if True, print batch progress.
 
     Returns:
         dict with train_dh_data_bits, nll_per_string, n_strings.
     """
     nll_per_string = compute_per_string_nll_bits(
         forward_fn, train_inputs, train_targets, batch_size=batch_size,
+        verbose=verbose,
     )
     total_nll = float(np.sum(nll_per_string))
 
@@ -213,6 +240,7 @@ def compute_optimal_dh_test(
     max_n: int,
     p: float = 0.3,
     batch_size: int = 64,
+    verbose: bool = False,
 ) -> dict:
     """Golden network's test |D:H| and |H|.
 
@@ -222,6 +250,7 @@ def compute_optimal_dh_test(
         max_n: largest n in the test set.
         p: PCFG termination probability.
         batch_size: strings per batch.
+        verbose: if True, print batch progress.
 
     Returns:
         dict with data_dh_bits, h_bits, mdl_score.
@@ -237,6 +266,7 @@ def compute_optimal_dh_test(
 
     data_result = compute_grammar_weighted_nll_bits(
         golden_fwd, max_n=max_n, p=p, batch_size=batch_size,
+        verbose=verbose,
     )
 
     mdl_score = golden_mdl_score(p=p)
@@ -253,6 +283,7 @@ def compute_optimal_dh_train(
     train_targets,
     p: float = 0.3,
     batch_size: int = 64,
+    verbose: bool = False,
 ) -> dict:
     """Golden network's train |D:H| data term.
 
@@ -263,6 +294,7 @@ def compute_optimal_dh_train(
         train_targets: list of target sequences from the training set.
         p: PCFG termination probability.
         batch_size: strings per batch.
+        verbose: if True, print batch progress.
 
     Returns:
         dict with train_dh_data_bits.
@@ -276,6 +308,7 @@ def compute_optimal_dh_train(
 
     return compute_train_dh(
         golden_fwd, train_inputs, train_targets, batch_size=batch_size,
+        verbose=verbose,
     )
 
 

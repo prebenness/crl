@@ -597,6 +597,7 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
         best['long_val_passes'] = long_val_probe["passed_count"]
         best['complexity_bits'] = current_complexity_bits
         best['params'] = jax.tree.map(lambda x: x.copy(), state.params)
+        best['epoch'] = epoch + 1
         if run_dir is not None:
             save_checkpoint(best['params'], checkpoint_path(run_dir, "best.npz"))
             save_checkpoint_meta(
@@ -745,6 +746,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         'long_val_passes': -1,
         'complexity_bits': math.inf,
         'params': None,
+        'epoch': 0,
     }
     long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
     prev_phase_name = None
@@ -1000,7 +1002,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
         print(f"  [CKPT] Final checkpoint saved")
 
-    return state, best['params'], best['n_perfect']
+    return state, best['params'], best['n_perfect'], best['epoch']
 
 
 def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,
@@ -1804,8 +1806,9 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         state = state.replace(params=loaded_params)
         best_params = loaded_params
         best_val_n_perfect = None
+        best_epoch = None
     elif args.mode == "basic":
-        state, best_params, best_val_n_perfect = run_training_basic(
+        state, best_params, best_val_n_perfect, best_epoch = run_training_basic(
             args, model, grid_values, grid_codelengths,
             x_train, y_train, mask_train,
             val_inputs, val_targets, rng, grid,
@@ -1820,6 +1823,7 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
             run_dir=run_dir, start_epoch=start_epoch,
             init_params=loaded_params,
         )
+        best_epoch = None
 
     if not args.eval and run_dir is not None:
         save_checkpoint_meta(run_dir, args.epochs, best_val_n_perfect or 0)
@@ -1831,6 +1835,7 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         test_inputs, test_targets,
         train_inputs, train_targets,
         golden_mdl, golden_result,
+        best_epoch=best_epoch,
     )
     if run_dir is not None:
         save_results(run_dir, metrics)
@@ -1841,7 +1846,8 @@ def run_final_evaluation(args, state, best_params,
                          grid, grid_values, grid_codelengths,
                          test_inputs, test_targets,
                          train_inputs, train_targets,
-                         golden_mdl, golden_result):
+                         golden_mdl, golden_result,
+                         best_epoch=None):
     """Run final test evaluation and print the comparison table.
 
     For test_max_n > 10000, uses efficient float64 simulation instead of
@@ -1851,6 +1857,8 @@ def run_final_evaluation(args, state, best_params,
     """
     print("\n" + "=" * 70)
     print("FINAL EVALUATION")
+    if best_params is not None and best_epoch is not None:
+        print(f"  (using best checkpoint from epoch {best_epoch})")
     print("=" * 70)
 
     eval_params = best_params if best_params is not None else state.params
@@ -1939,7 +1947,6 @@ def run_final_evaluation(args, state, best_params,
     print("-" * 70)
     print(f"{'Lan et al. golden':<30} {golden_mdl['total_bits']:>10d} {golden_gen_n:>8d} "
           f"{golden_n_perfect:>10d}/{test_max_n}")
-    print(f"{'Lan et al. backprop (reported)':<30} {'---':>10} {'---':>8} {'---':>16}")
     print(f"{'Trivial (always-b)':<30} {trivial_mdl:>10d} {0:>8d} "
           f"{0:>10d}/{test_max_n}")
     mode_name = "Ours (basic MDL)" if args.mode == "basic" else "Ours (shared MDL)"
@@ -1953,14 +1960,15 @@ def run_final_evaluation(args, state, best_params,
     print("=" * 70)
 
     # Golden baselines
+    print("  Evaluating golden baselines...")
     golden_opt_test = compute_optimal_dh_test(
-        max_n=test_max_n, p=args.p, batch_size=64,
+        max_n=test_max_n, p=args.p, batch_size=64, verbose=True,
     )
     print(f"  Golden test |D:H|: {golden_opt_test['data_dh_bits']:.4f} bits")
     print(f"  Golden |H| (LSTM): {golden_opt_test['h_bits']} bits")
 
     golden_opt_train = compute_optimal_dh_train(
-        train_inputs, train_targets, p=args.p, batch_size=64,
+        train_inputs, train_targets, p=args.p, batch_size=64, verbose=True,
     )
     print(f"  Golden train |D:H|: {golden_opt_train['train_dh_data_bits']:.2f} bits")
 
@@ -1971,13 +1979,16 @@ def run_final_evaluation(args, state, best_params,
         )
         return logits_out
 
+    print("  Evaluating trained network...")
     our_test_result = compute_grammar_weighted_nll_bits(
         our_discrete_fwd, max_n=test_max_n, p=args.p, batch_size=64,
+        verbose=True,
     )
     our_test_data_dh = our_test_result["data_dh_bits"]
 
     our_train_result = compute_train_dh(
         our_discrete_fwd, train_inputs, train_targets, batch_size=64,
+        verbose=True,
     )
     our_train_data_dh = our_train_result["train_dh_data_bits"]
 
