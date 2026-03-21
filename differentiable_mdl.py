@@ -484,55 +484,95 @@ def _print_metric_legend(mode):
         print(_METRIC_LEGEND_BASIC)
 
 
-def _fmt_epoch_line(epoch, phase, metrics, complexity_argmax_bits, tau,
-                    frozen_str=None):
-    """Format a single epoch log line using paper notation.
-
-    Returns a string like:
-      Epoch   200 [warm] τ=1.00 | J=0.8  L_D=1.6  λ|H|/N=-0.8 | |H|_disc=1508  |H|_exp=1502  H(π)=754
-    """
-    parts = [
-        f"Epoch {epoch:5d} [{phase:4s}] τ={float(tau):.4f}",
-        f"J={float(metrics['objective_total_bits']):8.1f}  "
-        f"L_D={float(metrics['data_nll_bits']):6.2f}  "
-        f"λ|H|/N={float(metrics['reg_net_bits']):7.1f}",
-        f"|H|_disc={int(complexity_argmax_bits):4d}  "
-        f"|H|_exp={float(metrics['complexity_expected_bits']):7.1f}  "
-        f"H(π)={float(metrics['entropy_weights_bits']):6.1f}",
-    ]
-    line = " | ".join(parts)
+def _fmt_epoch_header(epoch, phase, tau, frozen_str=None):
+    """Format the epoch header line."""
+    line = f"--- Epoch {epoch:5d}  [{phase}]  τ={float(tau):.4f} ---"
     if frozen_str is not None:
         line += f"  {frozen_str}"
     return line
 
 
-def _fmt_epoch_line_shared(epoch, phase, metrics, lan_hyp_bits, shared_disc,
-                           tau):
-    """Format epoch log line for shared-weight mode."""
+def _fmt_train_line(metrics, complexity_argmax_bits):
+    """Format the training metrics lines (two lines, indented)."""
     return (
-        f"Epoch {epoch:5d} [{phase:4s}] τ={float(tau):.4f} | "
-        f"J={float(metrics['objective_total_bits']):8.1f}  "
-        f"L_D={float(metrics['data_nll_bits']):6.2f}  "
-        f"λ|H|/N={float(metrics['reg_net_bits']):7.1f} | "
-        f"|H|_disc={int(lan_hyp_bits):4d}  "
-        f"shared={shared_disc['shared_complexity']:.1f} "
-        f"(CE={shared_disc['code_ce']:.1f}+KL={shared_disc['kl_dict']:.1f})  "
-        f"H(π)={float(metrics['entropy_weights_bits']):6.1f}  "
-        f"H(φ)={float(metrics['phi_entropy_bits']):.1f}  "
+        f"  train  J={float(metrics['objective_total_bits']):10.4f}  "
+        f"L_D={float(metrics['data_nll_bits']):8.4f}  "
+        f"λ|H|/N={float(metrics['reg_net_bits']):10.4f}\n"
+        f"         |H|_disc={int(complexity_argmax_bits)}  "
+        f"|H|_exp={float(metrics['complexity_expected_bits']):.2f}  "
+        f"H(π)={float(metrics['entropy_weights_bits']):.2f}"
+    )
+
+
+def _fmt_train_line_shared(metrics, lan_hyp_bits, shared_disc):
+    """Format training metrics lines for shared-weight mode."""
+    return (
+        f"  train  J={float(metrics['objective_total_bits']):10.4f}  "
+        f"L_D={float(metrics['data_nll_bits']):8.4f}  "
+        f"λ|H|/N={float(metrics['reg_net_bits']):10.4f}\n"
+        f"         |H|_disc={int(lan_hyp_bits)}  "
+        f"shared={shared_disc['shared_complexity']:.2f} "
+        f"(CE={shared_disc['code_ce']:.2f}+KL={shared_disc['kl_dict']:.2f})  "
+        f"H(π)={float(metrics['entropy_weights_bits']):.2f}  "
+        f"H(φ)={float(metrics['phi_entropy_bits']):.2f}  "
         f"φ∈[{metrics['phi_min_prob']:.1e},{metrics['phi_max_prob']:.1e}]"
     )
 
 
-def _fmt_val_line(val_summary, val_sym, n_perfect, n_val,
-                  complexity_total_bits, long_val_suffix="", best_tag=""):
+def _fmt_val_line(n_perfect, n_val, gen_n, complexity_total_bits,
+                  soft_acc=None, long_val_suffix="", best_tag=""):
     """Format a validation summary line."""
+    soft_str = f"acc_soft={soft_acc:.4f}  " if soft_acc is not None else ""
     return (
-        f"  ↳ val: {val_summary['val_desc']} {val_sym}  "
-        f"({n_perfect}/{n_val} perfect, "
-        f"|H|={int(complexity_total_bits)}b"
-        f"{long_val_suffix})"
+        f"  val    {soft_str}"
+        f"acc_hard={n_perfect}/{n_val}  "
+        f"gen_n={gen_n}  "
+        f"|H|={int(complexity_total_bits)}"
+        f"{long_val_suffix}"
         f"{best_tag}"
     )
+
+
+def _compute_soft_val_accuracy(apply_fn, params, val_inputs, val_targets, tau):
+    """Compute mean b-phase accuracy using soft-forward (continuous relaxation).
+
+    This gives a smooth training signal: the soft weights interpolate on the
+    grid, so predictions change continuously as the categorical distributions
+    shift, even when the hard argmax doesn't change.
+    """
+    from src.mdl.data import SYMBOL_B
+
+    N = len(val_inputs)
+    if N == 0:
+        return 0.0
+
+    max_len = max(len(s) for s in val_inputs)
+    x_pad = np.zeros((N, max_len), dtype=np.int32)
+    y_pad = np.zeros((N, max_len), dtype=np.int32)
+    det_mask = np.zeros((N, max_len), dtype=np.float32)
+
+    for i, (inp, tgt) in enumerate(zip(val_inputs, val_targets)):
+        L = len(inp)
+        x_pad[i, :L] = inp
+        y_pad[i, :L] = tgt
+        for t in range(L):
+            if inp[t] == SYMBOL_B:
+                det_mask[i, t] = 1.0
+
+    x_jnp = jnp.array(x_pad)
+    y_jnp = jnp.array(y_pad)
+    det_mask_jnp = jnp.array(det_mask)
+
+    logits, _ = apply_fn(
+        {"params": params}, x_jnp, tau=tau,
+        train=True, soft_forward=True,
+    )
+    preds = jnp.argmax(logits, axis=-1)
+    correct = (preds == y_jnp).astype(jnp.float32)
+    n_det = jnp.sum(det_mask_jnp, axis=-1)
+    n_correct = jnp.sum(correct * det_mask_jnp, axis=-1)
+    per_string_acc = jnp.where(n_det > 0, n_correct / n_det, 1.0)
+    return float(jnp.mean(per_string_acc))
 
 
 def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengths,
@@ -556,9 +596,14 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
     current_complexity_bits = _compute_discrete_hyp_bits(
         state.params, grid_codelengths,
     )
-    val_summary = _format_val_summary(val_result, val_inputs)
-    n_val = val_summary["n_val"]
-    fail_abs_n = val_summary["fail_abs_n"]
+
+    # Soft-forward accuracy (smooth metric)
+    soft_acc = _compute_soft_val_accuracy(
+        state.apply_fn, state.params, val_inputs, val_targets,
+        tau=float(state.tau),
+    )
+
+    n_val = len(val_inputs)
     long_val_probe = {
         "passed_count": 0,
         "all_passed": True,
@@ -568,7 +613,6 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
         long_val_probe = _evaluate_long_val_probes(
             state.params, grid, grid_values, long_val_probe_ns,
         )
-    val_sym = "✓" if fail_abs_n is None else f"✗ (fails@{fail_abs_n})"
     is_best = _should_update_best(
         n_perfect,
         gen_n,
@@ -583,13 +627,15 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
     long_val_suffix = ""
     if long_val_probe_ns:
         if n_perfect == n_val:
-            long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
+            long_val_suffix = f"  long_n=[{long_val_probe['summary']}]"
         else:
-            long_val_suffix = ", long_n=[skipped]"
+            long_val_suffix = "  long_n=[skipped]"
     print(_fmt_val_line(
-        val_summary, val_sym, n_perfect, n_val,
+        n_perfect, n_val, gen_n,
         current_complexity_bits + integer_code_length(hidden_size),
-        long_val_suffix, best_tag,
+        soft_acc=soft_acc,
+        long_val_suffix=long_val_suffix,
+        best_tag=best_tag,
     ))
     if is_best:
         best['n_perfect'] = n_perfect
@@ -839,11 +885,11 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                     complexity_argmax_bits = _compute_discrete_hyp_bits(
                         state.params, grid_codelengths,
                     )
-                    print(_fmt_epoch_line(
-                        ep + 1, f"S{stage_idx+1}", metrics,
-                        complexity_argmax_bits, tau_level,
+                    print(_fmt_epoch_header(
+                        ep + 1, f"S{stage_idx+1}", tau_level,
                         frozen_str=f"frozen={n_frozen}/{n_params}",
                     ))
+                    print(_fmt_train_line(metrics, complexity_argmax_bits))
 
                 if (ep + 1) % args.eval_every == 0:
                     best = _eval_and_update_best(
@@ -925,10 +971,8 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 complexity_argmax_bits = _compute_discrete_hyp_bits(
                     state.params, grid_codelengths,
                 )
-                print(_fmt_epoch_line(
-                    last_epoch + 1, phase_name, metrics,
-                    complexity_argmax_bits, last_tau,
-                ))
+                print(_fmt_epoch_header(last_epoch + 1, phase_name, last_tau))
+                print(_fmt_train_line(metrics, complexity_argmax_bits))
 
             if (last_epoch + 1) % args.eval_every == 0:
                 best = _eval_and_update_best(
@@ -981,10 +1025,8 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 complexity_argmax_bits = _compute_discrete_hyp_bits(
                     state.params, grid_codelengths,
                 )
-                print(_fmt_epoch_line(
-                    epoch + 1, phase_name, metrics,
-                    complexity_argmax_bits, tau,
-                ))
+                print(_fmt_epoch_header(epoch + 1, phase_name, tau))
+                print(_fmt_train_line(metrics, complexity_argmax_bits))
 
             if (epoch + 1) % args.eval_every == 0:
                 best = _eval_and_update_best(
@@ -1216,10 +1258,8 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 state.params, grid_codelengths, p_base,
                 args.lambda1, args.lambda2, args.epsilon,
             )
-            print(_fmt_epoch_line_shared(
-                epoch + 1, phase_name, metrics,
-                lan_hyp_bits, shared_disc, tau,
-            ))
+            print(_fmt_epoch_header(epoch + 1, phase_name, tau))
+            print(_fmt_train_line_shared(metrics, lan_hyp_bits, shared_disc))
 
         if (epoch + 1) % args.eval_every == 0:
             model_params = {"logits": state.params["logits"]}
@@ -1232,13 +1272,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             current_complexity_bits = _compute_discrete_hyp_bits(
                 model_params, grid_codelengths,
             )
-            val_shared_disc = _compute_shared_discrete_complexity_bits(
-                state.params, grid_codelengths, p_base,
-                args.lambda1, args.lambda2, args.epsilon,
-            )
-            val_summary = _format_val_summary(val_result, val_inputs)
-            n_val = val_summary["n_val"]
-            fail_abs_n = val_summary["fail_abs_n"]
+            n_val = len(val_inputs)
             long_val_probe = {
                 "passed_count": 0,
                 "all_passed": True,
@@ -1248,7 +1282,11 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 long_val_probe = _evaluate_long_val_probes(
                     model_params, grid, grid_values, long_val_probe_ns,
                 )
-            val_sym = "✓" if fail_abs_n is None else f"✗ (fails@{fail_abs_n})"
+            # Soft-forward accuracy (smooth metric)
+            soft_acc = _compute_soft_val_accuracy(
+                state.apply_fn, model_params, val_inputs, val_targets,
+                tau=float(state.tau),
+            )
             is_best = _should_update_best(
                 n_perfect,
                 gen_n,
@@ -1263,18 +1301,16 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
             long_val_suffix = ""
             if long_val_probe_ns:
                 if n_perfect == n_val:
-                    long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
+                    long_val_suffix = f"  long_n=[{long_val_probe['summary']}]"
                 else:
-                    long_val_suffix = ", long_n=[skipped]"
+                    long_val_suffix = "  long_n=[skipped]"
             lan_total = current_complexity_bits + integer_code_length(args.hidden_size)
-            print(
-                f"  ↳ val: {val_summary['val_desc']} {val_sym}  "
-                f"({n_perfect}/{n_val} perfect, "
-                f"|H|_Lan={int(lan_total)}b, "
-                f"shared={val_shared_disc['shared_complexity']:.1f}b"
-                f"{long_val_suffix})"
-                f"{best_tag}"
-            )
+            print(_fmt_val_line(
+                n_perfect, n_val, gen_n, lan_total,
+                soft_acc=soft_acc,
+                long_val_suffix=long_val_suffix,
+                best_tag=best_tag,
+            ))
             if is_best:
                 best_val_n_perfect = n_perfect
                 best_val_gen_n = gen_n
