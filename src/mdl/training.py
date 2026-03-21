@@ -203,8 +203,9 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
 def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
                     soft_forward: bool = False,
-                    deterministic_st: bool = False):
-    """Create a JIT-compiled training step.
+                    deterministic_st: bool = False,
+                    jit: bool = True):
+    """Create a training step function.
 
     Args:
         mdl_lambda: MDL trade-off parameter
@@ -212,13 +213,14 @@ def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
         n_samples: Gumbel samples for variance reduction (ST phase)
         soft_forward: use continuous relaxation (warmup phase)
         deterministic_st: deterministic straight-through bridge phase
+        jit: if True (default), wrap with @jax.jit. Set False for use
+            inside lax.scan where the outer scan is already JIT'd.
     """
     loss_fn = make_loss_fn(
         mdl_lambda, n_train=n_train, n_samples=n_samples,
         soft_forward=soft_forward, deterministic_st=deterministic_st,
     )
 
-    @jax.jit
     def train_step(state, x, y, mask, rng):
         def _loss(params):
             return loss_fn(
@@ -231,7 +233,52 @@ def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
         state = state.apply_gradients(grads=grads)
         return state, loss, aux
 
-    return train_step
+    return jax.jit(train_step) if jit else train_step
+
+
+def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
+                        total_epochs, tau_hold_epochs, tau_start, tau_end):
+    """Create a JIT'd function that fuses N full-batch epochs via lax.scan.
+
+    Eliminates Python-loop dispatch overhead by running multiple training
+    steps entirely within XLA.  Only valid for full-batch training (bs >= N).
+
+    Args:
+        train_step_nojit: train_step function without @jax.jit (jit=False)
+        x_train, y_train, mask_train: full training data arrays
+        total_epochs, tau_hold_epochs: for tau schedule
+        tau_start, tau_end: temperature range
+
+    Returns:
+        run_fused(state, rng, start_epoch, n_steps) -> (state, rng, last_metrics)
+        n_steps is static (recompiles per distinct value); start_epoch is dynamic.
+    """
+    _total = total_epochs
+    _hold = tau_hold_epochs
+    _ts = float(tau_start)
+    _te = float(tau_end)
+
+    def _run(state, rng, start_epoch, n_steps):
+        def body(carry, step_idx):
+            st, rn = carry
+            ep = start_epoch + step_idx
+            tau = anneal_tau_traceable(
+                ep, _total, _hold, jnp.float32(_ts), jnp.float32(_te),
+            )
+            st = st.replace(tau=tau)
+            rn, step_rng = jrandom.split(rn)
+            st, _, aux = train_step_nojit(
+                st, x_train, y_train, mask_train, step_rng,
+            )
+            return (st, rn), aux
+
+        (state, rng), stacked_aux = jax.lax.scan(
+            body, (state, rng), jnp.arange(n_steps),
+        )
+        last_aux = jax.tree.map(lambda x: x[-1], stacked_aux)
+        return state, rng, last_aux
+
+    return jax.jit(_run, static_argnums=(3,))
 
 
 def deterministic_accuracy_single(
@@ -380,3 +427,17 @@ def anneal_tau_st_phase(epoch, total_epochs, warmup_epochs, tau_start, tau_end):
     st_epoch = epoch - warmup_epochs
     st_total = max(total_epochs - warmup_epochs, 1)
     return anneal_tau(st_epoch, st_total, tau_start, tau_end)
+
+
+def anneal_tau_traceable(epoch, total_epochs, tau_hold_epochs, tau_start, tau_end):
+    """JAX-traceable tau annealing for use inside lax.scan/fori_loop.
+
+    Equivalent to anneal_tau_st_phase but uses jnp.where instead of Python if,
+    making it safe to use inside JAX-traced control flow.
+    """
+    st_epoch = jnp.maximum(epoch - tau_hold_epochs, 0)
+    st_total = jnp.maximum(total_epochs - tau_hold_epochs, 1)
+    progress = st_epoch / st_total
+    log_tau = jnp.log(tau_start) + progress * (jnp.log(tau_end) - jnp.log(tau_start))
+    annealed = jnp.exp(log_tau)
+    return jnp.where(epoch < tau_hold_epochs, tau_start, annealed)
