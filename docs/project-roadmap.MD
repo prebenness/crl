@@ -1,10 +1,14 @@
 # Project Roadmap
 
-Consolidated from `code-cleanup-todos.MD`, `research-roadmap.MD`, and `experiment-and-metrics-roadmap.MD`. Updated 2026-03-20.
+Consolidated from `code-cleanup-todos.MD`, `research-roadmap.MD`, and `experiment-and-metrics-roadmap.MD`. Updated 2026-03-21.
 
 **Reference papers:**
 - Lan et al. (2024), "MDL Regularization of LSTM Language Models for Formal Language Learning", ACL 2024: `agent-context/arxiv/arXiv-2402.10013v2_contents/main-acl.tex`
 - Abudy et al. (2025), "Learning Formal Languages with Small RNNs Using MDL Regularization", NeurIPS 2025 submission: `agent-context/arxiv/arXiv-2505.13398v2_contents/main.tex`
+- Lan, Chemla & Katzir (2022), "Minimum description length recurrent neural networks", TACL 10:785–799: `agent-context/arxiv/arXiv-2111.00600v4_contents/main-3649-Lan.tex`
+- Weiss, Goldberg & Yahav (2018), "On the Practical Computational Power of Finite Precision RNNs for Language Recognition", ACL 2018 Short: `agent-context/arxiv/arXiv-1805.04908v1_contents/`
+
+**Fair comparison analysis:** `docs/comparisons.md` — detailed comparison targets, golden network discrepancies, threats to validity, and implementation tasks for apples-to-apples reporting.
 
 ---
 
@@ -24,6 +28,14 @@ Implemented `lax.scan`-based epoch fusion in `src/mdl/training.py`. For full-bat
 
 Training keeps `log_softmax` (optax, numerically stable). New `compute_data_nll_bits_smoothed` in `src/mdl/training.py` applies Abudy et al. (2025) convention (additive 1e-10, no re-normalization) for |D:H| evaluation. 3 tests added in `test_mdl.py`.
 
+### ~~1.4 Fix n=0 inclusion in grammar-weighted test evaluation~~ — Done (2026-03-21)
+
+Changed `compute_anbn_grammar_weights` default `min_n` from 0 to 1 and `compute_grammar_weighted_nll_bits` loop from `range(0, ...)` to `range(1, ...)`, matching Abudy et al. (2025) n≥1 convention. Updated all tests with new expected values (weights sum to 0.7, analytical |D:H| ≈ 2.42).
+
+### ~~1.5 Verify smoothing consistency between training and evaluation on golden network~~ — Done (2026-03-21)
+
+Already correct by construction: training uses optax log_softmax (numerically stable optimizer path), all reported metrics go through `compute_per_string_nll_bits` / `compute_data_nll_bits_smoothed` with additive 1e-10 matching Abudy et al. (2025). No code change needed.
+
 ---
 
 ## Section 2: Experiments
@@ -39,11 +51,13 @@ Achievable by running existing code — parameter sweeps, resumed runs, hyperpar
 
 - Once the new transition is validated, run the strongest schedule across multiple seeds.
 - Quantify mean/std for `gen_n` and `total_mdl_bits`.
+- **Seed count (ref: `docs/comparisons.md` §6.8):** Single seed suffices for Abudy-comparable experiments (they ran seed=100 only). For FLaRe/Deletang-comparable claims or any assertion of consistent improvement, need ≥5 seeds with mean ± std (FLaRe uses 10 seeds × 4 loss variants; Deletang et al. (2023) uses 10 seeds).
 
 ### 2.3 Transition and regularization ablations
 
 - Sweep `mdl_lambda`, grid size, warmup duration, bridge duration, annealing schedule, and `n_samples`.
 - Main goal: reduce the threat to validity from the current narrow good-`lambda` region.
+- **LR ablation (ref: `docs/comparisons.md` §6.3):** Our lr=0.05 is 500× Abudy et al. (2025) Exp 3 (lr=1e-4) and 50× Lan et al. (2024) (lr=0.001). Defensible because we optimize categorical logits, but a reviewer will check. Run ablation over lr ∈ {0.001, 0.01, 0.05, 0.1} to show results are not cherry-picked.
 
 ### 2.4 Shared-MDL validation
 
@@ -71,10 +85,9 @@ Items requiring new code, new experimental infrastructure, or new research direc
 - Peak-vs-final behaviour is a bottleneck. Save and select best outer checkpoints during training.
 - Add group-balanced and worst-group metrics for `cmnist_ula`.
 
-#### Staged temperature annealing with discretization checkpoints — P2 (L — 1+ day)
+#### ~~Staged temperature annealing with discretization checkpoints~~ — Done (2026-03-21)
 
-- Source: quantization session log (Change 3, ~150 lines across 6 files).
-- Fixed-temperature stages with freeze masks for converged weights. Gated by `anneal_mode: "staged"` config.
+Implemented in `src/mdl/training.py` and `differentiable_mdl.py`. Extended `MDLTrainState` with `freeze_mask` (n_params,) float32. New functions: `compute_confidence_mask`, `freeze_confident_weights` (one-hot × 100 logits), `apply_freeze_mask_to_grads` (gradient masking). `make_train_step` gains `use_freeze_mask` parameter. CLI args: `--anneal_mode staged`, `--staged_tau_levels`, `--staged_epoch_fracs`, `--freeze_threshold`. Tests in `tests/test_staged_annealing.py`.
 
 #### DiffQ-style continuous relaxation for cMNIST — P2 (L — 1+ day)
 
@@ -242,11 +255,46 @@ Implemented in `src/mdl/evaluation.py`: `evaluate_golden_under_regularisers(max_
 
 Implemented in `src/mdl/evaluation.py`: `compute_anbn_grammar_weights(max_n, p, min_n=0)` returns raw PCFG weights P(n) = p*(1-p)^n. `compute_grammar_weighted_nll_bits(forward_fn, max_n, p)` computes |D:H|_test = Σ P(n) × NLL_total(n) including n=0. Uses Abudy et al. (2025) smoothing convention (additive 1e-10). Also `compute_train_dh(...)` for raw NLL sum over training corpus, and `compute_optimal_dh_train(...)` for golden's train baseline.
 
+#### ~~Recognition accuracy (FLaRe / Deletang comparison)~~ — Done (2026-03-21)
+
+Implemented in `src/mdl/evaluation.py`: `compute_full_string_accuracy` (per-string boolean, batched with padding), `generate_negative_anbn` (4 types: wrong counts, interleaved, single-symbol, random), `compute_recognition_accuracy` (returns accuracy, tp_rate, tn_rate). Tests in `tests/test_evaluation.py::TestRecognitionAccuracy`. Note: golden LM gets 0% on valid strings (memoryless PCFG predicts P(a)=0.7 at a→b transition).
+
 ### 3.D Baseline Comparisons
 
 #### ~~Standard LSTM baselines (no-reg, L1, L2)~~ — Metrics integrated (2026-03-21)
 
 Baseline experiment script (`scripts/experiments/baseline_lstm_experiments.py`) now computes grammar-weighted |D:H|_test, |D:H|_train, and Δ% using `src/mdl/evaluation.py`. Output includes Abudy et al. (2025)-style comparison table via `format_abudy_comparison_table`. Results saved to `results.json` with full metric breakdown. Long production runs (1000+ epochs, multi-seed) deferred.
+
+#### Verify LSTM golden |H| decomposition against Lan et al. (2024)
+
+**Ref:** `docs/comparisons.md` §7.1.
+
+Lan et al. (2024) Table 1 reports 3920 as the golden network's total MDL objective (L_D + λ·|H|), not |H| alone. Our `golden.py` computes |H| = 1137 bits. Decompose their 3920 into data term + hypothesis term and verify our |H| matches their weight-encoding component exactly.
+
+**Steps:**
+1. Run `golden_mdl_score()` and record full breakdown (architecture bits, per-weight bits, total |H|).
+2. Cross-check against Lan et al. (2024) Appendix B: gate order, bias convention, output layer construction (ε = (2¹⁴−1)⁻¹, `limit_denominator(1000)`, tanh(1) scaling).
+3. Compute data term L_D on matching training set (1000 strings, Geometric(p=0.3)) and check |H| + L_D ≈ 3920 under their λ convention.
+4. Document the exact decomposition.
+
+#### Free-form RNN implementation (Stages 1–2)
+
+**Ref:** `docs/comparisons.md` §7.2.
+
+**Stage 1 — Golden construction & |H| verification:**
+Build the Lan et al. (2022, TACL 10:785–799, arXiv:2111.00600) / Abudy et al. (2025) free-form RNN architecture and verify the aⁿbⁿ golden network gives |H| = 139 bits exactly.
+
+- Create `src/mdl/freeform_rnn.py` — `FreeFormRNN` data structure + `freeform_forward` function.
+- Create `src/mdl/freeform_coding.py` — `freeform_codelength(network)` following Lan et al. (2022) encoding (unit count, activation type, bias, adjacency, weights).
+- Create `src/mdl/golden_freeform.py` — hard-code aⁿbⁿ golden topology from Abudy et al. (2025) Figure 7.
+- Create `tests/test_freeform_golden.py` — verify |H| = 139 bits, 100% deterministic accuracy on n=1..1500.
+- Also build the differentiable variant (Abudy et al. Figure 8, Linear+ReLU only) and verify accuracy.
+
+**Stage 2 — Trainable free-form RNN with differentiable MDL (after Stage 1):**
+Apply categorical relaxation to free-form RNN weights. Fixed-topology approach: fix graph structure to golden/supergraph, learn weights via Gumbel-Softmax over rational grid.
+
+- Create `src/mdl/freeform_training.py` — adapt categorical MDL training loop for free-form forward pass.
+- Enables direct comparison to Abudy et al. (2025) Exp 3 (GD from golden init) AND from-scratch training (our novel contribution).
 
 #### Differentiable MDL vs. non-differentiable MDL — the central comparison
 
@@ -300,32 +348,63 @@ Baseline experiment script (`scripts/experiments/baseline_lstm_experiments.py`) 
 - Connect proposal theory and the strongest empirical evidence.
 - Be explicit about optimizer path dependence, schedule effects, and current limits.
 
+#### Fair comparison documentation checklist
+
+**Ref:** `docs/comparisons.md` §5–6. Each item below must be addressed in the paper to withstand reviewer scrutiny.
+
+- [ ] **Architecture mismatch (§6.4):** State clearly in all comparison tables that Abudy et al. (2025) GD baselines use free-form RNNs, not LSTMs. |H| comparison across architectures is invalid; Δ_test comparison is valid.
+- [ ] **Grid cannot represent golden (§6.5):** Acknowledge that the LSTM golden net (LARGE=127) is outside our rational grid (n_max=10). Frame any |H| result honestly: "solutions in restricted grid S."
+- [ ] **Training vs eval loss asymmetry (§6.6):** Document that training loss averages over positions while |D:H| sums then grammar-weights. Standard practice but not identical to the reported metric.
+- [ ] **Report effective λ (§6.7):** State effective λ_eff = mdl_lambda / N (e.g., 1000/1000 = 1.0), not just the config value. Abudy's GA uses pure MDL (λ=1 implicitly).
+- [ ] **LR difference (§6.3):** State our lr and the 500× gap vs Abudy. Include ablation results (item 2.3).
+- [ ] **Test range (§6.2):** Document that our test_max_n=1500 vs Abudy's n_max_train+1000. Numerically negligible for Geometric(0.3) but should be stated.
+- [ ] **Golden-init vs random-init (§6.10):** Present both where applicable. Abudy Exp 3 starts from golden weights; we start from random init — complementary experiments.
+- [ ] **n=0 convention (§6.1):** After fixing item 1.4, state which min_n convention each reported number uses.
+- [ ] **Seed count (§6.8):** Match or exceed comparison papers' seed counts per item 2.2 notes.
+
+#### Progression goals
+
+**Ref:** `docs/comparisons.md` §4.
+
+- **Level 1 (minimum publishable):** Across aⁿbⁿ, aⁿbⁿcⁿ, Dyck-1: Δ_test substantially below GD+L1/L2 baselines. |H| ≥ order of magnitude smaller. Generalization to 10×+ training length with >95% det. acc.
+- **Level 2 (strong paper):** Perfect/near-perfect generalization on aⁿbⁿ (done). Strong on aⁿbⁿcⁿ and Dyck-1. Δ_test ≈ 0%. Recognition accuracy vs FLaRe.
+- **Level 3 (excellent paper):** Perfect generalization on all counter languages. Meaningful Dyck-2/stack-language results. FLaRe comparison showing MDL-LSTM beats all standard LSTMs.
+
 ---
 
 ## Appendix A: Suggested Implementation Order
 
 **Phase A — paper-ready numbers for aⁿbⁿ (no new tasks needed):**
-1. Compute analytical optimal |D:H| for aⁿbⁿ using `src/mdl/golden.py`.
-2. Add composite |D:H| evaluation for trained networks.
-3. ~~Compute Δ% for our best existing runs.~~
-4. ~~Add grammar weights for aⁿbⁿ test set (geometric distribution).~~
-5. ~~Golden network scores under CE, L1, L2, MDL.~~
+1. ~~Compute analytical optimal |D:H| for aⁿbⁿ using `src/mdl/golden.py`.~~ Done
+2. ~~Add composite |D:H| evaluation for trained networks.~~ Done
+3. ~~Compute Δ% for our best existing runs.~~ Done
+4. ~~Add grammar weights for aⁿbⁿ test set (geometric distribution).~~ Done
+5. ~~Golden network scores under CE, L1, L2, MDL.~~ Done
 6. ~~Run standard LSTM with CE/L1/L2 on aⁿbⁿ.~~ (metrics integrated; long runs deferred)
 7. ~~Produce the main results table for aⁿbⁿ.~~ (table infrastructure done; production numbers need long runs)
+8. ~~Fix n=0 inclusion in grammar-weighted evaluation (item 1.4)~~ Done
+9. ~~Verify smoothing consistency on golden network (item 1.5)~~ Done
+10. Verify LSTM golden |H| decomposition against Lan et al. (2024) (item 3.D)
+11. LR ablation over {0.001, 0.01, 0.05, 0.1} (item 2.3)
+12. Production runs: 1000+ epochs, multi-seed baselines + MDL (items 2.1, 2.2)
+13. ~~Implement recognition accuracy metric (item 3.C)~~ Done
 
 **Phase B — second and third tasks:**
-8. Implement aⁿbⁿcⁿ (data, golden network, evaluation).
-9. Implement Dyck-1 (data, golden network, evaluation).
-10. Run differentiable MDL + baselines on both new tasks.
+14. Implement aⁿbⁿcⁿ (data, golden network, evaluation).
+15. Implement Dyck-1 (data, golden network, evaluation).
+16. Run differentiable MDL + baselines on both new tasks.
 
-**Phase C — harder tasks (architecture decision needed):**
-11. Decide on architecture for Dyck-2, Arithmetic, Toy-English (LSTM vs free-form RNN).
-12. Implement remaining tasks.
+**Phase C — free-form RNN & harder tasks (ref: `docs/comparisons.md` §7):**
+17. Free-form RNN Stage 1: architecture, coding scheme, aⁿbⁿ golden net, verify |H|=139 (item 3.D).
+18. Free-form RNN Stage 2: categorical relaxation training, Abudy Exp 3 comparison (item 3.D).
+19. Decide on architecture for Dyck-2, Arithmetic, Toy-English (LSTM vs free-form RNN).
+20. Implement remaining tasks.
 
-**Phase D — visualizations and polish:**
-13. Loss landscape plots.
-14. Output probability / memory traces.
-15. Verify smoothing convention.
+**Phase D — visualizations, polish, and write-up:**
+21. Loss landscape plots.
+22. Output probability / memory traces.
+23. Complete fair comparison documentation checklist (item 3.F).
+24. Write-up targeting progression Level 1 → Level 2 (ref: `docs/comparisons.md` §4).
 
 ---
 

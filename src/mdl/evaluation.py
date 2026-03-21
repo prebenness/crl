@@ -19,7 +19,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.mdl.data import make_test_set, make_anbn_fixed_n
+from src.mdl.data import (
+    make_test_set, make_anbn_fixed_n,
+    SYMBOL_HASH, SYMBOL_A, SYMBOL_B, NUM_SYMBOLS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -27,21 +30,18 @@ from src.mdl.data import make_test_set, make_anbn_fixed_n
 # ---------------------------------------------------------------------------
 
 def compute_anbn_grammar_weights(
-    max_n: int, p: float = 0.3, min_n: int = 0,
+    max_n: int, p: float = 0.3, min_n: int = 1,
 ) -> np.ndarray:
     """Raw PCFG weights P(n) = p * (1-p)^n for n=min_n..max_n.
 
     Returns unnormalized probabilities from the geometric PCFG.
-    For full PCFG (min_n=0, large max_n), these sum to ~1.
-
-    The default min_n=0 includes the empty string, matching the
-    information-theoretic |D:H| = E_{s~PCFG}[-log P_H(s)] over
-    the full grammar distribution.
+    Default min_n=1 matches Abudy et al. (2025) test convention
+    (test sets start at n=1, excluding the empty string).
 
     Args:
         max_n: largest n in the test set.
         p: PCFG termination probability.
-        min_n: smallest n (default 0, includes empty string).
+        min_n: smallest n (default 1, Abudy et al. convention).
 
     Returns:
         (max_n - min_n + 1,) float64 array of PCFG weights.
@@ -129,16 +129,13 @@ def compute_grammar_weighted_nll_bits(
 ) -> dict:
     """Grammar-weighted |D:H| data term on the exhaustive test set.
 
-    |D:H|_test = Σ_{n=0}^{max_n} P(n) × NLL_total(n)
+    |D:H|_test = Σ_{n=1}^{max_n} P(n) × NLL_total(n)
 
     where NLL_total(n) is the total NLL in bits for string aⁿbⁿ,
-    P(n) = p*(1-p)^n is the raw PCFG probability (unnormalized),
-    and n=0 is the empty string "# #".
+    P(n) = p*(1-p)^n is the raw PCFG probability (unnormalized).
 
-    Including n=0 with raw PCFG weights matches the information-
-    theoretic convention |D:H| = E_{s~PCFG}[-log P_H(s)].
-    For the ideal golden predictor this gives ~2.94 bits, matching
-    Abudy et al. (2025, arXiv:2505.13398v2, line 803).
+    Test set starts at n=1 following Abudy et al. (2025,
+    arXiv:2505.13398v2, Appendix A.1).
 
     Args:
         forward_fn: callable (x_batch) -> logits.
@@ -149,15 +146,14 @@ def compute_grammar_weighted_nll_bits(
     Returns:
         dict with data_dh_bits, nll_per_string, grammar_weights, max_n.
     """
-    # Build test set including n=0 (empty string)
     test_inputs = []
     test_targets = []
-    for n in range(0, max_n + 1):
+    for n in range(1, max_n + 1):
         inp, tgt = make_anbn_fixed_n(n)
         test_inputs.append(inp)
         test_targets.append(tgt)
 
-    weights = compute_anbn_grammar_weights(max_n, p=p, min_n=0)
+    weights = compute_anbn_grammar_weights(max_n, p=p)
 
     nll_per_string = compute_per_string_nll_bits(
         forward_fn, test_inputs, test_targets, batch_size=batch_size,
@@ -525,3 +521,191 @@ def format_golden_regulariser_table(result: dict) -> str:
         "=" * 65,
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Recognition accuracy (FLaRe / Deletang comparison)
+# ---------------------------------------------------------------------------
+
+def compute_full_string_accuracy(
+    forward_fn,
+    inputs,
+    targets,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Per-string boolean: True iff argmax correct at every position.
+
+    Unlike evaluate_deterministic_accuracy (which checks only b-phase
+    positions), this checks ALL positions — equivalent to the recognition
+    accuracy notion used in FLaRe (ICLR 2025) and Deletang et al.
+    (2023, "Neural Networks and the Chomsky Hierarchy", ICLR 2023).
+
+    Args:
+        forward_fn: callable (x_batch: int32 (B,T)) -> logits (B,T,V).
+        inputs: list of variable-length int lists.
+        targets: list of variable-length int lists.
+        batch_size: strings per batch.
+
+    Returns:
+        (N,) bool array. True = all positions correct ("accepted").
+    """
+    N = len(inputs)
+    accepted = np.zeros(N, dtype=bool)
+
+    for batch_start in range(0, N, batch_size):
+        batch_end = min(batch_start + batch_size, N)
+        batch_inputs = inputs[batch_start:batch_end]
+        batch_targets = targets[batch_start:batch_end]
+        B = len(batch_inputs)
+
+        max_len = max(len(s) for s in batch_inputs)
+        x_pad = np.zeros((B, max_len), dtype=np.int32)
+        y_pad = np.zeros((B, max_len), dtype=np.int32)
+        mask = np.zeros((B, max_len), dtype=np.float32)
+
+        for i, (inp, tgt) in enumerate(zip(batch_inputs, batch_targets)):
+            L = len(inp)
+            x_pad[i, :L] = inp
+            y_pad[i, :L] = tgt
+            mask[i, :L] = 1.0
+
+        logits = forward_fn(jnp.array(x_pad))  # (B, T, V)
+        preds = jnp.argmax(logits, axis=-1)  # (B, T)
+        correct = (preds == jnp.array(y_pad)).astype(jnp.float32)
+        # A position is "ok" if correct OR padding
+        ok = correct * jnp.array(mask) + (1.0 - jnp.array(mask))
+        per_string = jnp.all(ok > 0.5, axis=-1)  # (B,)
+        accepted[batch_start:batch_end] = np.array(per_string)
+
+    return accepted
+
+
+def generate_negative_anbn(
+    num_examples: int,
+    max_n: int,
+    p: float = 0.3,
+    seed: int = 0,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Generate invalid strings over {#, a, b} for recognition testing.
+
+    Produces strings that are NOT valid a^n b^n, formatted as
+    language-modeling pairs (input=s[:-1], target=s[1:]).
+
+    Four negative types in equal proportion:
+      1. Wrong counts: a^m b^n with m != n
+      2. Interleaved: a's and b's mixed (e.g., abab)
+      3. Single symbol: only a's or only b's (e.g., #aaa#)
+      4. Random: random tokens from {a, b}
+
+    Args:
+        num_examples: total negative strings to generate.
+        max_n: controls length range (lengths drawn from geometric(p)).
+        p: geometric parameter for length distribution.
+        seed: random seed.
+
+    Returns:
+        (negative_inputs, negative_targets): lists of int lists.
+    """
+    rng = np.random.RandomState(seed)
+    neg_inputs = []
+    neg_targets = []
+
+    per_type = num_examples // 4
+    remainder = num_examples - 4 * per_type
+
+    def _sample_length():
+        # Geometric distribution on {1, 2, ...} to avoid empty strings
+        return int(rng.geometric(p)) if rng.random() > 0.5 else rng.randint(1, max(max_n, 2))
+
+    def _add(string):
+        """Add a #-delimited string as input/target pair."""
+        full = [SYMBOL_HASH] + string + [SYMBOL_HASH]
+        neg_inputs.append(full[:-1])
+        neg_targets.append(full[1:])
+
+    # Type 1: wrong counts (a^m b^n, m != n)
+    for _ in range(per_type + remainder):
+        m = _sample_length()
+        n = _sample_length()
+        if m == n:
+            n = m + 1  # ensure m != n
+        _add([SYMBOL_A] * m + [SYMBOL_B] * n)
+
+    # Type 2: interleaved a's and b's
+    for _ in range(per_type):
+        length = _sample_length() * 2
+        s = []
+        for j in range(length):
+            s.append(SYMBOL_A if rng.random() < 0.5 else SYMBOL_B)
+        # Ensure it's not accidentally a valid a^nb^n
+        if len(s) >= 2 and all(c == SYMBOL_A for c in s[:len(s)//2]) \
+                and all(c == SYMBOL_B for c in s[len(s)//2:]) \
+                and s.count(SYMBOL_A) == s.count(SYMBOL_B):
+            s[0] = SYMBOL_B  # break validity
+        _add(s)
+
+    # Type 3: single symbol (only a's or only b's)
+    for _ in range(per_type):
+        length = _sample_length()
+        sym = SYMBOL_A if rng.random() < 0.5 else SYMBOL_B
+        _add([sym] * length)
+
+    # Type 4: random tokens from {a, b}
+    for _ in range(per_type):
+        length = _sample_length()
+        s = [rng.choice([SYMBOL_A, SYMBOL_B]) for _ in range(length)]
+        # Break if accidentally valid
+        na = s.count(SYMBOL_A)
+        nb = s.count(SYMBOL_B)
+        if na == nb and na > 0:
+            is_valid = all(c == SYMBOL_A for c in s[:na]) and \
+                       all(c == SYMBOL_B for c in s[na:])
+            if is_valid:
+                s[0] = SYMBOL_B
+        _add(s)
+
+    return neg_inputs, neg_targets
+
+
+def compute_recognition_accuracy(
+    forward_fn,
+    positive_inputs,
+    positive_targets,
+    negative_inputs,
+    negative_targets,
+    batch_size: int = 64,
+) -> dict:
+    """Binary accept/reject recognition accuracy.
+
+    A string is "accepted" iff the model's argmax prediction is correct
+    at every position; otherwise "rejected". For comparison with
+    FLaRe (ICLR 2025) and Deletang et al. (2023, ICLR 2023).
+
+    Args:
+        forward_fn: callable (x_batch) -> logits.
+        positive_inputs, positive_targets: valid strings.
+        negative_inputs, negative_targets: invalid strings.
+        batch_size: strings per batch.
+
+    Returns:
+        dict with accuracy, tp_rate, tn_rate, n_positive, n_negative.
+    """
+    pos_accepted = compute_full_string_accuracy(
+        forward_fn, positive_inputs, positive_targets, batch_size,
+    )
+    neg_accepted = compute_full_string_accuracy(
+        forward_fn, negative_inputs, negative_targets, batch_size,
+    )
+
+    tp = int(np.sum(pos_accepted))
+    tn = int(np.sum(~neg_accepted))
+    n_pos = len(positive_inputs)
+    n_neg = len(negative_inputs)
+
+    return {
+        "accuracy": (tp + tn) / max(n_pos + n_neg, 1),
+        "tp_rate": tp / max(n_pos, 1),
+        "tn_rate": tn / max(n_neg, 1),
+        "n_positive": n_pos,
+        "n_negative": n_neg,
+    }

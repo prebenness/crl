@@ -75,6 +75,7 @@ from src.mdl.training import (
     evaluate_deterministic_accuracy,
     anneal_tau_st_phase,
     compute_data_nll_bits_smoothed,
+    freeze_confident_weights,
 )
 from src.mdl.golden import (
     build_golden_network_params,
@@ -395,6 +396,145 @@ def _compute_shared_discrete_complexity_bits(
     }
 
 
+# ---------------------------------------------------------------------------
+# Logging: metric legend and epoch formatting
+# ---------------------------------------------------------------------------
+
+_METRIC_LEGEND_BASIC = """\
+======================================================================
+  METRIC LEGEND  (paper §2 Eq. 3, §3 Eq. 4)
+======================================================================
+
+  J  —  Relaxed MDL objective J_β(α), the quantity being minimised.
+         In a standard classifier this would be the total loss.
+         J = L_D + λ/N · |H|_exp − τ/N · H(π).
+         The three terms trade off data fit, model complexity, and
+         exploration (entropy bonus).
+
+  L_D  —  Data codelength E[L_D(θ)]: cross-entropy between the
+         model's output distribution and the targets, in bits,
+         averaged over sequence positions. This is the standard
+         training loss — how well the model predicts the next token.
+         Analogous to the CE loss in a classifier.
+
+  λ|H|/N  —  Net regularisation = λ/N · |H|_exp − τ/N · H(π).
+         Analogous to a weight-decay penalty in a standard model,
+         but here it penalises the description length of the weights
+         rather than their norm, minus an entropy bonus that
+         encourages exploration early in training and vanishes as
+         τ → 0.
+
+  |H|_disc  —  Discrete hypothesis codelength Σᵢ ℓ(argmax πᵢ).
+         The actual MDL cost you would pay to encode the current
+         hard (argmax) weights as rationals. This is the number
+         that matters at convergence — the "model size" in bits.
+         Analogous to parameter count or L0 norm.
+
+  |H|_exp  —  Expected hypothesis codelength Σᵢ Σₘ πᵢₘ ℓ(sₘ).
+         The soft (differentiable) version of |H|_disc: a weighted
+         average over the categorical distributions, used during
+         training because it has gradients. Converges to |H|_disc
+         as the categoricals sharpen (τ → 0).
+
+  H(π)  —  Total categorical entropy Σᵢ H₂(πᵢ) in bits.
+         Measures how "spread out" the weight distributions are.
+         High early in training (exploring), drops to ~0 at
+         convergence (each weight committed to one grid value).
+
+  τ  —  Temperature = 1/β, annealed toward 0 during training.
+         Controls the entropy bonus: high τ encourages exploration,
+         low τ forces commitment to discrete weights.
+======================================================================"""
+
+_METRIC_LEGEND_SHARED = """\
+======================================================================
+  METRIC LEGEND  (paper §2 Eq. 3, §3 Eq. 4/8)
+======================================================================
+
+  J  —  Shared-weight relaxed objective J^shared_β(α, φ).
+         J = L_D + λ₁/N·CE(π,φ) + λ₂/N·KL(φ‖P) − τ/N·H(π).
+
+  L_D  —  Data codelength (cross-entropy in bits, position-averaged).
+         How well the model predicts the next token. Same as the
+         CE loss in a standard classifier.
+
+  λ|H|/N  —  Net regularisation (all non-data terms combined).
+
+  |H|_disc  —  Discrete Lan-style codelength Σᵢ ℓ(argmax πᵢ).
+         Cost to encode the hard weights as rationals.
+
+  shared  —  Shared-objective complexity at argmax convergence:
+         λ₁ · CE₂(one_hot, φ) + λ₂ · KL(φ ‖ P_base).
+         Replaces |H|_disc when comparing shared-mode runs.
+
+  H(π)  —  Total categorical entropy Σᵢ H₂(πᵢ).
+         Exploration measure, drops to ~0 at convergence.
+
+  H(φ)  —  Entropy of the shared prior φ.
+
+  τ  —  Temperature = 1/β, annealed toward 0.
+======================================================================"""
+
+
+def _print_metric_legend(mode):
+    """Print the metric legend once at the start of training."""
+    if mode == "shared":
+        print(_METRIC_LEGEND_SHARED)
+    else:
+        print(_METRIC_LEGEND_BASIC)
+
+
+def _fmt_epoch_line(epoch, phase, metrics, complexity_argmax_bits, tau,
+                    frozen_str=None):
+    """Format a single epoch log line using paper notation.
+
+    Returns a string like:
+      Epoch   200 [warm] τ=1.00 | J=0.8  L_D=1.6  λ|H|/N=-0.8 | |H|_disc=1508  |H|_exp=1502  H(π)=754
+    """
+    parts = [
+        f"Epoch {epoch:5d} [{phase:4s}] τ={float(tau):.4f}",
+        f"J={float(metrics['objective_total_bits']):8.1f}  "
+        f"L_D={float(metrics['data_nll_bits']):6.2f}  "
+        f"λ|H|/N={float(metrics['reg_net_bits']):7.1f}",
+        f"|H|_disc={int(complexity_argmax_bits):4d}  "
+        f"|H|_exp={float(metrics['complexity_expected_bits']):7.1f}  "
+        f"H(π)={float(metrics['entropy_weights_bits']):6.1f}",
+    ]
+    line = " | ".join(parts)
+    if frozen_str is not None:
+        line += f"  {frozen_str}"
+    return line
+
+
+def _fmt_epoch_line_shared(epoch, phase, metrics, lan_hyp_bits, shared_disc,
+                           tau):
+    """Format epoch log line for shared-weight mode."""
+    return (
+        f"Epoch {epoch:5d} [{phase:4s}] τ={float(tau):.4f} | "
+        f"J={float(metrics['objective_total_bits']):8.1f}  "
+        f"L_D={float(metrics['data_nll_bits']):6.2f}  "
+        f"λ|H|/N={float(metrics['reg_net_bits']):7.1f} | "
+        f"|H|_disc={int(lan_hyp_bits):4d}  "
+        f"shared={shared_disc['shared_complexity']:.1f} "
+        f"(CE={shared_disc['code_ce']:.1f}+KL={shared_disc['kl_dict']:.1f})  "
+        f"H(π)={float(metrics['entropy_weights_bits']):6.1f}  "
+        f"H(φ)={float(metrics['phi_entropy_bits']):.1f}  "
+        f"φ∈[{metrics['phi_min_prob']:.1e},{metrics['phi_max_prob']:.1e}]"
+    )
+
+
+def _fmt_val_line(val_summary, val_sym, n_perfect, n_val,
+                  complexity_total_bits, long_val_suffix="", best_tag=""):
+    """Format a validation summary line."""
+    return (
+        f"  ↳ val: {val_summary['val_desc']} {val_sym}  "
+        f"({n_perfect}/{n_val} perfect, "
+        f"|H|={int(complexity_total_bits)}b"
+        f"{long_val_suffix})"
+        f"{best_tag}"
+    )
+
+
 def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengths,
                           val_inputs, val_targets, grid, long_val_probe_ns,
                           best, run_dir):
@@ -446,13 +586,11 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
             long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
         else:
             long_val_suffix = ", long_n=[skipped]"
-    print(
-        f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
-        f"({n_perfect}/{n_val} perfect, "
-        f"|H|={current_complexity_bits + integer_code_length(hidden_size)}b"
-        f"{long_val_suffix})"
-        f"{best_tag}"
-    )
+    print(_fmt_val_line(
+        val_summary, val_sym, n_perfect, n_val,
+        current_complexity_bits + integer_code_length(hidden_size),
+        long_val_suffix, best_tag,
+    ))
     if is_best:
         best['n_perfect'] = n_perfect
         best['gen_n'] = gen_n
@@ -599,7 +737,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         f"then anneal to {args.tau_end}"
     )
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
-    print("-" * 70)
+    _print_metric_legend("basic")
 
     best = {
         'n_perfect': -1,
@@ -658,7 +796,73 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
 
     t0 = time.time()
 
-    if is_full_batch:
+    if getattr(args, 'anneal_mode', 'exponential') == 'staged':
+        # ----- Staged annealing: fixed-tau stages with freezing between -----
+        tau_levels = args.staged_tau_levels
+        epoch_fracs = args.staged_epoch_fracs
+        assert len(tau_levels) == len(epoch_fracs), \
+            "staged_tau_levels and staged_epoch_fracs must have the same length"
+        assert abs(sum(epoch_fracs) - 1.0) < 1e-6, \
+            "staged_epoch_fracs must sum to 1.0"
+
+        n_params = state.params["logits"].shape[0]
+        print(f"\n  [STAGED] {len(tau_levels)} stages: "
+              f"tau={tau_levels}, fracs={epoch_fracs}, "
+              f"freeze_threshold={args.freeze_threshold}")
+
+        epoch = start_epoch
+        for stage_idx, (tau_level, frac) in enumerate(zip(tau_levels, epoch_fracs)):
+            n_stage_epochs = max(int(frac * total_epochs), 1)
+            stage_end = min(epoch + n_stage_epochs, total_epochs)
+
+            # Create train step with freeze masking
+            staged_step = make_train_step(
+                args.mdl_lambda, n_train=N, n_samples=effective_n_samples,
+                use_freeze_mask=True,
+            )
+            state = state.replace(tau=jnp.float32(tau_level))
+
+            n_frozen = int(jnp.sum(state.freeze_mask))
+            print(f"\n  Stage {stage_idx+1}/{len(tau_levels)}: "
+                  f"tau={tau_level}, epochs {epoch+1}..{stage_end}, "
+                  f"frozen={n_frozen}/{n_params}")
+
+            for ep in range(epoch, stage_end):
+                state, rng, metrics = _run_epoch(
+                    state, x_train, y_train, mask_train, N, bs, rng,
+                    staged_step,
+                )
+
+                if (ep + 1) % args.log_every == 0 or ep == 0:
+                    complexity_argmax_bits = _compute_discrete_hyp_bits(
+                        state.params, grid_codelengths,
+                    )
+                    print(_fmt_epoch_line(
+                        ep + 1, f"S{stage_idx+1}", metrics,
+                        complexity_argmax_bits, tau_level,
+                        frozen_str=f"frozen={n_frozen}/{n_params}",
+                    ))
+
+                if (ep + 1) % args.eval_every == 0:
+                    best = _eval_and_update_best(
+                        state, ep, args.hidden_size,
+                        grid_values, grid_codelengths,
+                        val_inputs, val_targets, grid, long_val_probe_ns,
+                        best, run_dir,
+                    )
+
+            epoch = stage_end
+
+            # Freeze confident weights between stages (not after the last)
+            if stage_idx < len(tau_levels) - 1:
+                state = freeze_confident_weights(state, args.freeze_threshold)
+                state = _reset_optimizer_state(state)
+                n_frozen_new = int(jnp.sum(state.freeze_mask))
+                print(f"  ↳ [FREEZE] Stage {stage_idx+1} → {stage_idx+2}: "
+                      f"froze {n_frozen_new - n_frozen} weights "
+                      f"(total frozen: {n_frozen_new}/{n_params})")
+
+    elif is_full_batch:
         # ----- Fused full-batch path: lax.scan over contiguous epoch runs -----
         epoch = start_epoch
         while epoch < total_epochs:
@@ -719,18 +923,10 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 complexity_argmax_bits = _compute_discrete_hyp_bits(
                     state.params, grid_codelengths,
                 )
-                print(
-                    f"Epoch {last_epoch+1:5d} [{phase_name:4s}] | "
-                    f"objective_total_bits={float(metrics['objective_total_bits']):8.1f}b  "
-                    f"data_nll_bits={float(metrics['data_nll_bits']):8.1f}b  "
-                    f"reg_net_bits={float(metrics['reg_net_bits']):7.1f}b "
-                    f"(reg_complexity_weighted_bits={float(metrics['reg_complexity_weighted_bits']):.1f}b "
-                    f"- reg_entropy_bonus_bits={float(metrics['reg_entropy_bonus_bits']):.1f}b) | "
-                    f"complexity_expected_bits={float(metrics['complexity_expected_bits']):.1f}b  "
-                    f"complexity_argmax_bits={int(complexity_argmax_bits):4d}b  "
-                    f"entropy_weights_bits={float(metrics['entropy_weights_bits']):5.1f}b  "
-                    f"τ={float(last_tau):.4f}"
-                )
+                print(_fmt_epoch_line(
+                    last_epoch + 1, phase_name, metrics,
+                    complexity_argmax_bits, last_tau,
+                ))
 
             if (last_epoch + 1) % args.eval_every == 0:
                 best = _eval_and_update_best(
@@ -783,18 +979,10 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 complexity_argmax_bits = _compute_discrete_hyp_bits(
                     state.params, grid_codelengths,
                 )
-                print(
-                    f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
-                    f"objective_total_bits={metrics['objective_total_bits']:8.1f}b  "
-                    f"data_nll_bits={metrics['data_nll_bits']:8.1f}b  "
-                    f"reg_net_bits={metrics['reg_net_bits']:7.1f}b "
-                    f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
-                    f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
-                    f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
-                    f"complexity_argmax_bits={int(complexity_argmax_bits):4d}b  "
-                    f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  "
-                    f"τ={float(tau):.4f}"
-                )
+                print(_fmt_epoch_line(
+                    epoch + 1, phase_name, metrics,
+                    complexity_argmax_bits, tau,
+                ))
 
             if (epoch + 1) % args.eval_every == 0:
                 best = _eval_and_update_best(
@@ -959,7 +1147,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
     )
     print(f"  lr={args.lr}, lambda1={args.lambda1}, lambda2={args.lambda2}, "
           f"eps={args.epsilon}, batch_size={bs}")
-    print("-" * 70)
+    _print_metric_legend("shared")
 
     best_val_n_perfect = -1
     best_val_gen_n = -1
@@ -1026,25 +1214,10 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 state.params, grid_codelengths, p_base,
                 args.lambda1, args.lambda2, args.epsilon,
             )
-            print(
-                f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
-                f"objective_total_bits={metrics['objective_total_bits']:8.1f}b  "
-                f"data_nll_bits={metrics['data_nll_bits']:8.1f}b  "
-                f"reg_net_bits={metrics['reg_net_bits']:7.1f}b "
-                f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
-                f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
-                f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
-                f"code_cross_entropy_bits={metrics['code_cross_entropy_bits']:.1f}b  "
-                f"|H|_Lan={lan_hyp_bits:4d}b  "
-                f"shared_complexity={shared_disc['shared_complexity']:.1f}b "
-                f"(code_ce={shared_disc['code_ce']:.1f} + kl_dict={shared_disc['kl_dict']:.1f})  "
-                f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  "
-                f"kl_pi_phi_bits={metrics['kl_pi_phi_bits']:.1f}b  "
-                f"kl_phi_pbase_bits={metrics['kl_phi_pbase_bits']:.1f}b  "
-                f"phi_entropy_bits={metrics['phi_entropy_bits']:.1f}b  "
-                f"phi∈[{metrics['phi_min_prob']:.2e},{metrics['phi_max_prob']:.2e}]  "
-                f"τ={float(tau):.4f}"
-            )
+            print(_fmt_epoch_line_shared(
+                epoch + 1, phase_name, metrics,
+                lan_hyp_bits, shared_disc, tau,
+            ))
 
         if (epoch + 1) % args.eval_every == 0:
             model_params = {"logits": state.params["logits"]}
@@ -1093,10 +1266,10 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                     long_val_suffix = ", long_n=[skipped]"
             lan_total = current_complexity_bits + integer_code_length(args.hidden_size)
             print(
-                f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
+                f"  ↳ val: {val_summary['val_desc']} {val_sym}  "
                 f"({n_perfect}/{n_val} perfect, "
-                f"|H|_Lan={lan_total}b, "
-                f"shared_complexity={val_shared_disc['shared_complexity']:.1f}b"
+                f"|H|_Lan={int(lan_total)}b, "
+                f"shared={val_shared_disc['shared_complexity']:.1f}b"
                 f"{long_val_suffix})"
                 f"{best_tag}"
             )
@@ -1208,6 +1381,18 @@ def _build_arg_parser(defaults=None):
     parser.add_argument("--bridge_epochs", type=int, default=None,
                         help="Deterministic ST bridge epochs after warmup "
                              "(default: ceil(0.1 * warmup_epochs), min 1 when warmup > 0; pass 0 to disable)")
+    # Staged annealing (Louizos et al. 2019 / Lee et al. 2021)
+    parser.add_argument("--anneal_mode", type=str, default="exponential",
+                        choices=["exponential", "staged"],
+                        help="Temperature annealing strategy")
+    parser.add_argument("--staged_tau_levels", type=float, nargs="+",
+                        default=[1.0, 0.3, 0.01],
+                        help="Constant tau for each stage (staged mode)")
+    parser.add_argument("--staged_epoch_fracs", type=float, nargs="+",
+                        default=[0.4, 0.3, 0.3],
+                        help="Fraction of total epochs per stage (staged mode)")
+    parser.add_argument("--freeze_threshold", type=float, default=0.95,
+                        help="max(softmax) threshold for freezing weights (staged mode)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     # Shared-weight mode parameters
@@ -1347,16 +1532,10 @@ def _print_resolved_parameters(args):
     print("-" * 60)
     print(f"  mode={args.mode}")
     if args.mode == "basic":
-        print(
-            "  objective_total_bits = data_nll_bits + "
-            "reg_complexity_weighted_bits - reg_entropy_bonus_bits"
-        )
+        print("  J = L_D + λ/N·E[Σℓ(θᵢ)] − τ/N·ΣH₂(πᵢ)  (Eq. 86)")
         print(f"  mdl_lambda={args.mdl_lambda}")
     else:
-        print(
-            "  objective_total_bits = data_nll_bits + "
-            "reg_complexity_weighted_bits - reg_entropy_bonus_bits"
-        )
+        print("  J = L_D + λ₁/N·CE₂(π,φ) + λ₂/N·KL(φ‖P) − τ/N·ΣH₂(πᵢ)  (Eq. 156)")
         print(f"  lambda1={args.lambda1}")
         print(f"  lambda2={args.lambda2}")
         print(f"  epsilon={args.epsilon}")

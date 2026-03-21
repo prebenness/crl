@@ -1,9 +1,9 @@
 """Tests for paper-comparable evaluation metrics (src/mdl/evaluation.py).
 
 Covers:
-    - Grammar weights: normalization, correct geometric distribution
+    - Grammar weights: geometric distribution with n≥1 (Abudy convention)
     - Per-string NLL: correctness on known logits
-    - Grammar-weighted test NLL: golden network sanity check (~2.94 bits)
+    - Grammar-weighted test NLL: golden network sanity check
     - Optimal |D:H|: golden test baseline matches expected value
     - Δ%: arithmetic correctness
     - Golden under regularisers: norms and MDL match expectations
@@ -24,42 +24,37 @@ import numpy as np
 class TestGrammarWeights:
     """Verify grammar weight computation for aⁿbⁿ."""
 
-    def test_sums_to_approximately_one(self):
-        """Raw PCFG weights for n=0..max_n sum to ~1 for large max_n."""
+    def test_sums_to_one_minus_p(self):
+        """Raw PCFG weights for n=1..max_n sum to ~(1-p) for large max_n."""
         from src.mdl.evaluation import compute_anbn_grammar_weights
-        w = compute_anbn_grammar_weights(1000, p=0.3, min_n=0)
-        assert abs(w.sum() - 1.0) < 1e-10
+        w = compute_anbn_grammar_weights(1000, p=0.3)
+        assert abs(w.sum() - 0.7) < 1e-10
 
     def test_geometric_ratios(self):
         """Adjacent weights should have ratio (1-p)."""
         from src.mdl.evaluation import compute_anbn_grammar_weights
         p = 0.3
-        w = compute_anbn_grammar_weights(100, p=p, min_n=0)
+        w = compute_anbn_grammar_weights(100, p=p)
         for i in range(10):
             ratio = w[i + 1] / w[i]
             assert abs(ratio - (1 - p)) < 1e-12
 
-    def test_n0_is_largest(self):
-        """With p=0.3, n=0 should have the highest weight."""
+    def test_n1_is_largest(self):
+        """With default min_n=1, first weight (n=1) is largest."""
         from src.mdl.evaluation import compute_anbn_grammar_weights
-        w = compute_anbn_grammar_weights(100, p=0.3, min_n=0)
+        w = compute_anbn_grammar_weights(100, p=0.3)
         assert w[0] > w[1] > w[2]
 
-    def test_shape_with_n0(self):
+    def test_shape_default(self):
         from src.mdl.evaluation import compute_anbn_grammar_weights
-        w = compute_anbn_grammar_weights(50, p=0.3, min_n=0)
-        assert w.shape == (51,)  # n=0..50
-
-    def test_shape_without_n0(self):
-        from src.mdl.evaluation import compute_anbn_grammar_weights
-        w = compute_anbn_grammar_weights(50, p=0.3, min_n=1)
+        w = compute_anbn_grammar_weights(50, p=0.3)
         assert w.shape == (50,)  # n=1..50
 
-    def test_n0_weight_equals_p(self):
-        """P(0) = p * (1-p)^0 = p."""
+    def test_n1_weight_equals_p_times_one_minus_p(self):
+        """P(1) = p * (1-p)^1 = p*(1-p)."""
         from src.mdl.evaluation import compute_anbn_grammar_weights
-        w = compute_anbn_grammar_weights(10, p=0.3, min_n=0)
-        assert abs(w[0] - 0.3) < 1e-12
+        w = compute_anbn_grammar_weights(10, p=0.3)
+        assert abs(w[0] - 0.3 * 0.7) < 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -147,15 +142,18 @@ class TestPerStringNLL:
 # ---------------------------------------------------------------------------
 
 class TestGrammarWeightedNLL:
-    """Verify grammar-weighted NLL on the golden network matches ~2.94 bits."""
+    """Verify grammar-weighted NLL on the golden network (n=1 convention)."""
 
-    def test_golden_test_dh_approximately_294(self):
-        """Golden network test |D:H| should be ≈ 2.94 bits.
+    def test_golden_test_dh(self):
+        """Golden network test |D:H| with n≥1 (Abudy convention).
 
         Reference: Abudy et al. (2025, arXiv:2505.13398v2), line 803.
-        The ideal predictor gives E[NLL] = E[n]*(-log2(1-p)) + (-log2(p))
-        ≈ (7/3)*0.5146 + 1.737 ≈ 2.938, using E[n] = (1-p)/p over the
-        full PCFG (including n=0).
+        For ideal predictor with p=0.3, n≥1:
+        E[NLL_total(n) | n≥1] = E[n|n≥1] × (-log2(1-p)) + (-log2(p))
+        where E[n|n≥1] = 1/p = 10/3 for geometric(0.3) conditioned on n≥1.
+        So E[NLL|n≥1] ≈ (10/3)*0.5146 + 1.737 ≈ 3.452.
+        But this is the conditional expectation; the grammar-weighted sum
+        uses unnormalized weights summing to (1-p)=0.7, giving ~2.42.
         """
         from src.mdl.evaluation import compute_grammar_weighted_nll_bits
         from src.mdl.golden import build_golden_network_params, golden_forward
@@ -165,41 +163,50 @@ class TestGrammarWeightedNLL:
         def golden_fwd(x):
             return golden_forward(params, x)
 
-        # Use moderate max_n for test speed; result should be close
         result = compute_grammar_weighted_nll_bits(
             golden_fwd, max_n=200, p=0.3, batch_size=64,
         )
 
-        # Should be approximately 2.94 bits (with n=0 included in PCFG)
-        assert abs(result["data_dh_bits"] - 2.94) < 0.1, (
+        # Analytical: Σ_{n=1}^{∞} p(1-p)^n × [n×(-log2(1-p)) + (-log2(p))]
+        # = (1-p) × (-log2(p)) + p(1-p)/(1-(1-p))^2 × (-log2(1-p))  ... but
+        # simplest: just check against the analytical value computed below.
+        p = 0.3
+        max_n_check = 5000
+        ns = np.arange(1, max_n_check + 1)
+        weights = p * (1 - p) ** ns
+        nll_per_n = ns * (-math.log2(1 - p)) + (-math.log2(p))
+        analytical = float(np.sum(weights * nll_per_n))
+
+        assert abs(result["data_dh_bits"] - analytical) < 0.1, (
             f"Golden test |D:H| = {result['data_dh_bits']:.4f}, "
-            f"expected ≈ 2.94"
+            f"expected ≈ {analytical:.4f}"
         )
 
     def test_analytical_expected_value(self):
-        """Cross-check against analytical formula for ideal predictor.
+        """Cross-check analytical formula for ideal predictor with n≥1.
 
-        For ideal (no epsilon) predictor on aⁿbⁿ with p=0.3, including
-        n=0 in the PCFG expectation:
         E[NLL_total(n)] = n × (-log2(1-p)) + (-log2(p))
-                        = n × 0.5146 + 1.7370
-        E[NLL] = E[n] × 0.5146 + 1.7370
-        where E[n] = (1-p)/p = 7/3 ≈ 2.333 for geometric(0.3) on {0,1,...}.
-        So E[NLL] ≈ 1.201 + 1.737 = 2.938.
+        Σ_{n=1}^{∞} P(n) × E[NLL_total(n)] where P(n) = p(1-p)^n.
         """
         from src.mdl.evaluation import compute_anbn_grammar_weights
 
         p = 0.3
-        max_n = 5000  # large enough for convergence
-        weights = compute_anbn_grammar_weights(max_n, p=p, min_n=0)
+        max_n = 5000
+        weights = compute_anbn_grammar_weights(max_n, p=p)
 
-        # Analytical per-string NLL for ideal predictor (n=0..max_n)
-        ns = np.arange(0, max_n + 1)
+        ns = np.arange(1, max_n + 1)
         nll_per_n = ns * (-math.log2(1 - p)) + (-math.log2(p))
         expected_nll = np.sum(weights * nll_per_n)
 
-        # Should be very close to 2.938
-        assert abs(expected_nll - 2.938) < 0.01
+        # Analytical closed-form:
+        # Σ P(n)*n = p(1-p)/(1-(1-p))^2 = (1-p)/p
+        # = E[n] for geometric on {0,1,...} = (1-p)/p, but here
+        # Σ_{n=1} p(1-p)^n × n = (1-p)/p × p = (1-p) ... wait,
+        # Σ_{n=1} n*p*(1-p)^n = p*(1-p)/(1-(1-p))^2 = (1-p)/p
+        # So weighted NLL = (1-p)/p * (-log2(1-p)) + (1-p)*(-log2(p))
+        closed = (1-p)/p * (-math.log2(1-p)) + (1-p) * (-math.log2(p))
+        assert abs(expected_nll - closed) < 0.001
+        assert abs(closed - 2.4165) < 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -320,3 +327,111 @@ class TestFormatting:
         assert "L1" in table
         assert "L2" in table
         assert "MDL" in table
+
+
+# ---------------------------------------------------------------------------
+# Recognition accuracy
+# ---------------------------------------------------------------------------
+
+class TestRecognitionAccuracy:
+    """Verify recognition accuracy (binary accept/reject)."""
+
+    def test_golden_fails_at_transition(self):
+        """Golden network gets the a→b transition wrong (P(a)=0.7 > P(b)=0.3).
+
+        This is correct behavior: the PCFG is memoryless, so the golden
+        LM always predicts argmax='a' at the last a-position where the
+        actual target is 'b'. Recognition accuracy is 0% on valid strings.
+        """
+        from src.mdl.evaluation import compute_full_string_accuracy
+        from src.mdl.golden import build_golden_network_params, golden_forward
+        from src.mdl.data import make_anbn_fixed_n
+
+        params = build_golden_network_params(p=0.3)
+        def golden_fwd(x):
+            return golden_forward(params, x)
+
+        inputs, targets = [], []
+        for n in range(1, 21):
+            inp, tgt = make_anbn_fixed_n(n)
+            inputs.append(inp)
+            targets.append(tgt)
+
+        accepted = compute_full_string_accuracy(golden_fwd, inputs, targets)
+        # Golden rejects all valid strings because of the a→b transition
+        assert accepted.sum() == 0
+
+    def test_golden_rejects_negatives(self):
+        """Golden network should reject all invalid strings."""
+        from src.mdl.evaluation import (
+            compute_full_string_accuracy, generate_negative_anbn,
+        )
+        from src.mdl.golden import build_golden_network_params, golden_forward
+
+        params = build_golden_network_params(p=0.3)
+        def golden_fwd(x):
+            return golden_forward(params, x)
+
+        neg_inputs, neg_targets = generate_negative_anbn(
+            num_examples=100, max_n=20, seed=42,
+        )
+        accepted = compute_full_string_accuracy(
+            golden_fwd, neg_inputs, neg_targets,
+        )
+        # Golden should reject all (or nearly all) invalid strings
+        assert accepted.sum() == 0, (
+            f"Golden accepted {accepted.sum()}/100 invalid strings"
+        )
+
+    def test_negative_examples_are_invalid(self):
+        """No generated negative should be a valid a^n b^n string."""
+        from src.mdl.evaluation import generate_negative_anbn
+        from src.mdl.data import SYMBOL_HASH, SYMBOL_A, SYMBOL_B
+
+        neg_inputs, neg_targets = generate_negative_anbn(
+            num_examples=200, max_n=30, seed=0,
+        )
+        for i, (inp, tgt) in enumerate(zip(neg_inputs, neg_targets)):
+            # Reconstruct full string: input + last target token
+            full = inp + [tgt[-1]]
+            # Valid a^n b^n: [#, a, ..., a, b, ..., b, #] with equal a's and b's
+            body = full[1:-1]  # strip delimiters
+            if len(body) == 0:
+                continue  # empty body is n=0 (valid but trivial)
+            na = sum(1 for c in body if c == SYMBOL_A)
+            nb = sum(1 for c in body if c == SYMBOL_B)
+            if na != nb or na == 0:
+                continue  # not equal counts or no symbols
+            # Check structure: all a's then all b's
+            is_valid = (
+                all(c == SYMBOL_A for c in body[:na])
+                and all(c == SYMBOL_B for c in body[na:])
+            )
+            assert not is_valid, (
+                f"Negative example {i} is a valid a^{na} b^{nb} string"
+            )
+
+    def test_full_string_accuracy_perfect_fwd(self):
+        """A forward function that always predicts token 1 accepts matching strings."""
+        from src.mdl.evaluation import compute_full_string_accuracy
+
+        # All targets are token 1 — forward always predicts token 1
+        inputs = [[0, 0, 0], [0, 0]]
+        targets = [[1, 1, 1], [1, 1]]
+
+        def always_1_fwd(x):
+            B, T = x.shape
+            logits = jnp.full((B, T, 3), -100.0)
+            logits = logits.at[:, :, 1].set(100.0)
+            return logits
+
+        accepted = compute_full_string_accuracy(always_1_fwd, inputs, targets)
+        assert accepted.all()
+
+        # Now with a target that doesn't match: token 2 instead of 1
+        targets_bad = [[1, 2, 1], [1, 1]]
+        accepted_bad = compute_full_string_accuracy(
+            always_1_fwd, inputs, targets_bad,
+        )
+        assert not accepted_bad[0]  # first string has a mismatch
+        assert accepted_bad[1]      # second string still all 1s
