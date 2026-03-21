@@ -71,6 +71,7 @@ from src.mdl.lstm import GumbelSoftmaxLSTM, decode_weights
 from src.mdl.training import (
     create_mdl_state,
     make_train_step,
+    make_fused_epoch_fn,
     evaluate_deterministic_accuracy,
     anneal_tau_st_phase,
     compute_data_nll_bits_smoothed,
@@ -394,6 +395,82 @@ def _compute_shared_discrete_complexity_bits(
     }
 
 
+def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengths,
+                          val_inputs, val_targets, grid, long_val_probe_ns,
+                          best, run_dir):
+    """Run validation eval, print summary, update best-tracking dict.
+
+    Args:
+        best: dict with keys n_perfect, gen_n, long_val_passes,
+            complexity_bits, params. Modified in-place if new best found.
+
+    Returns:
+        The best dict (same object, possibly modified).
+    """
+    val_result = evaluate_deterministic_accuracy(
+        state.apply_fn, state.params, grid_values,
+        val_inputs, val_targets,
+    )
+    n_perfect = val_result["n_perfect"]
+    gen_n = val_result["gen_n"]
+    current_complexity_bits = _compute_discrete_hyp_bits(
+        state.params, grid_codelengths,
+    )
+    val_summary = _format_val_summary(val_result, val_inputs)
+    n_val = val_summary["n_val"]
+    fail_abs_n = val_summary["fail_abs_n"]
+    long_val_probe = {
+        "passed_count": 0,
+        "all_passed": True,
+        "summary": "",
+    }
+    if n_perfect == n_val and long_val_probe_ns:
+        long_val_probe = _evaluate_long_val_probes(
+            state.params, grid, grid_values, long_val_probe_ns,
+        )
+    val_sym = "✓" if fail_abs_n is None else f"✗ (fails@{fail_abs_n})"
+    is_best = _should_update_best(
+        n_perfect,
+        gen_n,
+        long_val_probe["passed_count"],
+        current_complexity_bits,
+        best['n_perfect'],
+        best['gen_n'],
+        best['long_val_passes'],
+        best['complexity_bits'],
+    )
+    best_tag = "  ★ NEW BEST" if is_best else ""
+    long_val_suffix = ""
+    if long_val_probe_ns:
+        if n_perfect == n_val:
+            long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
+        else:
+            long_val_suffix = ", long_n=[skipped]"
+    print(
+        f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
+        f"({n_perfect}/{n_val} perfect, "
+        f"|H|={current_complexity_bits + integer_code_length(hidden_size)}b"
+        f"{long_val_suffix})"
+        f"{best_tag}"
+    )
+    if is_best:
+        best['n_perfect'] = n_perfect
+        best['gen_n'] = gen_n
+        best['long_val_passes'] = long_val_probe["passed_count"]
+        best['complexity_bits'] = current_complexity_bits
+        best['params'] = jax.tree.map(lambda x: x.copy(), state.params)
+        if run_dir is not None:
+            save_checkpoint(best['params'], checkpoint_path(run_dir, "best.npz"))
+            save_checkpoint_meta(
+                run_dir,
+                epoch + 1,
+                best['n_perfect'],
+                best_checkpoint_epoch=epoch + 1,
+            )
+            print(f"              ↳ [CKPT] checkpoint saved")
+    return best
+
+
 def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
     """Run one training epoch, return updated state and aggregated metrics."""
     rng, perm_rng = jrandom.split(rng)
@@ -524,11 +601,13 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
     print("-" * 70)
 
-    best_val_n_perfect = -1
-    best_val_gen_n = -1
-    best_long_val_passes = -1
-    best_complexity_bits = math.inf
-    best_params = None
+    best = {
+        'n_perfect': -1,
+        'gen_n': -1,
+        'long_val_passes': -1,
+        'complexity_bits': math.inf,
+        'params': None,
+    }
     long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
     prev_phase_name = None
     if start_epoch > 0:
@@ -545,120 +624,185 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             prev_tau,
         )
 
+    is_full_batch = bs >= N
+
+    # Full-batch fusion: create non-JIT train steps + lax.scan runners
+    if is_full_batch:
+        warmup_step_nojit = make_train_step(
+            args.mdl_lambda, n_train=N, n_samples=1, soft_forward=True, jit=False,
+        )
+        st_step_nojit = make_train_step(
+            args.mdl_lambda, n_train=N, n_samples=effective_n_samples, jit=False,
+        )
+        det_st_step_nojit = None
+        if use_det_st:
+            det_st_step_nojit = make_train_step(
+                args.mdl_lambda, n_train=N, n_samples=effective_n_samples,
+                deterministic_st=True, jit=False,
+            )
+        fused_warmup = make_fused_epoch_fn(
+            warmup_step_nojit, x_train, y_train, mask_train,
+            total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
+        )
+        fused_st = make_fused_epoch_fn(
+            st_step_nojit, x_train, y_train, mask_train,
+            total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
+        )
+        fused_det_st = None
+        if det_st_step_nojit is not None:
+            fused_det_st = make_fused_epoch_fn(
+                det_st_step_nojit, x_train, y_train, mask_train,
+                total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
+            )
+        print(f"  [FUSED] Full-batch mode: epochs fused via lax.scan")
+
     t0 = time.time()
-    for epoch in range(start_epoch, total_epochs):
-        tau = anneal_tau_st_phase(
-            epoch, total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
-        )
-        phase_name = _phase_name_for_epoch(
-            epoch,
-            warmup_epochs,
-            bridge_epochs,
-            args.deterministic_st,
-            args.det_st_after_tau,
-            tau,
-        )
 
-        if _should_reset_optimizer(prev_phase_name, phase_name):
-            state = _reset_optimizer_state(state)
-            print(
-                f"              ↳ [OPT] reset Adam state at "
-                f"{prev_phase_name} -> {phase_name}"
+    if is_full_batch:
+        # ----- Fused full-batch path: lax.scan over contiguous epoch runs -----
+        epoch = start_epoch
+        while epoch < total_epochs:
+            tau = anneal_tau_st_phase(
+                epoch, total_epochs, tau_hold_epochs,
+                args.tau_start, args.tau_end,
+            )
+            phase_name = _phase_name_for_epoch(
+                epoch, warmup_epochs, bridge_epochs,
+                args.deterministic_st, args.det_st_after_tau, tau,
             )
 
-        if phase_name == "warmup":
-            train_step = warmup_train_step
-        elif phase_name in ("bridge", "DST"):
-            train_step = det_st_train_step
-        else:
-            train_step = st_train_step
-
-        state = state.replace(tau=tau)
-
-        state, rng, metrics = _run_epoch(
-            state, x_train, y_train, mask_train, N, bs, rng, train_step,
-        )
-        prev_phase_name = phase_name
-
-        if (epoch + 1) % args.log_every == 0 or epoch == 0:
-            # Compute discrete argmax complexity periodically for monitoring.
-            complexity_argmax_bits = _compute_discrete_hyp_bits(
-                state.params, grid_codelengths,
-            )
-            print(
-                f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
-                f"objective_total_bits={metrics['objective_total_bits']:8.1f}b  "
-                f"data_nll_bits={metrics['data_nll_bits']:8.1f}b  "
-                f"reg_net_bits={metrics['reg_net_bits']:7.1f}b "
-                f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
-                f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
-                f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
-                f"complexity_argmax_bits={complexity_argmax_bits:4d}b  "
-                f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  τ={float(tau):.4f}"
-            )
-
-        if (epoch + 1) % args.eval_every == 0:
-            val_result = evaluate_deterministic_accuracy(
-                state.apply_fn, state.params, grid_values,
-                val_inputs, val_targets,
-            )
-            n_perfect = val_result["n_perfect"]
-            gen_n = val_result["gen_n"]
-            current_complexity_bits = _compute_discrete_hyp_bits(
-                state.params, grid_codelengths,
-            )
-            val_summary = _format_val_summary(val_result, val_inputs)
-            n_val = val_summary["n_val"]
-            fail_abs_n = val_summary["fail_abs_n"]
-            long_val_probe = {
-                "passed_count": 0,
-                "all_passed": True,
-                "summary": "",
-            }
-            if n_perfect == n_val and long_val_probe_ns:
-                long_val_probe = _evaluate_long_val_probes(
-                    state.params, grid, grid_values, long_val_probe_ns,
+            if _should_reset_optimizer(prev_phase_name, phase_name):
+                state = _reset_optimizer_state(state)
+                print(
+                    f"              ↳ [OPT] reset Adam state at "
+                    f"{prev_phase_name} -> {phase_name}"
                 )
-            val_sym = "✓" if fail_abs_n is None else f"✗ (fails@{fail_abs_n})"
-            is_best = _should_update_best(
-                n_perfect,
-                gen_n,
-                long_val_probe["passed_count"],
-                current_complexity_bits,
-                best_val_n_perfect,
-                best_val_gen_n,
-                best_long_val_passes,
-                best_complexity_bits,
+
+            # Scan forward: find how many contiguous same-phase epochs to fuse,
+            # stopping at log/eval boundaries.
+            run_end = epoch
+            for e in range(epoch, total_epochs):
+                e_tau = anneal_tau_st_phase(
+                    e, total_epochs, tau_hold_epochs,
+                    args.tau_start, args.tau_end,
+                )
+                e_phase = _phase_name_for_epoch(
+                    e, warmup_epochs, bridge_epochs,
+                    args.deterministic_st, args.det_st_after_tau, e_tau,
+                )
+                if e_phase != phase_name:
+                    break
+                run_end = e + 1
+                needs_log = ((e + 1) % args.log_every == 0) or e == 0
+                needs_eval = (e + 1) % args.eval_every == 0
+                if needs_log or needs_eval:
+                    break
+
+            n_steps = run_end - epoch
+
+            if phase_name == 'warmup':
+                fused = fused_warmup
+            elif phase_name in ('bridge', 'DST'):
+                fused = fused_det_st
+            else:
+                fused = fused_st
+
+            state, rng, metrics = fused(state, rng, epoch, n_steps)
+
+            last_epoch = run_end - 1
+            last_tau = anneal_tau_st_phase(
+                last_epoch, total_epochs, tau_hold_epochs,
+                args.tau_start, args.tau_end,
             )
-            best_tag = "  ★ NEW BEST" if is_best else ""
-            long_val_suffix = ""
-            if long_val_probe_ns:
-                if n_perfect == n_val:
-                    long_val_suffix = f", long_n=[{long_val_probe['summary']}]"
-                else:
-                    long_val_suffix = ", long_n=[skipped]"
-            print(
-                f"              ↳ val: {val_summary['val_desc']} {val_sym}  "
-                f"({n_perfect}/{n_val} perfect, "
-                f"|H|={current_complexity_bits + integer_code_length(args.hidden_size)}b"
-                f"{long_val_suffix})"
-                f"{best_tag}"
+
+            if ((last_epoch + 1) % args.log_every == 0) or last_epoch == 0:
+                complexity_argmax_bits = _compute_discrete_hyp_bits(
+                    state.params, grid_codelengths,
+                )
+                print(
+                    f"Epoch {last_epoch+1:5d} [{phase_name:4s}] | "
+                    f"objective_total_bits={float(metrics['objective_total_bits']):8.1f}b  "
+                    f"data_nll_bits={float(metrics['data_nll_bits']):8.1f}b  "
+                    f"reg_net_bits={float(metrics['reg_net_bits']):7.1f}b "
+                    f"(reg_complexity_weighted_bits={float(metrics['reg_complexity_weighted_bits']):.1f}b "
+                    f"- reg_entropy_bonus_bits={float(metrics['reg_entropy_bonus_bits']):.1f}b) | "
+                    f"complexity_expected_bits={float(metrics['complexity_expected_bits']):.1f}b  "
+                    f"complexity_argmax_bits={int(complexity_argmax_bits):4d}b  "
+                    f"entropy_weights_bits={float(metrics['entropy_weights_bits']):5.1f}b  "
+                    f"τ={float(last_tau):.4f}"
+                )
+
+            if (last_epoch + 1) % args.eval_every == 0:
+                best = _eval_and_update_best(
+                    state, last_epoch, args.hidden_size,
+                    grid_values, grid_codelengths,
+                    val_inputs, val_targets, grid, long_val_probe_ns,
+                    best, run_dir,
+                )
+
+            prev_phase_name = phase_name
+            epoch = run_end
+
+    else:
+        # ----- Mini-batch fallback: original per-epoch loop -----
+        for epoch in range(start_epoch, total_epochs):
+            tau = anneal_tau_st_phase(
+                epoch, total_epochs, tau_hold_epochs, args.tau_start, args.tau_end,
             )
-            if is_best:
-                best_val_n_perfect = n_perfect
-                best_val_gen_n = gen_n
-                best_long_val_passes = long_val_probe["passed_count"]
-                best_complexity_bits = current_complexity_bits
-                best_params = jax.tree.map(lambda x: x.copy(), state.params)
-                if run_dir is not None:
-                    save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
-                    save_checkpoint_meta(
-                        run_dir,
-                        epoch + 1,
-                        best_val_n_perfect,
-                        best_checkpoint_epoch=epoch + 1,
-                    )
-                    print(f"              ↳ [CKPT] checkpoint saved")
+            phase_name = _phase_name_for_epoch(
+                epoch,
+                warmup_epochs,
+                bridge_epochs,
+                args.deterministic_st,
+                args.det_st_after_tau,
+                tau,
+            )
+
+            if _should_reset_optimizer(prev_phase_name, phase_name):
+                state = _reset_optimizer_state(state)
+                print(
+                    f"              ↳ [OPT] reset Adam state at "
+                    f"{prev_phase_name} -> {phase_name}"
+                )
+
+            if phase_name == "warmup":
+                train_step = warmup_train_step
+            elif phase_name in ("bridge", "DST"):
+                train_step = det_st_train_step
+            else:
+                train_step = st_train_step
+
+            state = state.replace(tau=tau)
+
+            state, rng, metrics = _run_epoch(
+                state, x_train, y_train, mask_train, N, bs, rng, train_step,
+            )
+            prev_phase_name = phase_name
+
+            if (epoch + 1) % args.log_every == 0 or epoch == 0:
+                complexity_argmax_bits = _compute_discrete_hyp_bits(
+                    state.params, grid_codelengths,
+                )
+                print(
+                    f"Epoch {epoch+1:5d} [{phase_name:4s}] | "
+                    f"objective_total_bits={metrics['objective_total_bits']:8.1f}b  "
+                    f"data_nll_bits={metrics['data_nll_bits']:8.1f}b  "
+                    f"reg_net_bits={metrics['reg_net_bits']:7.1f}b "
+                    f"(reg_complexity_weighted_bits={metrics['reg_complexity_weighted_bits']:.1f}b "
+                    f"- reg_entropy_bonus_bits={metrics['reg_entropy_bonus_bits']:.1f}b) | "
+                    f"complexity_expected_bits={metrics['complexity_expected_bits']:.1f}b  "
+                    f"complexity_argmax_bits={int(complexity_argmax_bits):4d}b  "
+                    f"entropy_weights_bits={metrics['entropy_weights_bits']:5.1f}b  "
+                    f"τ={float(tau):.4f}"
+                )
+
+            if (epoch + 1) % args.eval_every == 0:
+                best = _eval_and_update_best(
+                    state, epoch, args.hidden_size,
+                    grid_values, grid_codelengths,
+                    val_inputs, val_targets, grid, long_val_probe_ns,
+                    best, run_dir,
+                )
 
     elapsed = time.time() - t0
     print("-" * 70)
@@ -668,7 +812,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
         save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
         print(f"  [CKPT] Final checkpoint saved")
 
-    return state, best_params, best_val_n_perfect
+    return state, best['params'], best['n_perfect']
 
 
 def _run_epoch_shared(state, x_train, y_train, mask_train, N, bs, rng,

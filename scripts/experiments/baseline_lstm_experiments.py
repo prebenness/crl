@@ -53,6 +53,14 @@ from src.mdl.baseline_lstm import (
 from src.mdl.training import evaluate_deterministic_accuracy
 from src.mdl.golden import golden_mdl_score
 from src.mdl.coding import integer_code_length
+from src.mdl.evaluation import (
+    compute_grammar_weighted_nll_bits,
+    compute_optimal_dh_test,
+    compute_optimal_dh_train,
+    compute_train_dh,
+    compute_delta_pct,
+    format_abudy_comparison_table,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +414,24 @@ def _main_inner(args, run_dir):
         state.params, args.hidden_size,
     )
 
+    # Grammar-weighted evaluation metrics (Abudy et al. 2025 convention)
+    def _baseline_fwd(x):
+        logits, _ = state.apply_fn({"params": state.params}, x, train=False)
+        return logits
+
+    print("\nComputing grammar-weighted |D:H| metrics...")
+    test_dh = compute_grammar_weighted_nll_bits(
+        _baseline_fwd, max_n=args.test_max_n, p=args.p, batch_size=64,
+    )
+    train_dh = compute_train_dh(_baseline_fwd, train_inputs, train_targets)
+    golden_opt = compute_optimal_dh_test(max_n=args.test_max_n, p=args.p)
+    golden_train = compute_optimal_dh_train(train_inputs, train_targets, p=args.p)
+
+    test_data_dh = test_dh["data_dh_bits"]
+    train_data_dh = train_dh["train_dh_data_bits"]
+    delta_test = compute_delta_pct(test_data_dh, golden_opt["data_dh_bits"])
+    delta_train = compute_delta_pct(train_data_dh, golden_train["train_dh_data_bits"])
+
     # Summary
     our_gen_n = test_result["gen_n"]
     our_n_perfect = test_result["n_perfect"]
@@ -418,29 +444,25 @@ def _main_inner(args, run_dir):
 
     print(f"\n  MDL score (rationalized): {mdl_score['total_bits']} bits "
           f"({mdl_score['arch_bits']} arch + {mdl_score['weight_bits']} weights)")
+    print(f"  Test |D:H|: {test_data_dh:.4f} bits  (Δ_test = {delta_test:+.1f}%)")
+    print(f"  Train |D:H|: {train_data_dh:.2f} bits  (Δ_train = {delta_train:+.1f}%)")
 
     # Comparison table
-    golden_gen_n = args.test_max_n  # golden is always correct
-    n_params = mdl_score["n_params"]
-    trivial_bits = integer_code_length(args.hidden_size) + n_params * 5
-
     reg_label = f"CE+{args.reg.upper()}" if args.reg != "none" else "CE only"
     if args.early_stop > 0:
         reg_label += f"+ES({args.early_stop})"
     if args.dropout > 0:
         reg_label += f"+DO({args.dropout})"
 
-    print("\n" + "=" * 70)
-    print("COMPARISON TABLE")
-    print("=" * 70)
-    print(f"{'Method':<35} {'|H| (bits)':>10} {'gen_n':>8} {'n_perfect':>12}")
-    print("-" * 70)
-    print(f"{'Golden (Lan et al.)':<35} {golden_mdl['total_bits']:>10d} "
-          f"{golden_gen_n:>8d} {args.test_max_n:>12d}")
-    print(f"{'Trivial':<35} {trivial_bits:>10d} {0:>8d} {0:>12d}")
-    print(f"{reg_label:<35} {mdl_score['total_bits']:>10d} "
-          f"{our_gen_n:>8d} {our_n_perfect:>12d}")
-    print("=" * 70)
+    abudy_table = format_abudy_comparison_table(
+        our_test_data_dh=test_data_dh,
+        our_train_data_dh=train_data_dh,
+        our_h_bits=mdl_score["total_bits"],
+        opt_test_data_dh=golden_opt["data_dh_bits"],
+        opt_train_data_dh=golden_train["train_dh_data_bits"],
+        golden_h_bits=golden_opt["h_bits"],
+    )
+    print(f"\n{abudy_table}")
 
     # Save results
     mode_str = f"baseline_{args.reg}"
@@ -461,6 +483,12 @@ def _main_inner(args, run_dir):
         "best_val_loss": float(best_val_loss),
         "reg": args.reg,
         "reg_lambda": args.reg_lambda,
+        "test_data_dh_bits": float(test_data_dh),
+        "train_data_dh_bits": float(train_data_dh),
+        "delta_test_pct": float(delta_test),
+        "delta_train_pct": float(delta_train),
+        "golden_test_data_dh_bits": float(golden_opt["data_dh_bits"]),
+        "golden_train_data_dh_bits": float(golden_train["train_dh_data_bits"]),
     }
     with open(run_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)

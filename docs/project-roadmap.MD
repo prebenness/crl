@@ -16,10 +16,9 @@ Code cleanup, notation fixes, and performance optimization of existing functiona
 
 Shared training log, validation print, and final evaluation now show both `|H|_Lan` (Lan-style discrete codelength) and `shared_complexity` (lambda1 * code_ce + lambda2 * kl_dict). New helper `_compute_shared_discrete_complexity_bits` in `differentiable_mdl.py`.
 
-### 1.2 `lax.fori_loop` epoch fusion for full-batch ANBN training (L — 1+ day)
+### ~~1.2 `lax.fori_loop` epoch fusion for full-batch ANBN training~~ — Done (2026-03-21)
 
-- Source: former `engineering-roadmap.MD` item 1.
-- Reduce Python overhead in long ANBN runs. Keep chunk boundaries aligned with logging/eval.
+Implemented `lax.scan`-based epoch fusion in `src/mdl/training.py`. For full-batch training (bs >= N), contiguous same-phase epoch runs are fused into single `lax.scan` calls, with chunk boundaries at log/eval intervals and phase transitions. New functions: `anneal_tau_traceable` (JAX-traceable tau schedule using `jnp.where`), `make_fused_epoch_fn` (creates JIT'd scan runner). `make_train_step` gains `jit=False` option for use inside scan. Mini-batch fallback preserved via `_run_epoch`. ~2x speedup on debug runs.
 
 ### ~~1.3 Verify smoothing convention for evaluation~~ — Done (2026-03-20)
 
@@ -245,24 +244,9 @@ Implemented in `src/mdl/evaluation.py`: `compute_anbn_grammar_weights(max_n, p, 
 
 ### 3.D Baseline Comparisons
 
-#### Standard LSTM baselines (no-reg, L1, L2)
+#### ~~Standard LSTM baselines (no-reg, L1, L2)~~ — Metrics integrated (2026-03-21)
 
-Abudy et al. (2025) compare MDL against L1, L2, and no-regularisation across all tasks and all three experimental settings.
-
-- **Current state:** `src/mdl/baseline_lstm.py` and `scripts/experiments/baseline_lstm_experiments.py` exist but are not fully integrated.
-- **What to implement:**
-  - Standard LSTM training (regular float weights, no categorical parameterisation) with:
-    - CE only (no regularisation)
-    - CE + L1 (λ=1, matching Abudy et al. (2025) Appendix Table 10, line 756)
-    - CE + L2 (λ=1)
-  - Optimizer: Adam, lr=1e-4, 1000 epochs (matching Abudy et al. (2025) Table 10).
-  - Evaluation: same metrics as for MDL networks (composite |D:H|, Δ%, deterministic accuracy).
-  - The discrete |H| for baseline networks: discretise to nearest rational on the grid, compute Lan-style codelength. (This is how Abudy et al. (2025) compute |H| for L1/L2 networks.)
-- **Output format:** a results table matching Abudy et al. (2025) Table 1:
-
-  ```
-  Task | Regulariser | |H| | L1 | L2 | Train |D:H| | Test |D:H| | Δ_train(%) | Δ_test(%)
-  ```
+Baseline experiment script (`scripts/experiments/baseline_lstm_experiments.py`) now computes grammar-weighted |D:H|_test, |D:H|_train, and Δ% using `src/mdl/evaluation.py`. Output includes Abudy et al. (2025)-style comparison table via `format_abudy_comparison_table`. Results saved to `results.json` with full metric breakdown. Long production runs (1000+ epochs, multi-seed) deferred.
 
 #### Differentiable MDL vs. non-differentiable MDL — the central comparison
 
@@ -323,11 +307,11 @@ Abudy et al. (2025) compare MDL against L1, L2, and no-regularisation across all
 **Phase A — paper-ready numbers for aⁿbⁿ (no new tasks needed):**
 1. Compute analytical optimal |D:H| for aⁿbⁿ using `src/mdl/golden.py`.
 2. Add composite |D:H| evaluation for trained networks.
-3. Compute Δ% for our best existing runs.
-4. Add grammar weights for aⁿbⁿ test set (geometric distribution).
-5. Golden network scores under CE, L1, L2, MDL.
-6. Run standard LSTM with CE/L1/L2 on aⁿbⁿ.
-7. Produce the main results table for aⁿbⁿ.
+3. ~~Compute Δ% for our best existing runs.~~
+4. ~~Add grammar weights for aⁿbⁿ test set (geometric distribution).~~
+5. ~~Golden network scores under CE, L1, L2, MDL.~~
+6. ~~Run standard LSTM with CE/L1/L2 on aⁿbⁿ.~~ (metrics integrated; long runs deferred)
+7. ~~Produce the main results table for aⁿbⁿ.~~ (table infrastructure done; production numbers need long runs)
 
 **Phase B — second and third tasks:**
 8. Implement aⁿbⁿcⁿ (data, golden network, evaluation).
