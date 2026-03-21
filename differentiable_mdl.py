@@ -607,10 +607,12 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
         state.params, grid_codelengths,
     )
 
-    # Soft-forward accuracy (smooth metric)
+    # Soft-forward accuracy (smooth metric).
+    # Use fixed τ=1.0 so soft weights always interpolate meaningfully on the
+    # grid.  At low training τ the softmax is too peaked and soft ≈ hard.
     soft_acc = _compute_soft_val_accuracy(
         state.apply_fn, state.params, val_inputs, val_targets,
-        tau=float(state.tau),
+        tau=1.0,
     )
 
     n_val = len(val_inputs)
@@ -977,14 +979,19 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 args.tau_start, args.tau_end,
             )
 
-            if ((last_epoch + 1) % args.log_every == 0) or last_epoch == 0:
+            needs_log = ((last_epoch + 1) % args.log_every == 0) or last_epoch == 0
+            needs_eval = (last_epoch + 1) % args.eval_every == 0
+
+            if needs_log or needs_eval:
+                print(_fmt_epoch_header(last_epoch + 1, phase_name, last_tau))
+
+            if needs_log:
                 complexity_argmax_bits = _compute_discrete_hyp_bits(
                     state.params, grid_codelengths,
                 )
-                print(_fmt_epoch_header(last_epoch + 1, phase_name, last_tau))
                 print(_fmt_train_line(metrics, complexity_argmax_bits))
 
-            if (last_epoch + 1) % args.eval_every == 0:
+            if needs_eval:
                 best = _eval_and_update_best(
                     state, last_epoch, args.hidden_size,
                     grid_values, grid_codelengths,
@@ -1292,10 +1299,10 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 long_val_probe = _evaluate_long_val_probes(
                     model_params, grid, grid_values, long_val_probe_ns,
                 )
-            # Soft-forward accuracy (smooth metric)
+            # Soft-forward accuracy (smooth metric, fixed τ=1.0)
             soft_acc = _compute_soft_val_accuracy(
                 state.apply_fn, model_params, val_inputs, val_targets,
-                tau=float(state.tau),
+                tau=1.0,
             )
             is_best = _should_update_best(
                 n_perfect,
