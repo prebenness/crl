@@ -2,7 +2,7 @@
 
 What we need to show, what numbers to hit, and where the comparisons come from.
 
-Updated 2026-03-20.
+Updated 2026-03-21.
 
 ---
 
@@ -147,10 +147,6 @@ Trained on length [0,40], tested on length [0,500]. Recognition accuracy (mean �
 
 Nobody achieves 100% recognition accuracy on anything beyond regular languages with standard architectures.
 
-### SD-SSM (AAAI 2025)
-
-Perfect 100% length generalization on *regular languages* only. Single layer. Does not address counter or context-free languages.
-
 ---
 
 ## 4. Progression Goals
@@ -227,9 +223,104 @@ Our separate computation gives |H| = 1137 bits for the same LSTM golden net. Thi
 
 ---
 
-## 6. Implementation Tasks: Architecture Verification & Free-Form RNN
+## 6. Threats to Fair Comparison
 
-### 6.1 Task A: Verify LSTM golden network |H| against Lan et al. (2024)
+Concrete issues found by comparing our code (`src/mdl/`, `config/anbn_mdl/basic_train.yaml`) against the experimental details in Abudy et al. (2025, Appendix D) and Lan et al. (2024).
+
+### 6.1 Test set starts at n=0, Abudy starts at n=1
+
+**Status: MUST FIX before reporting Δ_test.**
+
+`compute_grammar_weighted_nll_bits` in `evaluation.py` iterates `for n in range(0, max_n + 1)` — includes the empty string (n=0). Abudy et al. (2025, Appendix "Task-specific probabilistic grammars") explicitly state: "test includes all n = 1, ..., 1020". The empty string has PCFG weight P(0) = 0.3, which is the largest single weight in the distribution. Including or excluding it will shift the absolute |D:H| and therefore Δ_test.
+
+**Fix:** add a `min_n` parameter to `compute_grammar_weighted_nll_bits` and default it to 1 for Abudy-comparable reporting. Keep the n=0 variant available for information-theoretic completeness, but clearly label which convention each number uses.
+
+### 6.2 Test set range differs: we use fixed n=1..1500, Abudy uses n=1..(n_max_train + 1000)
+
+**Status: SHOULD VERIFY whether this matters numerically.**
+
+Our `test_max_n: 1500` is hardcoded in the config. Abudy's test set goes to n_max_train + 1000 — so if training samples go up to n=20, the test set covers n=1..1020. With Geometric(p=0.3) weighting, P(1500) ≈ 5.6×10⁻²³⁵ — effectively zero. In practice this likely makes no numerical difference to the grammar-weighted |D:H|, but it should be documented. The more important difference is that our grammar weights are raw P(n) = p(1−p)^n (unnormalized, summing to ~1 for large max_n), while Abudy says "weighted by their true probabilities" — confirm whether they normalize.
+
+### 6.3 Learning rate is 500× higher than Abudy's GD baseline
+
+**Status: DEFENSIBLE but must be stated explicitly.**
+
+Our config: `lr: 0.05` (Adam). Abudy Experiment 3 (Appendix D): Adam with lr = 10⁻⁴. Lan et al. (2024): Adam with lr = 0.001, β₁=0.9, β₂=0.999.
+
+This is a 500× difference vs Abudy and 50× vs Lan. It's defensible because:
+- We optimize categorical logits (softmax parameterization), not continuous weights directly. The gradient magnitudes and loss landscape are structurally different.
+- Abudy's GD experiment starts from golden weights and trains 1000 epochs with a free-form RNN. We train from random init for 10000 epochs with an LSTM. These are fundamentally different experimental setups.
+
+**Nevertheless**, a reviewer will check this. The paper must state our lr and justify the difference. Consider running a small ablation over lr ∈ {0.001, 0.01, 0.05, 0.1} to show results are not cherry-picked.
+
+### 6.4 Abudy's GD baselines use free-form RNNs, not LSTMs
+
+**Status: MUST BE STATED clearly in any comparison table.**
+
+Confirmed from Abudy et al. (2025, Section 4.3): "we extend the analysis to new tasks and free-form RNNs." Their Experiment 3 GD baselines all use free-form RNNs. Our experiments use LSTMs.
+
+Consequences:
+- **Δ_test comparison is still valid** — it only measures output quality, not model size.
+- **|H| comparison is NOT valid** across architectures (1137 vs 139 for golden; ~5500 vs our LSTM |H| for trained).
+- The cleanest argument is within-architecture: "our MDL-LSTM achieves |H|=X vs baseline-LSTM |H|=Y, a Z× improvement." Cross-architecture comparisons should be presented as context, not direct comparisons.
+
+### 6.5 Rational grid cannot represent the golden solution
+
+**Status: BY DESIGN, but must be understood and stated.**
+
+Our config: `n_max: 10, m_max: 10`, producing ~68 grid values with numerators ≤ 10 and denominators ≤ 10. The LSTM golden network uses `LARGE = 127` for saturated gates. The value 127 = 127/1 requires n_max ≥ 127, which is far beyond our grid. Even `shared_train.yaml` with n_max=15 cannot represent 127.
+
+This means: the trained network **cannot** discover the exact Lan et al. golden solution by construction. It must find an alternative solution. This is actually fine and arguably interesting — if our method finds a *different* network with similar |D:H| but smaller |H| (because it uses simpler weights), that's a positive result. But we must acknowledge that the golden LSTM is not in our search space.
+
+**Impact on reporting:** Our trained |H| and the golden |H| = 1137 are computed over the same coding scheme, so comparison is fair. But saying "our method found a solution with |H| = X < 1137" would be misleading if the golden solution was unreachable anyway. The honest framing is: "our method finds solutions in the restricted grid S with |H| = X, while the golden LSTM requires weights outside S."
+
+### 6.6 Training loss averages over positions; |D:H| sums then grammar-weights
+
+**Status: NOT A BUG, but an asymmetry to document.**
+
+`_compute_data_nll_bits` in `training.py` divides by `sum(mask)` — per-position average. The reported test |D:H| (`compute_grammar_weighted_nll_bits`) sums over positions per string, then grammar-weights across strings. The training objective thus weights all positions equally regardless of string length, while the evaluation metric implicitly weights positions in longer strings more (since NLL is summed per string, and longer strings have more terms).
+
+This is standard practice (most LM papers train on per-token loss but report per-sequence or per-dataset metrics), but it means we're not directly optimizing the exact metric we report.
+
+### 6.7 λ/N scaling makes effective λ depend on corpus size
+
+**Status: DOCUMENT clearly.**
+
+Our training objective is: `data_nll_avg + (lambda/N) × E[|H|] - (1/N) × tau × H(pi)`. With `lambda=1000` and `N=1000`, the effective weight on |H| is 1.0 per string. But Abudy's GA optimizes `|D:H|_total + |H|` directly — pure MDL with no λ. Their GD experiment uses `lambda=1` for L1/L2 on continuous weights, which is a different regularizer entirely.
+
+The paper should report the effective regularization strength, not just the config value. State explicitly: "effective λ_eff = mdl_lambda / N = 1.0."
+
+### 6.8 Number of seeds
+
+**Status: MUST RUN multiple seeds for submission.**
+
+Deletang et al. (2023): 10 seeds. FLaRe (2025): 10 seeds × 4 loss variants. Abudy Experiment 3: single seed (seed=100, corpus_seed=100). Our config: single seed (seed=0, data_seed=0).
+
+For Abudy-comparable experiments, a single seed may suffice (they only ran one). For FLaRe/Deletang comparison or any claim of consistent improvement, we need at least 5 seeds with mean ± std.
+
+### 6.9 Smoothing convention: training vs evaluation
+
+**Status: ALREADY HANDLED, verify consistency.**
+
+Training uses `optax.softmax_cross_entropy_with_integer_labels` (numerically stable log_softmax). Evaluation uses additive 1e-10 smoothing matching Abudy (implemented in `compute_data_nll_bits_smoothed` and `compute_per_string_nll_bits`). This split is correct — train with stable numerics, report with Abudy's convention. But verify the two give similar values on the golden network; any significant gap would indicate a bug.
+
+### 6.10 Abudy GD starts from golden weights; we start from random init
+
+**Status: DIFFERENT EXPERIMENTAL QUESTION, not a bug.**
+
+Abudy Experiment 3 trains free-form RNNs "starting from the golden weights" with L1/L2/none for 1000 epochs. Their question: "does GD preserve the golden solution under different regularizers?" Our question: "can GD + differentiable MDL *discover* good solutions from scratch?"
+
+These are complementary experiments. We should present both:
+1. From-scratch training → demonstrates our method's discovery capability.
+2. From-golden-init training (if we implement free-form RNN) → directly comparable to Abudy Exp 3.
+
+Neither alone tells the whole story.
+
+---
+
+## 7. Implementation Tasks: Architecture Verification & Free-Form RNN
+
+### 7.1 Task A: Verify LSTM golden network |H| against Lan et al. (2024)
 
 **Goal:** Confirm our LSTM golden network's |H| matches Lan et al. (2024) exactly.
 
@@ -251,13 +342,13 @@ Our separate computation gives |H| = 1137 bits for the same LSTM golden net. Thi
 
 3. Compute the data term L_D on the Lan et al. training set (1000 strings from Geometric(p=0.3), train/val split 950/50) and check whether |H| + L_D ≈ 3920 under their λ convention.
 
-4. **If there's a mismatch:** compare our `integer_code_length` and `rational_codelength` against the Li & Vitányi (2008) scheme described in Lan et al. Section 3.2. The self-delimiting code is E(n) = 1^{k(n)} 0 bin_{k(n)}(n), |E(n)| = 2k(n)+1, k(n) = ceil(log2(n+1)).
+4. **If there's a mismatch:** compare our `integer_code_length` and `rational_codelength` against the encoding scheme described in Lan et al. (2024) Section 3.2 (see `agent-context/arxiv/arXiv-2402.10013v2_contents/main-acl.tex`). The self-delimiting code is E(n) = 1^{k(n)} 0 bin_{k(n)}(n), |E(n)| = 2k(n)+1, k(n) = ceil(log2(n+1)).
 
 **Expected result:** Our |H| = 1137 bits is correct for the LSTM golden net. The 3920 from Lan's table includes the data term. Document the exact decomposition.
 
 ---
 
-### 6.2 Task B: Implement free-form RNN golden network for a^nb^n
+### 7.2 Task B: Implement free-form RNN golden network for a^nb^n
 
 **Goal:** Implement the Lan et al. (2022 TACL) / Abudy et al. (2025) free-form RNN architecture, build the a^nb^n golden network, and verify |H| = 139 bits exactly.
 
@@ -291,7 +382,7 @@ The encoding for a free-form RNN encodes:
 
 **The crucial difference from LSTM encoding:** only connections that *exist* are encoded. No bits are wasted on zero-weight connections. This is why |H| = 139 for the free-form RNN vs 1137 for the LSTM — the LSTM must encode 83 zeros at 5 bits each.
 
-**The exact encoding details are in Lan et al. (2022), arXiv:2111.00600** (see `agent-context/arxiv/arXiv-2111.00600v4_contents/`). Abudy et al. reference it (line 259) but do not reproduce the full encoding scheme. The Lan 2022 paper and/or its reference implementation at [github.com/taucompling/mdlrnn](https://github.com/taucompling/mdlrnn) are essential for verifying the 139-bit count.
+**The exact encoding details are in Lan et al. (2022)** (see `agent-context/arxiv/arXiv-2111.00600v4_contents/main-3649-Lan.tex`). Abudy et al. reference it (line 259) but do not reproduce the full encoding scheme. The Lan 2022 paper is essential for verifying the 139-bit count.
 
 **Implementation steps:**
 
@@ -365,24 +456,24 @@ The encoding for a free-form RNN encodes:
 
 ---
 
-## 7. Key Reference Papers
+## 8. Key Reference Papers
 
 Papers available in `agent-context/arxiv/` that are essential for the implementation tasks above.
 
 ### For Task A (LSTM golden net verification)
 
-- **Lan, Chemla & Katzir (2024)** — "Bridging the Empirical-Theoretical Gap..." (ACL 2024). Appendix B has the exact LSTM golden network construction, weight matrices, output layer derivation, and encoding scheme. Directory: `arXiv-2402.10013v2_contents/`.
+- **Lan, Chemla & Katzir (2024)** — "Bridging the Empirical-Theoretical Gap..." (ACL 2024). Appendix B has the exact LSTM golden network construction, weight matrices, output layer derivation, and encoding scheme. See `agent-context/arxiv/arXiv-2402.10013v2_contents/main-acl.tex`.
 
-- **Weiss, Goldberg & Yahav (2018)** — "On the Practical Computational Power of Finite Precision RNNs for Language Recognition" (ACL 2018 Short). Source of the LSTM counting recipe (saturated gates, unit increment/decrement in cell state). Cited by Lan et al. (2024) as the basis for the golden LSTM. Directory: `arXiv-1805.04908v1_contents/`.
+- **Weiss, Goldberg & Yahav (2018)** — "On the Practical Computational Power of Finite Precision RNNs for Language Recognition" (ACL 2018 Short). Source of the LSTM counting recipe (saturated gates, unit increment/decrement in cell state). Cited by Lan et al. (2024) as the basis for the golden LSTM. See `agent-context/arxiv/arXiv-1805.04908v1_contents/`.
 
 ### For Task B (free-form RNN)
 
-- **Lan, Geyer, Chemla & Katzir (2022)** — "Minimum Description Length Recurrent Neural Networks" (TACL 10:785–799). **This is the critical reference.** Contains the complete free-form RNN encoding scheme: how to encode unit count, activation types, biases, connection topology (adjacency), and weights. The 139-bit golden network for a^nb^n originates here. Also provides the reference implementation. Directory: `arXiv-2111.00600v4_contents/`. Code: [github.com/taucompling/mdlrnn](https://github.com/taucompling/mdlrnn).
+- **Lan, Geyer, Chemla & Katzir (2022)** — "Minimum Description Length Recurrent Neural Networks" (TACL 10:785–799). **This is the critical reference.** Contains the complete free-form RNN encoding scheme: how to encode unit count, activation types, biases, connection topology (adjacency), and weights. The 139-bit golden network for a^nb^n originates here. See `agent-context/arxiv/arXiv-2111.00600v4_contents/main-3649-Lan.tex`.
 
-- **Abudy et al. (2025)** — "A Minimum Description Length Approach to Regularization in Neural Networks" (NeurIPS 2025). Figure 7 has the a^nb^n golden network diagram, Figure 8 has the differentiable variant. Table 1 has the |H| = 139 and Δ_test values. Experiment 3 has the GD baselines. Directory: `arXiv-2505.13398v2_contents/`.
+- **Abudy et al. (2025)** — "A Minimum Description Length Approach to Regularization in Neural Networks" (NeurIPS 2025). Figure 7 has the a^nb^n golden network diagram, Figure 8 has the differentiable variant. Table 1 has the |H| = 139 and Δ_test values. Experiment 3 has the GD baselines. See `agent-context/arxiv/arXiv-2505.13398v2_contents/main.tex`.
 
 ### For recognition accuracy comparisons
 
-- **Deletang et al. (2023)** — "Neural Networks and the Chomsky Hierarchy" (ICLR 2023). The 20,910-model benchmark across 15 formal language tasks with recognition accuracy. Establishes that standard LSTMs fail to generalize on counter and context-free languages. Directory: `arXiv-2207.02098v3_contents/`.
+- **Deletang et al. (2023)** — "Neural Networks and the Chomsky Hierarchy" (ICLR 2023). The 20,910-model benchmark across 15 formal language tasks with recognition accuracy. Establishes that standard LSTMs fail to generalize on counter and context-free languages. See `agent-context/arxiv/arXiv-2207.02098v3_contents/`.
 
-- **FLaRe / Bhatt et al. (2025)** — "Training Neural Networks as Recognizers of Formal Languages" (ICLR 2025). Current benchmark for formal language recognition. Trained on [0,40], tested on [0,500]. Provides the LSTM/RNN/Transformer baselines we compare against. Directory: `arXiv-2411.07107v3_contents/`.
+- **FLaRe / Svete et al. (2025)** — "Training Neural Networks as Recognizers of Formal Languages" (ICLR 2025). Current benchmark for formal language recognition. Trained on [0,40], tested on [0,500]. Provides the LSTM/RNN/Transformer baselines we compare against. See `agent-context/arxiv/arXiv-2411.07107v3_contents/main.tex`.
