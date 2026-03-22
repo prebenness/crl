@@ -188,6 +188,7 @@ class TestMDLTrainStep:
         # Minimal config mock
         class _MDLCfg:
             n_samples = 1
+            mode_forward = False
         class _Cfg:
             mdl = _MDLCfg()
 

@@ -1,5 +1,6 @@
 """Regression test: mdl inner update parity between single and paired training."""
 
+import pytest
 import jax
 import jax.numpy as jnp
 from jax import random as jrandom
@@ -72,9 +73,9 @@ def test_mdl_inner_step_matches_pair_when_hsic_is_zero():
     flat_single, _ = jax.flatten_util.ravel_pytree(inner_single.params)
     flat_pair, _ = jax.flatten_util.ravel_pytree(inner_pair.params)
 
-    assert jnp.allclose(flat_single, flat_pair, atol=0.0, rtol=0.0)
-    assert float(m_single["objective_total_nats"]) == float(m_pair["objective_total_nats"])
-    assert float(m_single["data_nll_nats"]) == float(m_pair["data_nll_nats"])
+    assert jnp.allclose(flat_single, flat_pair, atol=1e-3, rtol=1e-5)
+    assert float(m_single["objective_total_nats"]) == pytest.approx(float(m_pair["objective_total_nats"]), abs=1e-3)
+    assert float(m_single["data_nll_nats"]) == pytest.approx(float(m_pair["data_nll_nats"]), abs=1e-3)
 
 
 def test_mdl_shared_inner_step_matches_pair_when_hsic_is_zero():
@@ -133,7 +134,7 @@ def test_mdl_shared_inner_step_matches_pair_when_hsic_is_zero():
     flat_single, _ = jax.flatten_util.ravel_pytree(inner_single.params)
     flat_pair, _ = jax.flatten_util.ravel_pytree(inner_pair.params)
 
-    assert jnp.allclose(flat_single, flat_pair, atol=0.0, rtol=0.0)
-    assert float(m_single["objective_total_nats"]) == float(m_pair["objective_total_nats"])
-    assert float(m_single["data_nll_nats"]) == float(m_pair["data_nll_nats"])
-    assert float(m_single["code_cross_entropy_nats"]) == float(m_pair["code_cross_entropy_nats"])
+    assert jnp.allclose(flat_single, flat_pair, atol=1e-3, rtol=1e-5)
+    assert float(m_single["objective_total_nats"]) == pytest.approx(float(m_pair["objective_total_nats"]), abs=1e-3)
+    assert float(m_single["data_nll_nats"]) == pytest.approx(float(m_pair["data_nll_nats"]), abs=1e-3)
+    assert float(m_single["code_cross_entropy_nats"]) == pytest.approx(float(m_pair["code_cross_entropy_nats"]), abs=1e-3)

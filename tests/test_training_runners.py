@@ -61,7 +61,7 @@ def test_run_train_eval_uses_explicit_vib_metric_names():
         }
         return state, metrics
 
-    def eval_epoch_fn(state, xb, yb, rng):
+    def eval_epoch_fn(state, xb, yb, rng, counts=None):
         return jnp.array(0.90), jnp.array(0.60)
 
     results = run_train_eval(
@@ -121,7 +121,7 @@ def test_run_train_eval_pair_uses_explicit_vib_hsic_metric_names():
         }
         return inner_state, outer_state, metrics
 
-    def eval_epoch_fn(state, xb, yb, rng):
+    def eval_epoch_fn(state, xb, yb, rng, counts=None):
         if state.role == "inner":
             return jnp.array(0.95), jnp.array(0.58)
         return jnp.array(0.40), jnp.array(0.72)
