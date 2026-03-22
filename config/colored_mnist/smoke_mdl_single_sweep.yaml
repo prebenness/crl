@@ -38,7 +38,6 @@ mdl:
   m_max: 5
   tau_start: 2.0
   tau_end: 0.1
-  warmup_epochs: 1
   n_samples: 1
 
 # ---- Lambda sweep (MDL penalty weight) ----

@@ -16,7 +16,6 @@ tau_start: 1.0
 tau_end: 0.01
 batch_size: 0
 n_samples: 16
-warmup_epochs: 5000
 
 test_max_n: 1500
 eval_every: 100

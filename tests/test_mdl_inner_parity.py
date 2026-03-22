@@ -59,8 +59,8 @@ def test_mdl_inner_step_matches_pair_when_hsic_is_zero():
     mdl_lambda = 1e-1
     n_train = 60_000
 
-    single_step = make_train_step_mdl(cfg, soft_forward=False)
-    pair_step = make_train_step_mdl_pair(cfg, soft_forward=False)
+    single_step = make_train_step_mdl(cfg)
+    pair_step = make_train_step_mdl_pair(cfg)
 
     inner_single, m_single = single_step(
         inner_single, (x, y), step_rng, mdl_lambda, n_train,
@@ -120,8 +120,8 @@ def test_mdl_shared_inner_step_matches_pair_when_hsic_is_zero():
     mdl_lambda = 1e-1
     n_train = 60_000
 
-    single_step = make_train_step_mdl_shared(cfg, soft_forward=False)
-    pair_step = make_train_step_mdl_shared_pair(cfg, soft_forward=False)
+    single_step = make_train_step_mdl_shared(cfg)
+    pair_step = make_train_step_mdl_shared_pair(cfg)
 
     inner_single, m_single = single_step(
         inner_single, (x, y), step_rng, mdl_lambda, n_train,
