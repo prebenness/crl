@@ -224,7 +224,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
     bridge_epochs = _resolve_bridge_epochs(
         cfg.mdl.bridge_epochs, cfg.mdl.warmup_epochs, cfg.training.epochs,
     )
-    tau_hold_epochs = cfg.mdl.warmup_epochs + bridge_epochs
+    tau_mid = getattr(cfg.mdl, 'tau_mid', None)
     prev_phase_name = None
 
     xt, yt, te_counts = make_eval_batches(
@@ -235,8 +235,9 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
         t0 = time.time()
 
         tau = anneal_tau_st_phase(
-            ep, cfg.training.epochs, tau_hold_epochs,
+            ep, cfg.training.epochs, cfg.mdl.warmup_epochs,
             cfg.mdl.tau_start, cfg.mdl.tau_end,
+            tau_mid=tau_mid, bridge_epochs=bridge_epochs,
         )
         phase = _phase_name_for_epoch(ep, cfg.mdl.warmup_epochs, bridge_epochs)
         if _should_reset_optimizer(prev_phase_name, phase):
@@ -340,7 +341,7 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
     bridge_epochs = _resolve_bridge_epochs(
         cfg.mdl.bridge_epochs, cfg.mdl.warmup_epochs, cfg.training.epochs,
     )
-    tau_hold_epochs = cfg.mdl.warmup_epochs + bridge_epochs
+    tau_mid = getattr(cfg.mdl, 'tau_mid', None)
     prev_phase_name = None
 
     xt, yt, te_counts = make_eval_batches(
@@ -351,8 +352,9 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
         t0 = time.time()
 
         tau = anneal_tau_st_phase(
-            ep, cfg.training.epochs, tau_hold_epochs,
+            ep, cfg.training.epochs, cfg.mdl.warmup_epochs,
             cfg.mdl.tau_start, cfg.mdl.tau_end,
+            tau_mid=tau_mid, bridge_epochs=bridge_epochs,
         )
         phase = _phase_name_for_epoch(ep, cfg.mdl.warmup_epochs, bridge_epochs)
         if _should_reset_optimizer(prev_phase_name, phase):

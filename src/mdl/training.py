@@ -304,7 +304,8 @@ def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
 
 def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
-                        total_epochs, tau_hold_epochs, tau_start, tau_end):
+                        total_epochs, warmup_epochs, tau_start, tau_end,
+                        tau_mid=None, bridge_epochs=0):
     """Create a JIT'd function that fuses N full-batch epochs via lax.scan.
 
     Eliminates Python-loop dispatch overhead by running multiple training
@@ -313,24 +314,29 @@ def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
     Args:
         train_step_nojit: train_step function without @jax.jit (jit=False)
         x_train, y_train, mask_train: full training data arrays
-        total_epochs, tau_hold_epochs: for tau schedule
+        total_epochs, warmup_epochs: for tau schedule
         tau_start, tau_end: temperature range
+        tau_mid: temperature at warmup/bridge boundary (default: tau_start)
+        bridge_epochs: bridge phase length
 
     Returns:
         run_fused(state, rng, start_epoch, n_steps) -> (state, rng, last_metrics)
         n_steps is static (recompiles per distinct value); start_epoch is dynamic.
     """
     _total = total_epochs
-    _hold = tau_hold_epochs
+    _warmup = warmup_epochs
+    _bridge = bridge_epochs
     _ts = float(tau_start)
     _te = float(tau_end)
+    _tm = float(tau_mid if tau_mid is not None else tau_start)
 
     def _run(state, rng, start_epoch, n_steps):
         def body(carry, step_idx):
             st, rn = carry
             ep = start_epoch + step_idx
             tau = anneal_tau_traceable(
-                ep, _total, _hold, jnp.float32(_ts), jnp.float32(_te),
+                ep, _total, _warmup, jnp.float32(_ts), jnp.float32(_te),
+                tau_mid=jnp.float32(_tm), bridge_epochs=_bridge,
             )
             st = st.replace(tau=tau)
             rn, step_rng = jrandom.split(rn)
@@ -487,24 +493,52 @@ def anneal_tau(epoch, total_epochs, tau_start, tau_end):
     return jnp.exp(log_tau)
 
 
-def anneal_tau_st_phase(epoch, total_epochs, warmup_epochs, tau_start, tau_end):
-    """Anneal tau only after warmup; keep tau_start during warmup."""
-    if epoch < warmup_epochs:
-        return jnp.asarray(tau_start)
-    st_epoch = epoch - warmup_epochs
-    st_total = max(total_epochs - warmup_epochs, 1)
-    return anneal_tau(st_epoch, st_total, tau_start, tau_end)
+def anneal_tau_st_phase(epoch, total_epochs, warmup_epochs, tau_start, tau_end,
+                        tau_mid=None, bridge_epochs=0):
+    """Three-segment tau annealing: warmup (start→mid), bridge (hold mid), tail (mid→end).
 
-
-def anneal_tau_traceable(epoch, total_epochs, tau_hold_epochs, tau_start, tau_end):
-    """JAX-traceable tau annealing for use inside lax.scan/fori_loop.
-
-    Equivalent to anneal_tau_st_phase but uses jnp.where instead of Python if,
-    making it safe to use inside JAX-traced control flow.
+    Args:
+        epoch: current epoch
+        total_epochs: total training epochs
+        warmup_epochs: number of warmup epochs
+        tau_start: initial temperature
+        tau_end: final temperature
+        tau_mid: temperature at end of warmup / during bridge (default: tau_start)
+        bridge_epochs: number of bridge epochs (tau held at tau_mid)
     """
-    st_epoch = jnp.maximum(epoch - tau_hold_epochs, 0)
-    st_total = jnp.maximum(total_epochs - tau_hold_epochs, 1)
-    progress = st_epoch / st_total
-    log_tau = jnp.log(tau_start) + progress * (jnp.log(tau_end) - jnp.log(tau_start))
-    annealed = jnp.exp(log_tau)
-    return jnp.where(epoch < tau_hold_epochs, tau_start, annealed)
+    if tau_mid is None:
+        tau_mid = tau_start
+    hold_epochs = warmup_epochs + bridge_epochs
+    if epoch < warmup_epochs:
+        return anneal_tau(epoch, max(warmup_epochs, 1), tau_start, tau_mid)
+    if epoch < hold_epochs:
+        return jnp.asarray(tau_mid)
+    st_epoch = epoch - hold_epochs
+    st_total = max(total_epochs - hold_epochs, 1)
+    return anneal_tau(st_epoch, st_total, tau_mid, tau_end)
+
+
+def anneal_tau_traceable(epoch, total_epochs, warmup_epochs, tau_start, tau_end,
+                         tau_mid=None, bridge_epochs=0):
+    """JAX-traceable three-segment tau annealing for use inside lax.scan.
+
+    Equivalent to anneal_tau_st_phase but uses jnp.where instead of Python if.
+    """
+    if tau_mid is None:
+        tau_mid = tau_start
+    hold_epochs = warmup_epochs + bridge_epochs
+
+    # Warmup segment: anneal tau_start → tau_mid
+    warmup_progress = epoch / jnp.maximum(warmup_epochs, 1)
+    warmup_log = jnp.log(tau_start) + warmup_progress * (jnp.log(tau_mid) - jnp.log(tau_start))
+    warmup_tau = jnp.exp(warmup_log)
+
+    # Tail segment: anneal tau_mid → tau_end
+    st_epoch = jnp.maximum(epoch - hold_epochs, 0)
+    st_total = jnp.maximum(total_epochs - hold_epochs, 1)
+    tail_progress = st_epoch / st_total
+    tail_log = jnp.log(tau_mid) + tail_progress * (jnp.log(tau_end) - jnp.log(tau_mid))
+    tail_tau = jnp.exp(tail_log)
+
+    return jnp.where(epoch < warmup_epochs, warmup_tau,
+                     jnp.where(epoch < hold_epochs, tau_mid, tail_tau))
