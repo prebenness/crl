@@ -3,6 +3,7 @@
 import time
 import math
 
+import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 
@@ -33,8 +34,12 @@ def _resolve_bridge_epochs(requested_bridge_epochs, warmup_epochs, total_epochs)
 
 
 def _reset_optimizer_state(state):
-    """Reset Adam/AdamW moments while preserving params and extra fields."""
-    return state.replace(opt_state=state.tx.init(state.params))
+    """Reset Adam/AdamW first moment (momentum) while preserving adaptive LR and bias correction."""
+    adam_state = state.opt_state[0]  # ScaleByAdamState(count, mu, nu)
+    zero_mu = jax.tree.map(jnp.zeros_like, adam_state.mu)
+    new_adam_state = adam_state._replace(mu=zero_mu)
+    new_opt_state = (new_adam_state, *state.opt_state[1:])
+    return state.replace(opt_state=new_opt_state)
 
 
 def _phase_name_for_epoch(ep, warmup_epochs, bridge_epochs):
@@ -236,7 +241,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
         phase = _phase_name_for_epoch(ep, cfg.mdl.warmup_epochs, bridge_epochs)
         if _should_reset_optimizer(prev_phase_name, phase):
             state = _reset_optimizer_state(state)
-            print(f"  [OPT] reset Adam state at {prev_phase_name} -> {phase}")
+            print(f"  [OPT] reset Adam momentum at {prev_phase_name} -> {phase}")
         state = state.replace(tau=jnp.array(tau, dtype=jnp.float32))
 
         is_warmup = phase == "warmup"
@@ -353,7 +358,7 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
         if _should_reset_optimizer(prev_phase_name, phase):
             inner_state = _reset_optimizer_state(inner_state)
             outer_state = _reset_optimizer_state(outer_state)
-            print(f"  [OPT] reset Adam state at {prev_phase_name} -> {phase}")
+            print(f"  [OPT] reset Adam momentum at {prev_phase_name} -> {phase}")
         inner_state = inner_state.replace(
             tau=jnp.array(tau, dtype=jnp.float32),
         )

@@ -241,8 +241,12 @@ def get_train_max_n(inputs):
 
 
 def _reset_optimizer_state(state):
-    """Reset optimizer accumulators while keeping params and global step."""
-    return state.replace(opt_state=state.tx.init(state.params))
+    """Reset Adam first moment (momentum) while preserving adaptive LR and bias correction."""
+    adam_state = state.opt_state[0]  # ScaleByAdamState(count, mu, nu)
+    zero_mu = jax.tree.map(jnp.zeros_like, adam_state.mu)
+    new_adam_state = adam_state._replace(mu=zero_mu)
+    new_opt_state = (new_adam_state, *state.opt_state[1:])
+    return state.replace(opt_state=new_opt_state)
 
 
 def _resolve_bridge_epochs(requested_bridge_epochs, warmup_epochs, total_epochs):
@@ -894,7 +898,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             if _should_reset_optimizer(prev_phase_name, phase_name):
                 state = _reset_optimizer_state(state)
                 print(
-                    f"              ↳ [OPT] reset Adam state at "
+                    f"              ↳ [OPT] reset Adam momentum at "
                     f"{prev_phase_name} -> {phase_name}"
                 )
 
@@ -976,7 +980,7 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
             if _should_reset_optimizer(prev_phase_name, phase_name):
                 state = _reset_optimizer_state(state)
                 print(
-                    f"              ↳ [OPT] reset Adam state at "
+                    f"              ↳ [OPT] reset Adam momentum at "
                     f"{prev_phase_name} -> {phase_name}"
                 )
 
@@ -1215,7 +1219,7 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
         if _should_reset_optimizer(prev_phase_name, phase_name):
             state = _reset_optimizer_state(state)
             print(
-                f"              ↳ [OPT] reset Adam state at "
+                f"              ↳ [OPT] reset Adam momentum at "
                 f"{prev_phase_name} -> {phase_name}"
             )
 
