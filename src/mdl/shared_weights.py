@@ -219,7 +219,7 @@ def _shared_compute_data_nll_bits(logits, y, mask):
 
 
 def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
-                        n_samples=1, soft_forward=False,
+                        n_samples=1,
                         deterministic_st=False):
     """Create the shared-weight MDL loss function (Section 8.1).
 
@@ -239,7 +239,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         epsilon: minimum probability for each grid element in phi.
         n_train: total number of training sequences (for batch scaling).
         n_samples: number of Gumbel samples for variance reduction.
-        soft_forward: if True, use continuous relaxation (no Gumbel).
+        deterministic_st: if True, use deterministic straight-through.
     """
     lambda1 = float(lambda1)
     lambda2 = float(lambda2)
@@ -249,13 +249,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
     def loss_fn(params, apply_fn, x, y, mask, tau, rng, p_base):
         model_params = {"logits": params["logits"]}
 
-        if soft_forward:
-            logits, model_aux = apply_fn(
-                {"params": model_params}, x, tau=tau, train=True, rng=rng,
-                soft_forward=True,
-            )
-            data_nll_bits = _shared_compute_data_nll_bits(logits, y, mask)
-        elif deterministic_st:
+        if deterministic_st:
             logits, model_aux = apply_fn(
                 {"params": model_params}, x, tau=tau, train=True,
                 deterministic_st=True,
@@ -345,7 +339,7 @@ def make_shared_loss_fn(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
 # ---------------------------------------------------------------------------
 
 def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
-                           n_samples=1, soft_forward=False,
+                           n_samples=1,
                            deterministic_st=False):
     """Create a JIT-compiled training step for the shared-weight objective.
 
@@ -355,12 +349,11 @@ def make_shared_train_step(lambda1=1.0, lambda2=1.0, epsilon=1e-6, n_train=1,
         epsilon: minimum probability for phi.
         n_train: total number of training sequences (for batch scaling).
         n_samples: Gumbel samples for variance reduction.
-        soft_forward: use continuous relaxation (warmup phase).
         deterministic_st: deterministic straight-through bridge phase.
     """
     loss_fn = make_shared_loss_fn(
         lambda1, lambda2, epsilon, n_train=n_train,
-        n_samples=n_samples, soft_forward=soft_forward,
+        n_samples=n_samples,
         deterministic_st=deterministic_st,
     )
 

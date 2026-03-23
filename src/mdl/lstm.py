@@ -66,17 +66,13 @@ class GumbelSoftmaxLSTM(nn.Module):
 
     @nn.compact
     def __call__(self, x, tau, train=True, rng=None,
-                 soft_forward=False, deterministic_st=False):
+                 deterministic_st=False):
         """Forward pass through the categorical LSTM.
 
-        Three forward modes:
-            train=True, soft_forward=True:  continuous relaxation (no Gumbel noise)
-                weight_i = sum_m softmax(logits_i / tau)_m * grid_m
-                Exact gradients, zero variance. Used during warmup phase.
+        Forward modes:
             train=True, deterministic_st=True: deterministic straight-through
                 Hard argmax in forward, softmax(logits/tau) gradients in backward.
-                Used as a one-epoch bridge between warmup and stochastic ST.
-            train=True, soft_forward=False: Gumbel-Softmax straight-through
+            train=True, deterministic_st=False: Gumbel-Softmax straight-through
                 Discrete samples in forward, soft gradients in backward.
             train=False: deterministic argmax (evaluation)
 
@@ -84,8 +80,7 @@ class GumbelSoftmaxLSTM(nn.Module):
             x: int32 (batch, seq_len) input token indices
             tau: Gumbel-Softmax temperature
             train: whether in training mode
-            rng: PRNG key for Gumbel noise (only needed when train=True, soft_forward=False)
-            soft_forward: if True, use continuous relaxation instead of ST
+            rng: PRNG key for Gumbel noise (needed when train=True, deterministic_st=False)
             deterministic_st: if True, use deterministic straight-through
 
         Returns:
@@ -119,11 +114,7 @@ class GumbelSoftmaxLSTM(nn.Module):
 
         grid = jnp.asarray(self.grid_values)
 
-        if train and soft_forward:
-            # Continuous relaxation: weight = E[grid | softmax(logits/tau)]
-            y_soft = jax.nn.softmax(all_logits / tau, axis=-1)  # (n_total, M)
-            all_weights = jnp.sum(y_soft * grid[None, :], axis=-1)  # (n_total,)
-        elif train and deterministic_st:
+        if train and deterministic_st:
             # Deterministic straight-through: hard argmax forward, soft grads.
             y_soft = jax.nn.softmax(all_logits / tau, axis=-1)
             idx = jnp.argmax(y_soft, axis=-1)

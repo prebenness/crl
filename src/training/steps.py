@@ -185,8 +185,7 @@ def make_train_step_pair(cfg):
 
 
 def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
-              n_train, n_samples=1, soft_forward=False,
-              deterministic_st=False):
+              n_train, n_samples=1, deterministic_st=False):
     """MDL inner-model loss in nats.
 
     objective_total_nats
@@ -229,15 +228,7 @@ def _mdl_loss(apply_fn, params, x, y, rng, tau, mdl_lambda,
     # 1/N scaling: matches averaged CE (see docstring)
     hyp_scale = 1.0 / jnp.maximum(n_train, 1)
 
-    if soft_forward:
-        logits, aux = apply_fn(
-            {"params": params}, x, tau=tau, train=True, rng=rng,
-            soft_forward=soft_forward,
-        )
-        data_nll_nats = optax.softmax_cross_entropy_with_integer_labels(
-            logits, y,
-        ).mean()
-    elif deterministic_st:
+    if deterministic_st:
         logits, aux = apply_fn(
             {"params": params}, x, tau=tau, train=True,
             deterministic_st=True,
@@ -310,7 +301,7 @@ def _cross_entropy_nats(p, q):
 
 def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, lambda1, lambda2,
                      epsilon, p_base, n_train, n_samples=1,
-                     soft_forward=False, deterministic_st=False):
+                     deterministic_st=False):
     """Shared-weight MDL inner-model loss in nats.
 
     objective_total_nats
@@ -360,15 +351,7 @@ def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, lambda1, lambda2,
 
     hyp_scale = 1.0 / jnp.maximum(n_train, 1)
 
-    if soft_forward:
-        logits, aux = apply_fn(
-            {"params": model_params}, x, tau=tau, train=True, rng=rng,
-            soft_forward=True,
-        )
-        data_nll_nats = optax.softmax_cross_entropy_with_integer_labels(
-            logits, y,
-        ).mean()
-    elif deterministic_st:
+    if deterministic_st:
         logits, aux = apply_fn(
             {"params": model_params}, x, tau=tau, train=True,
             deterministic_st=True,
@@ -443,11 +426,11 @@ def _mdl_shared_loss(apply_fn, params, x, y, rng, tau, lambda1, lambda2,
     )
 
 
-def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
+def make_train_step_mdl(cfg, deterministic_st=False):
     """Return a JIT-compiled single-model MDL train_step.
 
-    Call for warmup (soft_forward=True), optional bridge (deterministic_st=True),
-    and regular stochastic ST training.
+    Call with deterministic_st=True for deterministic straight-through training,
+    or False for regular stochastic ST training.
     """
     n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
 
@@ -458,8 +441,7 @@ def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
         def loss_fn(params):
             return _mdl_loss(
                 state.apply_fn, params, x, y, rng, state.tau,
-                mdl_lambda, n_train, n_samples, soft_forward,
-                deterministic_st,
+                mdl_lambda, n_train, n_samples, deterministic_st,
             )
 
         (
@@ -503,7 +485,7 @@ def make_train_step_mdl(cfg, soft_forward=False, deterministic_st=False):
     return train_step
 
 
-def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
+def make_train_step_mdl_shared(cfg, deterministic_st=False):
     """Return a JIT-compiled single-model shared-MDL train_step."""
     n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
     lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
@@ -520,7 +502,7 @@ def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
             return _mdl_shared_loss(
                 state.apply_fn, params, x, y, rng, state.tau,
                 lambda1_arr, lambda2, epsilon, p_base, n_train,
-                n_samples, soft_forward, deterministic_st,
+                n_samples, deterministic_st,
             )
 
         (
@@ -581,7 +563,7 @@ def make_train_step_mdl_shared(cfg, soft_forward=False, deterministic_st=False):
     return train_step
 
 
-def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
+def make_train_step_mdl_pair(cfg, deterministic_st=False):
     """Return a JIT-compiled dual-model train step: MDL inner + standard outer with HSIC."""
     n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
 
@@ -598,7 +580,7 @@ def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
         def loss_fn1(params):
             return _mdl_loss(
                 inner_state.apply_fn, params, x, y, rng_inner,
-                inner_state.tau, mdl_lambda, n_train, n_samples, soft_forward,
+                inner_state.tau, mdl_lambda, n_train, n_samples,
                 deterministic_st,
             )
 
@@ -679,8 +661,7 @@ def make_train_step_mdl_pair(cfg, soft_forward=False, deterministic_st=False):
     return jax.jit(train_step_pair, static_argnames=("num_classes",))
 
 
-def make_train_step_mdl_shared_pair(cfg, soft_forward=False,
-                                    deterministic_st=False):
+def make_train_step_mdl_shared_pair(cfg, deterministic_st=False):
     """Return a JIT-compiled dual-model train step: shared-MDL inner + outer."""
     n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
     lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
@@ -699,7 +680,7 @@ def make_train_step_mdl_shared_pair(cfg, soft_forward=False,
             return _mdl_shared_loss(
                 inner_state.apply_fn, params, x, y, rng_inner, inner_state.tau,
                 lambda1_arr, lambda2, epsilon, p_base, n_train,
-                n_samples, soft_forward, deterministic_st,
+                n_samples, deterministic_st,
             )
 
         (

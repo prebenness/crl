@@ -24,9 +24,8 @@ from src.mdl.data import NUM_SYMBOLS
 
 
 class MDLTrainState(train_state.TrainState):
-    """TrainState extended with temperature and optional freeze mask."""
+    """TrainState extended with Gumbel-Softmax temperature."""
     tau: jnp.ndarray
-    freeze_mask: jnp.ndarray  # (n_params,) float32: 0=trainable, 1=frozen
 
 
 def create_mdl_state(rng, model, seq_len, batch_size, lr, tau_init):
@@ -39,73 +38,12 @@ def create_mdl_state(rng, model, seq_len, batch_size, lr, tau_init):
         train=False,
     )["params"]
     tx = optax.adam(lr)
-    n_params = params["logits"].shape[0]
     return MDLTrainState.create(
         apply_fn=model.apply,
         params=params,
         tx=tx,
         tau=jnp.array(tau_init, dtype=jnp.float32),
-        freeze_mask=jnp.zeros(n_params, dtype=jnp.float32),
     )
-
-
-# ---------------------------------------------------------------------------
-# Staged annealing: confidence detection, freezing, gradient masking
-# ---------------------------------------------------------------------------
-
-def compute_confidence_mask(logits, threshold=0.95):
-    """Identify parameters whose softmax distribution is peaked above threshold.
-
-    Args:
-        logits: (n_params, M) categorical logits.
-        threshold: max(softmax(logits_i)) must exceed this.
-
-    Returns:
-        (n_params,) float32 mask: 1.0 = confident (should freeze), 0.0 = uncertain.
-    """
-    probs = jax.nn.softmax(logits, axis=-1)  # (n_params, M)
-    max_prob = jnp.max(probs, axis=-1)        # (n_params,)
-    return (max_prob > threshold).astype(jnp.float32)
-
-
-def freeze_confident_weights(state, threshold=0.95):
-    """Freeze weights whose softmax distribution exceeds the threshold.
-
-    Frozen weights get one-hot logits (large value on argmax) and their
-    freeze_mask entry is set to 1.0.
-
-    Returns:
-        Updated state with frozen logits and updated freeze_mask.
-    """
-    logits = state.params["logits"]  # (n_params, M)
-    new_confidence = compute_confidence_mask(logits, threshold)
-    # Union with existing mask (once frozen, stays frozen)
-    new_mask = jnp.maximum(state.freeze_mask, new_confidence)
-
-    # For newly frozen weights: hard-set logits to one-hot * 100
-    argmax_idx = jnp.argmax(logits, axis=-1)  # (n_params,)
-    one_hot = jax.nn.one_hot(argmax_idx, logits.shape[1]) * 100.0
-    # Only replace logits where the mask is newly set
-    frozen_logits = jnp.where(
-        new_mask[:, None] > 0.5, one_hot, logits,
-    )
-
-    new_params = {**state.params, "logits": frozen_logits}
-    return state.replace(params=new_params, freeze_mask=new_mask)
-
-
-def apply_freeze_mask_to_grads(grads, freeze_mask):
-    """Zero out gradients for frozen parameters.
-
-    Args:
-        grads: parameter dict with "logits" key (n_params, M).
-        freeze_mask: (n_params,) float32, 1.0 = frozen.
-
-    Returns:
-        Modified grads dict with frozen logit gradients zeroed.
-    """
-    masked_logits = grads["logits"] * (1.0 - freeze_mask)[:, None]
-    return {**grads, "logits": masked_logits}
 
 
 def _compute_complexity_and_entropy_bits(model_aux, tau):
@@ -166,7 +104,7 @@ def compute_data_nll_bits_smoothed(logits, y, mask, smoothing=1e-10):
 
 
 def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
-                 soft_forward: bool = False, deterministic_st: bool = False):
+                 deterministic_st: bool = False):
     """Create the MDL loss function.
 
     The loss combines:
@@ -180,16 +118,13 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
     When n_samples > 1, the data term is averaged over multiple independent
     Gumbel-Softmax samples to reduce gradient variance.
 
-    When soft_forward=True, uses continuous relaxation (no Gumbel noise)
-    for zero-variance gradients during warmup phase.
     When deterministic_st=True, uses hard argmax weights in forward with
-    softmax(logits/tau) gradients (no Gumbel noise) for a stable bridge phase.
+    softmax(logits/tau) gradients (no Gumbel noise).
 
     Args:
         mdl_lambda: trade-off parameter for hypothesis codelength
         n_train: total number of training sequences (for 1/N reg scaling)
         n_samples: number of Gumbel samples to average data term over
-        soft_forward: if True, use continuous relaxation (no Gumbel)
         deterministic_st: if True, use deterministic straight-through
     """
     mdl_lambda = float(mdl_lambda)
@@ -198,14 +133,7 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
     def loss_fn(params, apply_fn, x, y, mask, tau, rng):
         hyp_scale = 1.0 / n_train
 
-        if soft_forward:
-            # Single forward pass with continuous relaxation
-            logits, model_aux = apply_fn(
-                {"params": params}, x, tau=tau, train=True, rng=rng,
-                soft_forward=True,
-            )
-            data_nll_bits = _compute_data_nll_bits(logits, y, mask)
-        elif deterministic_st:
+        if deterministic_st:
             # Single deterministic ST pass (hard argmax + soft gradients).
             logits, model_aux = apply_fn(
                 {"params": params}, x, tau=tau, train=True,
@@ -264,26 +192,21 @@ def make_loss_fn(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
 
 def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
-                    soft_forward: bool = False,
                     deterministic_st: bool = False,
-                    jit: bool = True,
-                    use_freeze_mask: bool = False):
+                    jit: bool = True):
     """Create a training step function.
 
     Args:
         mdl_lambda: MDL trade-off parameter
         n_train: total training sequences (for batch scaling)
-        n_samples: Gumbel samples for variance reduction (ST phase)
-        soft_forward: use continuous relaxation (warmup phase)
-        deterministic_st: deterministic straight-through bridge phase
+        n_samples: Gumbel samples for variance reduction
+        deterministic_st: deterministic straight-through (no Gumbel noise)
         jit: if True (default), wrap with @jax.jit. Set False for use
             inside lax.scan where the outer scan is already JIT'd.
-        use_freeze_mask: if True, zero gradients for frozen parameters
-            using state.freeze_mask (staged annealing).
     """
     loss_fn = make_loss_fn(
         mdl_lambda, n_train=n_train, n_samples=n_samples,
-        soft_forward=soft_forward, deterministic_st=deterministic_st,
+        deterministic_st=deterministic_st,
     )
 
     def train_step(state, x, y, mask, rng):
@@ -295,8 +218,6 @@ def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
         (loss, aux), grads = jax.value_and_grad(_loss, has_aux=True)(
             state.params
         )
-        if use_freeze_mask:
-            grads = apply_freeze_mask_to_grads(grads, state.freeze_mask)
         state = state.apply_gradients(grads=grads)
         return state, loss, aux
 
@@ -304,7 +225,7 @@ def make_train_step(mdl_lambda: float, n_train: int = 1, n_samples: int = 1,
 
 
 def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
-                        total_epochs, tau_hold_epochs, tau_start, tau_end):
+                        total_epochs, tau_start, tau_end):
     """Create a JIT'd function that fuses N full-batch epochs via lax.scan.
 
     Eliminates Python-loop dispatch overhead by running multiple training
@@ -313,7 +234,7 @@ def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
     Args:
         train_step_nojit: train_step function without @jax.jit (jit=False)
         x_train, y_train, mask_train: full training data arrays
-        total_epochs, tau_hold_epochs: for tau schedule
+        total_epochs: total training epochs for tau schedule
         tau_start, tau_end: temperature range
 
     Returns:
@@ -321,7 +242,6 @@ def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
         n_steps is static (recompiles per distinct value); start_epoch is dynamic.
     """
     _total = total_epochs
-    _hold = tau_hold_epochs
     _ts = float(tau_start)
     _te = float(tau_end)
 
@@ -330,7 +250,7 @@ def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
             st, rn = carry
             ep = start_epoch + step_idx
             tau = anneal_tau_traceable(
-                ep, _total, _hold, jnp.float32(_ts), jnp.float32(_te),
+                ep, _total, jnp.float32(_ts), jnp.float32(_te),
             )
             st = st.replace(tau=tau)
             rn, step_rng = jrandom.split(rn)
@@ -487,24 +407,8 @@ def anneal_tau(epoch, total_epochs, tau_start, tau_end):
     return jnp.exp(log_tau)
 
 
-def anneal_tau_st_phase(epoch, total_epochs, warmup_epochs, tau_start, tau_end):
-    """Anneal tau only after warmup; keep tau_start during warmup."""
-    if epoch < warmup_epochs:
-        return jnp.asarray(tau_start)
-    st_epoch = epoch - warmup_epochs
-    st_total = max(total_epochs - warmup_epochs, 1)
-    return anneal_tau(st_epoch, st_total, tau_start, tau_end)
-
-
-def anneal_tau_traceable(epoch, total_epochs, tau_hold_epochs, tau_start, tau_end):
-    """JAX-traceable tau annealing for use inside lax.scan/fori_loop.
-
-    Equivalent to anneal_tau_st_phase but uses jnp.where instead of Python if,
-    making it safe to use inside JAX-traced control flow.
-    """
-    st_epoch = jnp.maximum(epoch - tau_hold_epochs, 0)
-    st_total = jnp.maximum(total_epochs - tau_hold_epochs, 1)
-    progress = st_epoch / st_total
+def anneal_tau_traceable(epoch, total_epochs, tau_start, tau_end):
+    """JAX-traceable exponential tau annealing for use inside lax.scan."""
+    progress = epoch / jnp.maximum(total_epochs - 1, 1)
     log_tau = jnp.log(tau_start) + progress * (jnp.log(tau_end) - jnp.log(tau_start))
-    annealed = jnp.exp(log_tau)
-    return jnp.where(epoch < tau_hold_epochs, tau_start, annealed)
+    return jnp.exp(log_tau)

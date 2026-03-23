@@ -51,11 +51,10 @@ def params(model, dummy_input):
 class TestGumbelSoftmaxMLPForward:
     """Verify forward pass shapes for all three modes."""
 
-    def test_soft_forward_shapes(self, model, params, dummy_input):
+    def test_gst_forward_shapes(self, model, params, dummy_input):
         logits, aux = model.apply(
             {"params": params}, dummy_input,
             tau=1.0, train=True, rng=jrandom.PRNGKey(1),
-            soft_forward=True,
         )
         assert logits.shape == (4, 10)
         assert aux["z"].shape == (4, 8)  # bottleneck dim
@@ -94,7 +93,6 @@ class TestAuxOutputs:
         _, aux = model.apply(
             {"params": params}, dummy_input,
             tau=1.0, train=True, rng=jrandom.PRNGKey(3),
-            soft_forward=True,
         )
         assert "expected_codelength" in aux
         assert float(aux["expected_codelength"]) > 0
@@ -106,7 +104,6 @@ class TestAuxOutputs:
         _, aux = model.apply(
             {"params": params}, dummy_input,
             tau=1.0, train=True, rng=jrandom.PRNGKey(4),
-            soft_forward=True,
         )
         all_probs = aux["all_probs"]
         assert all_probs.ndim == 2
@@ -125,23 +122,21 @@ class TestKaimingCategoricalInit:
         max_vals = jnp.max(logits, axis=-1)
         assert float((max_vals > 1.0).mean()) > 0.99
 
-    def test_soft_forward_not_near_zero(self, model, params, dummy_input):
+    def test_forward_not_near_zero(self, model, params, dummy_input):
         logits, _ = model.apply(
             {"params": params}, dummy_input,
             tau=2.0, train=True, rng=jrandom.PRNGKey(10),
-            soft_forward=True,
         )
-        # With Kaiming init, soft forward should produce non-trivial logits
+        # With Kaiming init, forward should produce non-trivial logits
         assert float(jnp.abs(logits).max()) > 0.1
 
-    def test_warmup_gradient_nonzero(self, model, params, dummy_input):
+    def test_gradient_nonzero(self, model, params, dummy_input):
         y = jnp.array([0, 1, 2, 3])
 
         def loss_fn(p):
             logits, _ = model.apply(
                 {"params": p}, dummy_input,
                 tau=2.0, train=True, rng=jrandom.PRNGKey(11),
-                soft_forward=True,
             )
             import optax
             return optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
@@ -165,7 +160,7 @@ class TestMDLLoss:
         total_loss, (logits, data_nll_nats, complexity_expected_nats, entropy_weights_nats, z) = _mdl_loss(
             model.apply, params, dummy_input, y,
             rng=rng, tau=1.0, mdl_lambda=0.01,
-            n_train=100, n_samples=1, soft_forward=True,
+            n_train=100, n_samples=1,
         )
 
         assert jnp.isfinite(total_loss)
@@ -192,7 +187,7 @@ class TestMDLTrainStep:
         class _Cfg:
             mdl = _MDLCfg()
 
-        step_fn = make_train_step_mdl(_Cfg(), soft_forward=True)
+        step_fn = make_train_step_mdl(_Cfg())
 
         rng = jrandom.PRNGKey(6)
         params = model.init(rng, dummy_input, tau=1.0, train=False)["params"]

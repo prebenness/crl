@@ -117,21 +117,19 @@ class GumbelSoftmaxMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x, tau, train=True, rng=None,
-                 soft_forward=False, deterministic_st=False):
+                 deterministic_st=False):
         """Forward pass through the categorical MLP.
 
-        Three forward modes (matching GumbelSoftmaxLSTM):
-            train=True, soft_forward=True:  continuous relaxation (warmup)
+        Forward modes (matching GumbelSoftmaxLSTM):
             train=True, deterministic_st=True: deterministic straight-through
-            train=True, soft_forward=False: Gumbel-Softmax straight-through
+            train=True, deterministic_st=False: Gumbel-Softmax straight-through
             train=False: deterministic argmax (evaluation)
 
         Args:
             x: float32 (batch, ...) input (will be flattened)
             tau: Gumbel-Softmax temperature
             train: whether in training mode
-            rng: PRNG key for Gumbel noise (needed when train=True, soft_forward=False)
-            soft_forward: if True, use continuous relaxation instead of ST
+            rng: PRNG key for Gumbel noise (needed when train=True, deterministic_st=False)
             deterministic_st: if True, use deterministic straight-through
 
         Returns:
@@ -164,11 +162,7 @@ class GumbelSoftmaxMLP(nn.Module):
         grid = jnp.asarray(self.grid_values)
 
         # === Weight materialization ===
-        if train and soft_forward:
-            # Continuous relaxation: weight = E[grid | softmax(logits/tau)]
-            y_soft = jax.nn.softmax(all_logits / tau, axis=-1)
-            all_weights = jnp.sum(y_soft * grid[None, :], axis=-1)
-        elif train and deterministic_st:
+        if train and deterministic_st:
             # Deterministic straight-through: hard argmax forward, soft grads.
             y_soft = jax.nn.softmax(all_logits / tau, axis=-1)
             idx = jnp.argmax(y_soft, axis=-1)

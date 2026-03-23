@@ -1,59 +1,12 @@
 """Full training-loop runners with W&B logging and checkpointing."""
 
 import time
-import math
-
-import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 
 from src.datasets.datasets import make_epoch_batches, make_eval_batches
-from src.mdl.training import anneal_tau_st_phase
+from src.mdl.training import anneal_tau
 from src.utils.checkpointing import save_checkpoint, save_results, checkpoint_path
-
-
-def _resolve_bridge_epochs(requested_bridge_epochs, warmup_epochs, total_epochs):
-    """Resolve the MDL bridge length for ColoredMNIST runners.
-
-    Default behavior mirrors the ANBN MDL schedule:
-    - if warmup is zero, there is no bridge unless explicitly requested
-    - otherwise, default to max(1, ceil(0.1 * warmup_epochs))
-    - explicit 0 disables the bridge
-    - clip to the remaining training horizon
-    """
-    remaining_epochs = max(total_epochs - warmup_epochs, 0)
-    if remaining_epochs <= 0:
-        return 0
-    if requested_bridge_epochs is None:
-        if warmup_epochs <= 0:
-            return 0
-        requested_bridge_epochs = max(1, int(math.ceil(0.1 * warmup_epochs)))
-    else:
-        requested_bridge_epochs = int(max(requested_bridge_epochs, 0))
-    return min(requested_bridge_epochs, remaining_epochs)
-
-
-def _reset_optimizer_state(state):
-    """Reset Adam/AdamW first moment (momentum) while preserving adaptive LR and bias correction."""
-    adam_state = state.opt_state[0]  # ScaleByAdamState(count, mu, nu)
-    zero_mu = jax.tree.map(jnp.zeros_like, adam_state.mu)
-    new_adam_state = adam_state._replace(mu=zero_mu)
-    new_opt_state = (new_adam_state, *state.opt_state[1:])
-    return state.replace(opt_state=new_opt_state)
-
-
-def _phase_name_for_epoch(ep, warmup_epochs, bridge_epochs):
-    """Return the MDL training phase name for the current epoch."""
-    if ep < warmup_epochs:
-        return "warmup"
-    if ep < warmup_epochs + bridge_epochs:
-        return "bridge"
-    return "st"
-
-
-def _should_reset_optimizer(prev_phase_name, phase_name):
-    """Reset once whenever the MDL estimator regime changes."""
-    return prev_phase_name is not None and prev_phase_name != phase_name
 
 
 def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
@@ -209,10 +162,9 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
 
 def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
                        wandb_run, *, create_state_fn,
-                       train_epoch_warmup_fn, train_epoch_bridge_fn,
                        train_epoch_fn,
                        eval_epoch_fn, run_dir=None):
-    """MDL single-model training loop with warmup, bridge, and tau annealing."""
+    """MDL single-model training loop with tau annealing."""
     base_rng = jrandom.PRNGKey(cfg.training.seed)
     rng_init_inner = jrandom.fold_in(base_rng, 0)
     rng_train = jrandom.fold_in(base_rng, 2)
@@ -221,11 +173,6 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
 
     state = create_state_fn(rng_init_inner, model, input_shape, cfg)
     n_train = x_train.shape[0]
-    bridge_epochs = _resolve_bridge_epochs(
-        cfg.mdl.bridge_epochs, cfg.mdl.warmup_epochs, cfg.training.epochs,
-    )
-    tau_hold_epochs = cfg.mdl.warmup_epochs + bridge_epochs
-    prev_phase_name = None
 
     xt, yt, te_counts = make_eval_batches(
         x_test, y_test, cfg.training.batch_size,
@@ -234,24 +181,8 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
-        tau = anneal_tau_st_phase(
-            ep, cfg.training.epochs, tau_hold_epochs,
-            cfg.mdl.tau_start, cfg.mdl.tau_end,
-        )
-        phase = _phase_name_for_epoch(ep, cfg.mdl.warmup_epochs, bridge_epochs)
-        if _should_reset_optimizer(prev_phase_name, phase):
-            state = _reset_optimizer_state(state)
-            print(f"  [OPT] reset Adam momentum at {prev_phase_name} -> {phase}")
+        tau = anneal_tau(ep, cfg.training.epochs, cfg.mdl.tau_start, cfg.mdl.tau_end)
         state = state.replace(tau=jnp.array(tau, dtype=jnp.float32))
-
-        is_warmup = phase == "warmup"
-        is_bridge = phase == "bridge" and train_epoch_bridge_fn is not None
-        if phase == "warmup":
-            epoch_fn = train_epoch_warmup_fn
-        elif phase == "bridge" and train_epoch_bridge_fn is not None:
-            epoch_fn = train_epoch_bridge_fn
-        else:
-            epoch_fn = train_epoch_fn
 
         seed_tr = cfg.training.seed * 10_000 + ep
         rng_train, rng_epoch = jrandom.split(rng_train)
@@ -260,17 +191,15 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             x_train, y_train, cfg.training.batch_size, seed_tr,
         )
 
-        state, metrics = epoch_fn(
+        state, metrics = train_epoch_fn(
             state, xb, yb, rng_epoch, lamb, n_train,
         )
-        prev_phase_name = phase
 
         rng_eval, rng_eval_epoch = jrandom.split(rng_eval)
         te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval_epoch, te_counts)
 
         results = {
             "epoch": ep + 1,
-            "phase": phase,
             "tau": float(tau),
             "lambda_reg": float(lamb),
             "train_acc": float(metrics["accuracy"]),
@@ -306,7 +235,6 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
             f"  complexity_expected {float(metrics['complexity_expected_nats']):.1f}n"
             f"  entropy_weights {float(metrics['entropy_weights_nats']):.1f}n"
             f"  tau {float(tau):.4f}"
-            f"{'  [warmup]' if is_warmup else ('  [bridge]' if is_bridge else '')}"
             f"  {time.time()-t0:.2f}s"
         )
 
@@ -320,7 +248,6 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
 def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
                             outer_model, cfg, lamb, wandb_run,
                             *, create_inner_fn, create_outer_fn,
-                            train_epoch_warmup_fn, train_epoch_bridge_fn,
                             train_epoch_fn,
                             eval_inner_epoch_fn, eval_outer_epoch_fn,
                             run_dir=None):
@@ -337,11 +264,6 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
     inner_state = create_inner_fn(rng_init_inner, inner_model, input_shape, cfg)
     outer_state = create_outer_fn(rng_init_outer, outer_model, input_shape, cfg)
     n_train = x_train.shape[0]
-    bridge_epochs = _resolve_bridge_epochs(
-        cfg.mdl.bridge_epochs, cfg.mdl.warmup_epochs, cfg.training.epochs,
-    )
-    tau_hold_epochs = cfg.mdl.warmup_epochs + bridge_epochs
-    prev_phase_name = None
 
     xt, yt, te_counts = make_eval_batches(
         x_test, y_test, cfg.training.batch_size,
@@ -350,27 +272,10 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
     for ep in range(cfg.training.epochs):
         t0 = time.time()
 
-        tau = anneal_tau_st_phase(
-            ep, cfg.training.epochs, tau_hold_epochs,
-            cfg.mdl.tau_start, cfg.mdl.tau_end,
-        )
-        phase = _phase_name_for_epoch(ep, cfg.mdl.warmup_epochs, bridge_epochs)
-        if _should_reset_optimizer(prev_phase_name, phase):
-            inner_state = _reset_optimizer_state(inner_state)
-            outer_state = _reset_optimizer_state(outer_state)
-            print(f"  [OPT] reset Adam momentum at {prev_phase_name} -> {phase}")
+        tau = anneal_tau(ep, cfg.training.epochs, cfg.mdl.tau_start, cfg.mdl.tau_end)
         inner_state = inner_state.replace(
             tau=jnp.array(tau, dtype=jnp.float32),
         )
-
-        is_warmup = phase == "warmup"
-        is_bridge = phase == "bridge" and train_epoch_bridge_fn is not None
-        if phase == "warmup":
-            epoch_fn = train_epoch_warmup_fn
-        elif phase == "bridge" and train_epoch_bridge_fn is not None:
-            epoch_fn = train_epoch_bridge_fn
-        else:
-            epoch_fn = train_epoch_fn
 
         seed_tr = cfg.training.seed * 10_000 + ep
         rng_train, rng_epoch = jrandom.split(rng_train)
@@ -379,12 +284,11 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             x_train, y_train, cfg.training.batch_size, seed_tr,
         )
 
-        inner_state, outer_state, metrics = epoch_fn(
+        inner_state, outer_state, metrics = train_epoch_fn(
             inner_state, outer_state, xb, yb, rng_epoch,
             lamb, n_train, cfg.hsic.weight,
             num_classes=cfg.model.num_classes,
         )
-        prev_phase_name = phase
 
         rng_eval, rng_eval_inner = jrandom.split(rng_eval)
         rng_eval_outer = jrandom.fold_in(rng_eval_inner, 1)
@@ -397,7 +301,6 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
 
         results = {
             "epoch": ep + 1,
-            "phase": phase,
             "tau": float(tau),
             "lambda_reg": float(lamb),
             "train_acc1": float(metrics["accuracy_inner"]),
@@ -439,7 +342,6 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
             f" outer_test_acc {results['test_acc2']:.4f}"
             f" | hsic {results['hsic']:.4f}"
             f" | tau {float(tau):.4f}"
-            f"{'  [warmup]' if is_warmup else ('  [bridge]' if is_bridge else '')}"
             f" | {time.time()-t0:.2f}s"
         )
 
