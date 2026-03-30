@@ -3,4 +3,4 @@
 	url = git@github.com:prebenness/mdl.git
 [submodule "overleaf"]
 	path = overleaf
-	url = https://git@git.overleaf.com/68c1acf1ecdb71ae291a943a
+	url = git@github.com:prebenness/crl-overleaf.git
