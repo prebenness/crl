@@ -1,0 +1,52 @@
+# Test higher alpha values on 10-class cmnist_ula.
+# Alpha controls CE vs reconstruction balance in task loss.
+# Hypothesis: higher alpha -> less reconstruction pressure -> model prefers color.
+# We run 3 separate sweeps at alpha 0.1, 0.5, 0.9 with lambda in the 0.5-10 range.
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "single"
+  inner: "ula_mlp_var"
+  num_classes: 10
+  bottleneck_width: 16
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-2
+  weight_decay_outer: 0.0
+  epochs: 10
+  batch_size: 128
+  seed: 0
+  alpha: 0.5
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+
+controller:
+  beta_min: 0.0
+  beta_max: 1.0
+  ctrl_ki: 1.0
+
+mc_samples:
+  train: 2
+  eval: 8
+
+hsic:
+  weight: 0.50
+
+sweep:
+  lambda_min_exp: -1
+  lambda_max_exp: 1.5
+  lambda_steps: 10
+  log_sweep: true
