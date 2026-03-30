@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from jax import random as jrandom
 
 from src.datasets.datasets import make_epoch_batches, make_eval_batches
-from MDL.src.mdl.training import anneal_tau
+from mdl.src.mdl.training import anneal_tau
 from src.utils.checkpointing import save_checkpoint, save_results, checkpoint_path
 
 

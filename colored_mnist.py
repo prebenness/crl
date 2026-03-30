@@ -32,7 +32,7 @@ from src.datasets.datasets import (
 from src.models.ib_classifiers import VIBClassifier, ULAMLPVarClassifier
 from src.models.classifiers import StdClassifier, ULAMLPClassifier
 from src.models.mdl_classifiers import GumbelSoftmaxMLP
-from MDL.src.mdl.coding import grid_values_and_codelengths
+from mdl.src.mdl.coding import grid_values_and_codelengths
 from src.training.train_state import (
     create_state_inner, create_state_outer, create_state_mdl,
     create_state_mdl_shared,

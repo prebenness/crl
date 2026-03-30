@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from jax import random as jrandom
 import numpy as np
 
-from MDL.src.mdl.coding import grid_values_and_codelengths
+from mdl.src.mdl.coding import grid_values_and_codelengths
 from src.models.mdl_classifiers import GumbelSoftmaxMLP, kaiming_categorical_init
 
 

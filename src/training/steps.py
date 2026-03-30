@@ -11,8 +11,8 @@ import jax.lax as lax
 from jax.scipy.special import logsumexp
 import optax
 
-from MDL.src.mdl.coding import grid_values_and_codelengths
-from MDL.src.mdl.shared_weights import compute_p_base, epsilon_bound_simplex
+from mdl.src.mdl.coding import grid_values_and_codelengths
+from mdl.src.mdl.shared_weights import compute_p_base, epsilon_bound_simplex
 from src.loss_fns.reg_loss_fns import class_cond_hsic_rbf
 
 
