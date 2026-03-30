@@ -1,0 +1,23 @@
+mode: basic
+training_mode: dst_fixed
+n_max: 10
+m_max: 10
+hidden_size: 3
+num_train: 1000
+p: 0.3
+seed: 0
+data_seed: 0
+
+epochs: 12000
+lr: 0.03
+mdl_lambda: 0.144
+tau_fixed: 1.0
+batch_size: 0
+restart_patience: 0
+init_cl_scale: 1.0
+
+test_max_n: 1500
+eval_every: 100
+log_every: 200
+analyze: true
+analyze_max_n: 100000

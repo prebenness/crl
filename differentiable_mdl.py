@@ -72,6 +72,7 @@ from src.mdl.training import (
     create_mdl_state,
     make_train_step,
     make_fused_epoch_fn,
+    make_fused_epoch_fn_fixed_tau,
     evaluate_deterministic_accuracy,
     anneal_tau,
     compute_data_nll_bits_smoothed,
@@ -189,44 +190,38 @@ def _format_val_summary(val_result, val_inputs):
     }
 
 
-def _evaluate_long_val_probes(model_params, grid, grid_values, probe_ns):
-    """Run sparse large-n correctness probes on the discrete argmax network."""
-    probe_ns = sorted({int(n) for n in (probe_ns or []) if int(n) > 0})
-    if not probe_ns:
-        return {
-            "passed_count": 0,
-            "all_passed": True,
-            "results": [],
-            "summary": "",
-        }
-
-    extracted = extract_weights(model_params, grid, grid_values)
-    results = []
-    passed_count = 0
-    for n in probe_ns:
-        ok = bool(_check_single_n(extracted["named"], n))
-        results.append({"n": n, "correct": ok})
-        passed_count += int(ok)
-
-    summary = " ".join(f"{r['n']}{'✓' if r['correct'] else '✗'}" for r in results)
-    return {
-        "passed_count": passed_count,
-        "all_passed": passed_count == len(results),
-        "results": results,
-        "summary": summary,
-    }
+def _zero_adam_moments(opt_state):
+    """Zero mu and nu in an Adam optimizer state, preserving count."""
+    adam_state, scale_state = opt_state
+    zeroed = adam_state._replace(
+        mu=jax.tree.map(jnp.zeros_like, adam_state.mu),
+        nu=jax.tree.map(jnp.zeros_like, adam_state.nu),
+    )
+    return (zeroed, scale_state)
 
 
-def _should_update_best(n_perfect, gen_n, long_val_passes, complexity_bits,
+def _maybe_restart(state, best, epochs_since_best, restart_patience):
+    """Check stall and restart from best checkpoint if patience exceeded.
+
+    Returns (state, epochs_since_best, did_restart).
+    """
+    if restart_patience <= 0 or best['params'] is None:
+        return state, epochs_since_best, False
+    if epochs_since_best < restart_patience:
+        return state, epochs_since_best, False
+    new_opt_state = _zero_adam_moments(best['opt_state'])
+    state = state.replace(params=best['params'], opt_state=new_opt_state)
+    return state, 0, True
+
+
+def _should_update_best(n_perfect, gen_n, complexity_bits,
                         best_val_n_perfect, best_val_gen_n,
-                        best_long_val_passes, best_complexity_bits):
-    """Prefer better validation coverage, then stronger sparse long-n checks."""
+                        best_complexity_bits):
+    """Prefer better validation coverage, then lower complexity."""
     if n_perfect != best_val_n_perfect:
         return n_perfect > best_val_n_perfect
     if gen_n != best_val_gen_n:
         return gen_n > best_val_gen_n
-    if long_val_passes != best_long_val_passes:
-        return long_val_passes > best_long_val_passes
     return complexity_bits < best_complexity_bits
 
 
@@ -472,8 +467,7 @@ def _fmt_train_line_shared(metrics, lan_hyp_bits, shared_disc):
     )
 
 
-def _fmt_val_line(n_perfect, n_val, gen_n, complexity_total_bits,
-                  long_val_suffix="", best_tag=""):
+def _fmt_val_line(n_perfect, n_val, gen_n, complexity_total_bits, best_tag=""):
     """Format a validation summary line (same column grid as train)."""
     acc_hard_val = f"{n_perfect}/{n_val}"
     col1 = f"{'acc_hard':>8}={acc_hard_val:>8}"
@@ -481,17 +475,16 @@ def _fmt_val_line(n_perfect, n_val, gen_n, complexity_total_bits,
     col3 = f"{'|H|':>6}={int(complexity_total_bits):>8}"
     return (
         f"  val     {col1}    {col2}    {col3}"
-        f"{long_val_suffix}{best_tag}"
+        f"{best_tag}"
     )
 
 
 def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengths,
-                          val_inputs, val_targets, grid, long_val_probe_ns,
-                          best, run_dir):
+                          val_inputs, val_targets, best, run_dir):
     """Run validation eval, print summary, update best-tracking dict.
 
     Args:
-        best: dict with keys n_perfect, gen_n, long_val_passes,
+        best: dict with keys n_perfect, gen_n,
             complexity_bits, params. Modified in-place if new best found.
 
     Returns:
@@ -508,44 +501,26 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
     )
 
     n_val = len(val_inputs)
-    long_val_probe = {
-        "passed_count": 0,
-        "all_passed": True,
-        "summary": "",
-    }
-    if n_perfect == n_val and long_val_probe_ns:
-        long_val_probe = _evaluate_long_val_probes(
-            state.params, grid, grid_values, long_val_probe_ns,
-        )
     is_best = _should_update_best(
         n_perfect,
         gen_n,
-        long_val_probe["passed_count"],
         current_complexity_bits,
         best['n_perfect'],
         best['gen_n'],
-        best['long_val_passes'],
         best['complexity_bits'],
     )
     best_tag = "  ★ NEW BEST" if is_best else ""
-    long_val_suffix = ""
-    if long_val_probe_ns:
-        if n_perfect == n_val:
-            long_val_suffix = f"  long_n=[{long_val_probe['summary']}]"
-        else:
-            long_val_suffix = "  long_n=[skipped]"
     print(_fmt_val_line(
         n_perfect, n_val, gen_n,
         current_complexity_bits + integer_code_length(hidden_size),
-        long_val_suffix=long_val_suffix,
         best_tag=best_tag,
     ))
     if is_best:
         best['n_perfect'] = n_perfect
         best['gen_n'] = gen_n
-        best['long_val_passes'] = long_val_probe["passed_count"]
         best['complexity_bits'] = current_complexity_bits
         best['params'] = jax.tree.map(lambda x: x.copy(), state.params)
+        best['opt_state'] = jax.tree.map(lambda x: x.copy(), state.opt_state)
         best['epoch'] = epoch + 1
         if run_dir is not None:
             save_checkpoint(best['params'], checkpoint_path(run_dir, "best.npz"))
@@ -556,7 +531,7 @@ def _eval_and_update_best(state, epoch, hidden_size, grid_values, grid_codelengt
                 best_checkpoint_epoch=epoch + 1,
             )
             print(f"              ↳ [CKPT] checkpoint saved")
-    return best
+    return best, is_best
 
 
 def _run_epoch(state, x_train, y_train, mask_train, N, bs, rng, train_step):
@@ -649,12 +624,14 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
     best = {
         'n_perfect': -1,
         'gen_n': -1,
-        'long_val_passes': -1,
         'complexity_bits': math.inf,
         'params': None,
+        'opt_state': None,
         'epoch': 0,
     }
-    long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
+    epochs_since_best = 0
+    n_restarts = 0
+    restart_patience = getattr(args, 'restart_patience', 0)
 
     is_full_batch = bs >= N
 
@@ -705,12 +682,25 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 print(_fmt_train_line(metrics, complexity_argmax_bits))
 
             if needs_eval:
-                best = _eval_and_update_best(
+                best, is_best = _eval_and_update_best(
                     state, last_epoch, args.hidden_size,
                     grid_values, grid_codelengths,
-                    val_inputs, val_targets, grid, long_val_probe_ns,
+                    val_inputs, val_targets,
                     best, run_dir,
                 )
+                if is_best:
+                    epochs_since_best = 0
+                else:
+                    epochs_since_best += n_steps
+                    state, epochs_since_best, did_restart = _maybe_restart(
+                        state, best, epochs_since_best, restart_patience,
+                    )
+                    if did_restart:
+                        n_restarts += 1
+                        print(f"  ↻ RESTART #{n_restarts} at epoch {last_epoch + 1}"
+                              f" → best checkpoint (epoch {best['epoch']})")
+            else:
+                epochs_since_best += n_steps
 
             epoch = run_end
 
@@ -732,16 +722,194 @@ def run_training_basic(args, model, grid_values, grid_codelengths,
                 print(_fmt_train_line(metrics, complexity_argmax_bits))
 
             if (epoch + 1) % args.eval_every == 0:
-                best = _eval_and_update_best(
+                best, is_best = _eval_and_update_best(
                     state, epoch, args.hidden_size,
                     grid_values, grid_codelengths,
-                    val_inputs, val_targets, grid, long_val_probe_ns,
+                    val_inputs, val_targets,
                     best, run_dir,
                 )
+                if is_best:
+                    epochs_since_best = 0
+                else:
+                    epochs_since_best += args.eval_every
+                    state, epochs_since_best, did_restart = _maybe_restart(
+                        state, best, epochs_since_best, restart_patience,
+                    )
+                    if did_restart:
+                        n_restarts += 1
+                        print(f"  ↻ RESTART #{n_restarts} at epoch {epoch + 1}"
+                              f" → best checkpoint (epoch {best['epoch']})")
 
     elapsed = time.time() - t0
     print("-" * 70)
-    print(f"Training complete in {elapsed:.1f}s")
+    print(f"Training complete in {elapsed:.1f}s"
+          f"{f' ({n_restarts} restarts)' if n_restarts else ''}")
+
+    if run_dir is not None:
+        save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
+        print(f"  [CKPT] Final checkpoint saved")
+
+    return state, best['params'], best['n_perfect'], best['epoch']
+
+
+def run_training_dst_fixed(args, model, grid_values, grid_codelengths,
+                           x_train, y_train, mask_train,
+                           val_inputs, val_targets, rng, grid,
+                           run_dir=None, start_epoch=0, init_params=None):
+    """Run fixed-beta DST training: optimize J_beta at a single fixed tau.
+
+    Uses deterministic straight-through (hard argmax forward, soft grads).
+    Tau is set once and never changes. No phase transitions, no optimizer
+    resets, no tau annealing.
+
+    Returns:
+        (state, best_params, best_n_perfect, best_epoch)
+    """
+    rng, init_rng = jrandom.split(rng)
+    N = x_train.shape[0]
+    max_seq_len = x_train.shape[1]
+    bs = args.batch_size if args.batch_size > 0 else N
+
+    state = create_mdl_state(
+        init_rng, model,
+        seq_len=max_seq_len,
+        batch_size=min(bs, N),
+        lr=args.lr,
+        tau_init=args.tau_fixed,
+    )
+    if init_params is not None:
+        state = state.replace(params=init_params)
+        print(f"  Loaded params from checkpoint (resuming from epoch {start_epoch})")
+
+    print(f"  Number of LSTM+output parameters: {state.params['logits'].shape[0]}")
+    print(f"  Logit array shape: {state.params['logits'].shape}")
+
+    total_epochs = args.epochs
+    # DST is deterministic — n_samples=1 always (no Gumbel noise).
+    train_step = make_train_step(
+        args.mdl_lambda, n_train=N, n_samples=1,
+        deterministic_st=True,
+    )
+
+    print(f"\n  Training: {total_epochs} epochs, deterministic ST (fixed-tau)")
+    print(f"  τ = {args.tau_fixed} (fixed, no annealing)")
+    print(f"  lr={args.lr}, lambda={args.mdl_lambda}, batch_size={bs}")
+    _print_metric_legend("basic")
+
+    best = {
+        'n_perfect': -1,
+        'gen_n': -1,
+        'complexity_bits': math.inf,
+        'params': None,
+        'opt_state': None,
+        'epoch': 0,
+    }
+    epochs_since_best = 0
+    n_restarts = 0
+    restart_patience = getattr(args, 'restart_patience', 0)
+
+    is_full_batch = bs >= N
+
+    if is_full_batch:
+        step_nojit = make_train_step(
+            args.mdl_lambda, n_train=N, n_samples=1,
+            deterministic_st=True, jit=False,
+        )
+        fused = make_fused_epoch_fn_fixed_tau(
+            step_nojit, x_train, y_train, mask_train,
+        )
+        print(f"  [FUSED] Full-batch mode: epochs fused via lax.scan")
+
+    t0 = time.time()
+
+    if is_full_batch:
+        epoch = start_epoch
+        while epoch < total_epochs:
+            # Scan forward to next log/eval boundary.
+            run_end = epoch + 1
+            for e in range(epoch, total_epochs):
+                run_end = e + 1
+                needs_log = ((e + 1) % args.log_every == 0) or e == 0
+                needs_eval = (e + 1) % args.eval_every == 0
+                if needs_log or needs_eval:
+                    break
+
+            n_steps = run_end - epoch
+            state, rng, metrics = fused(state, rng, n_steps)
+
+            last_epoch = run_end - 1
+            needs_log = ((last_epoch + 1) % args.log_every == 0) or last_epoch == 0
+            needs_eval = (last_epoch + 1) % args.eval_every == 0
+
+            if needs_log or needs_eval:
+                print(_fmt_epoch_header(last_epoch + 1, args.tau_fixed))
+
+            if needs_log:
+                complexity_argmax_bits = _compute_discrete_hyp_bits(
+                    state.params, grid_codelengths,
+                )
+                print(_fmt_train_line(metrics, complexity_argmax_bits))
+
+            if needs_eval:
+                best, is_best = _eval_and_update_best(
+                    state, last_epoch, args.hidden_size,
+                    grid_values, grid_codelengths,
+                    val_inputs, val_targets,
+                    best, run_dir,
+                )
+                if is_best:
+                    epochs_since_best = 0
+                else:
+                    epochs_since_best += n_steps
+                    state, epochs_since_best, did_restart = _maybe_restart(
+                        state, best, epochs_since_best, restart_patience,
+                    )
+                    if did_restart:
+                        n_restarts += 1
+                        print(f"  ↻ RESTART #{n_restarts} at epoch {last_epoch + 1}"
+                              f" → best checkpoint (epoch {best['epoch']})")
+            else:
+                epochs_since_best += n_steps
+
+            epoch = run_end
+
+    else:
+        # Mini-batch fallback (tau is fixed, no annealing).
+        for epoch in range(start_epoch, total_epochs):
+            state, rng, metrics = _run_epoch(
+                state, x_train, y_train, mask_train, N, bs, rng, train_step,
+            )
+
+            if (epoch + 1) % args.log_every == 0 or epoch == 0:
+                complexity_argmax_bits = _compute_discrete_hyp_bits(
+                    state.params, grid_codelengths,
+                )
+                print(_fmt_epoch_header(epoch + 1, args.tau_fixed))
+                print(_fmt_train_line(metrics, complexity_argmax_bits))
+
+            if (epoch + 1) % args.eval_every == 0:
+                best, is_best = _eval_and_update_best(
+                    state, epoch, args.hidden_size,
+                    grid_values, grid_codelengths,
+                    val_inputs, val_targets,
+                    best, run_dir,
+                )
+                if is_best:
+                    epochs_since_best = 0
+                else:
+                    epochs_since_best += args.eval_every
+                    state, epochs_since_best, did_restart = _maybe_restart(
+                        state, best, epochs_since_best, restart_patience,
+                    )
+                    if did_restart:
+                        n_restarts += 1
+                        print(f"  ↻ RESTART #{n_restarts} at epoch {epoch + 1}"
+                              f" → best checkpoint (epoch {best['epoch']})")
+
+    elapsed = time.time() - t0
+    print("-" * 70)
+    print(f"Training complete in {elapsed:.1f}s"
+          f"{f' ({n_restarts} restarts)' if n_restarts else ''}")
 
     if run_dir is not None:
         save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
@@ -853,10 +1021,12 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
 
     best_val_n_perfect = -1
     best_val_gen_n = -1
-    best_long_val_passes = -1
     best_complexity_bits = math.inf
     best_params = None
-    long_val_probe_ns = sorted({int(n) for n in (args.long_val_n or []) if int(n) > 0})
+    best_opt_state = None
+    epochs_since_best = 0
+    n_restarts = 0
+    restart_patience = getattr(args, 'restart_patience', 0)
 
     t0 = time.time()
     for epoch in range(start_epoch, total_epochs):
@@ -891,44 +1061,28 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                 model_params, grid_codelengths,
             )
             n_val = len(val_inputs)
-            long_val_probe = {
-                "passed_count": 0,
-                "all_passed": True,
-                "summary": "",
-            }
-            if n_perfect == n_val and long_val_probe_ns:
-                long_val_probe = _evaluate_long_val_probes(
-                    model_params, grid, grid_values, long_val_probe_ns,
-                )
             is_best = _should_update_best(
                 n_perfect,
                 gen_n,
-                long_val_probe["passed_count"],
                 current_complexity_bits,
                 best_val_n_perfect,
                 best_val_gen_n,
-                best_long_val_passes,
                 best_complexity_bits,
             )
             best_tag = "  ★ NEW BEST" if is_best else ""
-            long_val_suffix = ""
-            if long_val_probe_ns:
-                if n_perfect == n_val:
-                    long_val_suffix = f"  long_n=[{long_val_probe['summary']}]"
-                else:
-                    long_val_suffix = "  long_n=[skipped]"
             lan_total = current_complexity_bits + integer_code_length(args.hidden_size)
             print(_fmt_val_line(
                 n_perfect, n_val, gen_n, lan_total,
-                long_val_suffix=long_val_suffix,
                 best_tag=best_tag,
             ))
             if is_best:
                 best_val_n_perfect = n_perfect
                 best_val_gen_n = gen_n
-                best_long_val_passes = long_val_probe["passed_count"]
                 best_complexity_bits = current_complexity_bits
                 best_params = jax.tree.map(lambda x: x.copy(), state.params)
+                best_opt_state = jax.tree.map(lambda x: x.copy(), state.opt_state)
+                best_epoch = epoch + 1
+                epochs_since_best = 0
                 if run_dir is not None:
                     save_checkpoint(best_params, checkpoint_path(run_dir, "best.npz"))
                     save_checkpoint_meta(
@@ -938,10 +1092,21 @@ def run_training_shared(args, model, grid_values, grid_codelengths,
                         best_checkpoint_epoch=epoch + 1,
                     )
                     print(f"              ↳ [CKPT] checkpoint saved")
+            else:
+                epochs_since_best += args.eval_every
+                if (restart_patience > 0 and best_params is not None
+                        and epochs_since_best >= restart_patience):
+                    new_opt_state = _zero_adam_moments(best_opt_state)
+                    state = state.replace(params=best_params, opt_state=new_opt_state)
+                    epochs_since_best = 0
+                    n_restarts += 1
+                    print(f"  ↻ RESTART #{n_restarts} at epoch {epoch + 1}"
+                          f" → best checkpoint (epoch {best_epoch})")
 
     elapsed = time.time() - t0
     print("-" * 70)
-    print(f"Training complete in {elapsed:.1f}s")
+    print(f"Training complete in {elapsed:.1f}s"
+          f"{f' ({n_restarts} restarts)' if n_restarts else ''}")
 
     if run_dir is not None:
         save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
@@ -1024,6 +1189,13 @@ def _build_arg_parser(defaults=None):
     parser.add_argument("--init_cl_scale", type=float, default=0.0,
                         help="Scale for codelength-informed logit initialization "
                              "(0 = legacy noise-only, >0 = bias toward simple rationals)")
+    parser.add_argument("--training_mode", type=str, default="annealed",
+                        choices=["annealed", "dst_fixed"],
+                        help="Training mode: 'annealed' (tau annealing, existing) "
+                             "or 'dst_fixed' (fixed-tau deterministic ST)")
+    parser.add_argument("--tau_fixed", type=float, default=1.0,
+                        help="Fixed backward-pass temperature for dst_fixed mode "
+                             "(no annealing; replaces tau_start/tau_end)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     # Shared-weight mode parameters
@@ -1040,8 +1212,9 @@ def _build_arg_parser(defaults=None):
                         help="Minimum n included in the structured validation set")
     parser.add_argument("--val_max_n", type=int, default=71,
                         help="Maximum n included in the structured validation set")
-    parser.add_argument("--long_val_n", action="append", type=int, default=None,
-                        help="Optional sparse large-n validation probe (repeatable)")
+    parser.add_argument("--restart_patience", type=int, default=0,
+                        help="Epochs without improvement before resetting to best "
+                             "checkpoint (0 = disabled)")
     parser.add_argument("--eval_every", type=int, default=100,
                         help="Evaluate every N epochs")
     parser.add_argument("--log_every", type=int, default=50,
@@ -1161,7 +1334,10 @@ def _print_resolved_parameters(args):
 
     print("\nResolved parameters")
     print("-" * 60)
+    training_mode = getattr(args, 'training_mode', 'annealed')
     print(f"  mode={args.mode}")
+    if training_mode == 'dst_fixed':
+        print(f"  training_mode=dst_fixed  (tau_fixed={args.tau_fixed})")
     if args.mode == "basic":
         print("  J = L_D + λ/N·E[Σℓ(θᵢ)] − τ/N·ΣH₂(πᵢ)  (Eq. 86)")
         print(f"  mdl_lambda={args.mdl_lambda}")
@@ -1231,8 +1407,10 @@ def main():
             "deterministic_st": "--deterministic_st",
             "mode_forward": "--mode_forward",
             "init_cl_scale": "--init_cl_scale",
+            "training_mode": "--training_mode",
+            "tau_fixed": "--tau_fixed",
             "deterministic": "--deterministic",
-            "long_val_n": "--long_val_n",
+            "restart_patience": "--restart_patience",
             "eval_every": "--eval_every",
             "log_every": "--log_every",
         }
@@ -1414,12 +1592,15 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         bs = args.batch_size if args.batch_size > 0 else N
         rng, init_rng = jrandom.split(rng)
         if args.mode == "basic":
+            tau_for_eval = (args.tau_fixed
+                            if getattr(args, 'training_mode', 'annealed') == 'dst_fixed'
+                            else args.tau_end)
             state = create_mdl_state(
                 init_rng, model,
                 seq_len=x_train.shape[1],
                 batch_size=min(bs, N),
                 lr=args.lr,
-                tau_init=args.tau_end,
+                tau_init=tau_for_eval,
             )
         else:
             state = create_shared_mdl_state(
@@ -1433,6 +1614,14 @@ def _main_inner(args, run_dir, loaded_params, start_epoch):
         best_params = loaded_params
         best_val_n_perfect = None
         best_epoch = None
+    elif args.mode == "basic" and getattr(args, 'training_mode', 'annealed') == 'dst_fixed':
+        state, best_params, best_val_n_perfect, best_epoch = run_training_dst_fixed(
+            args, model, grid_values, grid_codelengths,
+            x_train, y_train, mask_train,
+            val_inputs, val_targets, rng, grid,
+            run_dir=run_dir, start_epoch=start_epoch,
+            init_params=loaded_params,
+        )
     elif args.mode == "basic":
         state, best_params, best_val_n_perfect, best_epoch = run_training_basic(
             args, model, grid_values, grid_codelengths,

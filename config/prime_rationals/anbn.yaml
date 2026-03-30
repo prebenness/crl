@@ -1,0 +1,17 @@
+task: anbn
+P: 6
+hidden_size: 3
+lambda_mdl: 100.0
+lr: 0.01
+epochs: 10000
+seed: 42
+init_std: 0.01
+clamp_logmag: 10.0
+eval_every: 200
+log_every: 200
+
+# ANBN-specific
+num_train: 1000
+p: 0.3
+data_seed: 0
+test_max_n: 1500

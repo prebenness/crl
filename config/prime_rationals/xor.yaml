@@ -1,0 +1,15 @@
+task: xor
+P: 6
+hidden_dim: 32
+lambda_mdl: 0.001
+lr: 0.001
+epochs: 5000
+seed: 42
+init_std: 0.01
+clamp_logmag: 10.0
+eval_every: 500
+log_every: 100
+
+# XOR-specific
+xor_n_train: 200
+xor_noise_std: 0.1

@@ -268,6 +268,41 @@ def make_fused_epoch_fn(train_step_nojit, x_train, y_train, mask_train,
     return jax.jit(_run, static_argnums=(3,))
 
 
+def make_fused_epoch_fn_fixed_tau(train_step_nojit, x_train, y_train,
+                                   mask_train):
+    """Create a JIT'd function that fuses N full-batch epochs via lax.scan.
+
+    Like make_fused_epoch_fn but with constant tau (no annealing).
+    Tau is read from state.tau, which is set once at initialization.
+
+    Only valid for full-batch training (bs >= N).
+
+    Args:
+        train_step_nojit: train_step function without @jax.jit (jit=False)
+        x_train, y_train, mask_train: full training data arrays
+
+    Returns:
+        run_fused(state, rng, n_steps) -> (state, rng, last_metrics)
+        n_steps is static (recompiles per distinct value).
+    """
+    def _run(state, rng, n_steps):
+        def body(carry, _step_idx):
+            st, rn = carry
+            rn, step_rng = jrandom.split(rn)
+            st, _, aux = train_step_nojit(
+                st, x_train, y_train, mask_train, step_rng,
+            )
+            return (st, rn), aux
+
+        (state, rng), stacked_aux = jax.lax.scan(
+            body, (state, rng), jnp.arange(n_steps),
+        )
+        last_aux = jax.tree.map(lambda x: x[-1], stacked_aux)
+        return state, rng, last_aux
+
+    return jax.jit(_run, static_argnums=(2,))
+
+
 def deterministic_accuracy_single(
     apply_fn, params, grid_values, inp, tgt,
 ):
