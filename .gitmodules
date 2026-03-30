@@ -1,3 +1,6 @@
 [submodule "overleaf"]
 	path = overleaf
 	url = https://git@git.overleaf.com/69b7210dbec66014f921c5d4
+[submodule "mdl"]
+	path = mdl
+	url = git@github.com:prebenness/mdl.git

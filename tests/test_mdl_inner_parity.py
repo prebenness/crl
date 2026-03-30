@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax import random as jrandom
 
 from src.config import load_config
-from src.mdl.coding import grid_values_and_codelengths
+from MDL.src.mdl.coding import grid_values_and_codelengths
 from src.models.classifiers import ULAMLPClassifier
 from src.models.mdl_classifiers import GumbelSoftmaxMLP
 from src.training.steps import make_train_step_mdl, make_train_step_mdl_pair
