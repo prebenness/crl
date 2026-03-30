@@ -81,6 +81,14 @@ class MDLConfig:
 
 
 @dataclass
+class CheckpointingConfig:
+    early_stopping_patience: int = 0    # 0 = disabled
+    restart_patience: int = 0           # 0 = disabled
+    resume_from: str = ""               # path to run_dir to resume from
+    ckpt_select: str = "auto"           # "auto", "best", or "final"
+
+
+@dataclass
 class SweepConfig:
     lambda_min_exp: float = -3.0
     lambda_max_exp: float = 3.0
@@ -99,6 +107,7 @@ class ExperimentConfig:
     mc_samples: MCSamplesConfig = field(default_factory=MCSamplesConfig)
     hsic: HSICConfig = field(default_factory=HSICConfig)
     mdl: MDLConfig = field(default_factory=MDLConfig)
+    checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     sweep: SweepConfig = field(default_factory=SweepConfig)
 
     @property
@@ -127,10 +136,11 @@ def load_config(yaml_path: str) -> ExperimentConfig:
         "mc_samples": MCSamplesConfig,
         "hsic": HSICConfig,
         "mdl": MDLConfig,
+        "checkpointing": CheckpointingConfig,
         "sweep": SweepConfig,
     }
 
-    for section_name, section_cls in section_map.items():
+    for section_name in section_map:
         if section_name in raw:
             section_obj = getattr(cfg, section_name)
             for k, v in raw[section_name].items():
@@ -140,5 +150,12 @@ def load_config(yaml_path: str) -> ExperimentConfig:
                           file=sys.stderr)
                     continue
                 setattr(section_obj, k, v)
+
+    ck = cfg.checkpointing
+    if ck.early_stopping_patience > 0 and ck.restart_patience > 0:
+        raise ValueError(
+            "early_stopping_patience and restart_patience are mutually "
+            "exclusive — set at most one to a positive value"
+        )
 
     return cfg

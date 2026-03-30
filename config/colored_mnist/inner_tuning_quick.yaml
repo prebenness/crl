@@ -1,0 +1,55 @@
+# Quick inner-model tuning: find lambda where inner learns color only.
+# Target: train_acc ~ 95%, test_acc ~ 10%.
+# Single mode (no outer/HSIC) for speed.
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "single"
+  inner: "ula_mlp_var"
+  num_classes: 10
+  bottleneck_width: 16
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-4
+  weight_decay_outer: 0.0
+  epochs: 20
+  batch_size: 128
+  seed: 0
+  alpha: 1.0e-3
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+
+controller:
+  beta_min: 0.0
+  beta_max: 1.0
+  ctrl_ki: 1.0
+
+mc_samples:
+  train: 2
+  eval: 8
+
+hsic:
+  weight: 0.50
+
+checkpointing:
+  early_stopping_patience: 8
+
+# Sweep lambda (capacity target) from very tight to loose
+sweep:
+  lambda_min_exp: -3
+  lambda_max_exp: 1
+  lambda_steps: 10
+  log_sweep: true

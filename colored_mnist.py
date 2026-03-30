@@ -25,6 +25,9 @@ from src.utils.checkpointing import (
     save_config,
     make_experiment_dir,
     utc_timestamp,
+    load_checkpoint,
+    resolve_resume_checkpoint,
+    resolve_resume_start_epoch,
 )
 from src.datasets.datasets import (
     build_dataset, dataset_to_jax_arrays, DATASET_NUM_CLASSES,
@@ -137,6 +140,12 @@ def parse_args(argv=None):
         dest="dataloader_persistent_workers",
         action="store_false",
         help="Override dataloader.persistent_workers=False.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a run_dir to resume training from.",
     )
     parser.set_defaults(
         dataloader_pin_memory=None,
@@ -365,6 +374,23 @@ def main(argv=None):
             "dataloader": dataloader_settings,
         })
 
+        # Resume handling
+        resume_source = args.resume or cfg.checkpointing.resume_from
+        if resume_source:
+            ckpt_path, ckpt_kind = resolve_resume_checkpoint(
+                resume_source, cfg.checkpointing.ckpt_select,
+            )
+            resume_params = load_checkpoint(ckpt_path)
+            resume_start_epoch = resolve_resume_start_epoch(
+                resume_source, ckpt_kind,
+                default_final_epoch=cfg.training.epochs,
+            )
+            print(f"  Resuming from {ckpt_path} ({ckpt_kind}, "
+                  f"epoch {resume_start_epoch})")
+        else:
+            resume_params = None
+            resume_start_epoch = 0
+
         run_config = {
             "lambda": lamb,
             "dataset": cfg.dataset.name,
@@ -392,6 +418,8 @@ def main(argv=None):
                     train_epoch_fn=train_epoch,
                     eval_epoch_fn=eval_epoch,
                     run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_params=resume_params,
                 )
             elif mode == "pair":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)
@@ -403,6 +431,8 @@ def main(argv=None):
                     train_epoch_pair_fn=train_epoch_pair,
                     eval_epoch_fn=eval_epoch,
                     run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_inner_params=resume_params,
                 )
             elif mode == "mdl":
                 res = run_train_eval_mdl(
@@ -412,6 +442,8 @@ def main(argv=None):
                     train_epoch_fn=mdl_epoch_train,
                     eval_epoch_fn=mdl_eval_epoch,
                     run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_params=resume_params,
                 )
             elif mode == "mdl_pair":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)
@@ -424,6 +456,8 @@ def main(argv=None):
                     eval_inner_epoch_fn=mdl_eval_epoch,
                     eval_outer_epoch_fn=outer_eval_epoch,
                     run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_inner_params=resume_params,
                 )
             elif mode == "mdl_shared":
                 res = run_train_eval_mdl(
@@ -433,6 +467,8 @@ def main(argv=None):
                     train_epoch_fn=mdl_shared_epoch_train,
                     eval_epoch_fn=mdl_shared_eval_epoch,
                     run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_params=resume_params,
                 )
             elif mode == "mdl_shared_pair":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)
@@ -445,6 +481,8 @@ def main(argv=None):
                     eval_inner_epoch_fn=mdl_shared_eval_epoch,
                     eval_outer_epoch_fn=outer_eval_epoch,
                     run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_inner_params=resume_params,
                 )
             else:
                 raise ValueError(f"Unknown model.mode: {cfg.model.mode!r}")
@@ -455,6 +493,8 @@ def main(argv=None):
 
         run.summary["final_test_acc"] = res["test_acc"]
         run.summary["final_train_acc"] = res["train_acc"]
+        run.summary["best_test_acc"] = res.get("best_test_acc", res["test_acc"])
+        run.summary["best_epoch"] = res.get("best_epoch", res.get("epoch"))
         run.finish()
 
         all_results.append(res)

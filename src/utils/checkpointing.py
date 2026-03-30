@@ -112,6 +112,56 @@ def save_results(run_dir, results_dict):
         json.dump(clean, f, indent=2)
 
 
+def save_checkpoint_meta(run_dir, last_epoch, best_test_acc,
+                         best_checkpoint_epoch=None):
+    """Write/update checkpoint metadata sidecar (checkpoints/meta.json)."""
+    meta_path = checkpoint_path(run_dir, "meta.json")
+    meta = {}
+    if meta_path.exists():
+        with open(meta_path) as f:
+            meta = json.load(f)
+    meta["last_epoch"] = int(last_epoch)
+    meta["best_test_acc"] = float(best_test_acc)
+    if best_checkpoint_epoch is not None:
+        meta["best_checkpoint_epoch"] = int(best_checkpoint_epoch)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def load_checkpoint_meta(run_dir):
+    """Read checkpoint metadata, return empty dict if missing."""
+    meta_path = checkpoint_path(run_dir, "meta.json", create=False)
+    if meta_path.exists():
+        with open(meta_path) as f:
+            return json.load(f)
+    return {}
+
+
+def resolve_resume_checkpoint(run_dir, selection="auto"):
+    """Find checkpoint file for resume. Returns (path, kind)."""
+    candidates = {
+        "best": checkpoint_path(run_dir, "best.npz", create=False),
+        "final": checkpoint_path(run_dir, "final.npz", create=False),
+    }
+    order = ["best", "final"] if selection == "auto" else [selection]
+    for kind in order:
+        p = candidates[kind]
+        if p.exists():
+            return p, kind
+    raise FileNotFoundError(
+        f"No {selection} checkpoint found in {run_dir}"
+    )
+
+
+def resolve_resume_start_epoch(run_dir, checkpoint_kind,
+                                default_final_epoch=0):
+    """Choose start epoch based on checkpoint kind and metadata."""
+    meta = load_checkpoint_meta(run_dir)
+    if checkpoint_kind == "best":
+        return int(meta.get("best_checkpoint_epoch", 0))
+    return int(meta.get("last_epoch", default_final_epoch))
+
+
 def save_config(run_dir, config_dict):
     """Write config to config.json."""
     Path(run_dir).mkdir(parents=True, exist_ok=True)
