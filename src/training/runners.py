@@ -309,6 +309,142 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
     return results
 
 
+# ---- Oracle pair-model runner ----
+
+def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
+                               inner_model, outer_model, cfg, lamb,
+                               wandb_run, *, create_inner_fn,
+                               create_outer_fn, train_epoch_pair_fn,
+                               eval_epoch_fn, run_dir=None,
+                               start_epoch=0, init_inner_params=None,
+                               init_outer_params=None):
+    """Oracle pair training loop: frozen inner, trainable outer with HSIC."""
+    rng = jrandom.PRNGKey(cfg.training.seed)
+    input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
+    rng, r1, r2 = jrandom.split(rng, 3)
+
+    inner_state = create_inner_fn(r1, inner_model, input_shape, cfg)
+    outer_state = create_outer_fn(r2, outer_model, input_shape, cfg)
+    if init_inner_params is not None:
+        inner_state = inner_state.replace(params=init_inner_params)
+    if init_outer_params is not None:
+        outer_state = outer_state.replace(params=init_outer_params)
+
+    xt, yt, te_counts = make_eval_batches(
+        x_test, y_test, cfg.training.batch_size,
+    )
+
+    early_stopping_patience, restart_patience = _get_patience_cfg(cfg)
+    best = {
+        "test_acc": -1.0,
+        "outer_params": None,
+        "epoch": 0,
+    }
+    epochs_since_best = 0
+    n_restarts = 0
+
+    for ep in range(start_epoch, cfg.training.epochs):
+        t0 = time.time()
+        seed_tr = cfg.training.seed * 10_000 + ep
+        rng, rng_epoch = jrandom.split(rng)
+
+        xb, yb = make_epoch_batches(
+            x_train, y_train, cfg.training.batch_size, seed_tr,
+        )
+
+        inner_state, outer_state, metrics = train_epoch_pair_fn(
+            inner_state, outer_state, xb, yb, rng_epoch,
+            lamb, cfg.training.alpha, cfg.hsic.weight,
+            num_classes=cfg.model.num_classes,
+        )
+
+        rng, rng_eval1, rng_eval2 = jrandom.split(rng, 3)
+        te_loss1, te_acc1 = eval_epoch_fn(
+            inner_state, xt, yt, rng_eval1, te_counts,
+        )
+        te_loss2, te_acc2 = eval_epoch_fn(
+            outer_state, xt, yt, rng_eval2, te_counts,
+        )
+
+        # Best-checkpoint tracking (outer test accuracy only)
+        current_acc = float(te_acc2)
+        if current_acc > best["test_acc"]:
+            best["test_acc"] = current_acc
+            best["outer_params"] = outer_state.params
+            best["epoch"] = ep + 1
+            epochs_since_best = 0
+            if run_dir is not None:
+                save_checkpoint(outer_state.params,
+                                checkpoint_path(run_dir, "outer_best.npz"))
+                save_checkpoint_meta(run_dir, ep + 1, best["test_acc"],
+                                     best_checkpoint_epoch=ep + 1)
+            print(f"    >>> NEW BEST outer_test_acc={current_acc:.4f} "
+                  f"(epoch {ep+1})")
+        else:
+            epochs_since_best += 1
+
+        results = {
+            "epoch": ep + 1,
+            "train_acc1": float(metrics["accuracy_inner"]),
+            "test_acc1": float(te_acc1),
+            "test_nll_nats_inner": float(te_loss1),
+            "train_acc2": float(metrics["accuracy_outer"]),
+            "test_acc2": float(te_acc2),
+            "objective_total_outer_nats": float(metrics["objective_total_outer_nats"]),
+            "data_nll_outer_nats": float(metrics["data_nll_outer_nats"]),
+            "test_nll_nats_outer": float(te_loss2),
+            "hsic": float(metrics["hsic"]),
+            "best_test_acc": best["test_acc"],
+            "best_epoch": best["epoch"],
+        }
+        wandb_run.log(results)
+
+        print(
+            f"  Epoch {ep+1}/{cfg.training.epochs}"
+            f" | oracle_acc {results['train_acc1']:.4f}"
+            f" (test {results['test_acc1']:.4f})"
+            f" | outer_train_acc {results['train_acc2']:.4f}"
+            f" outer_test_acc {results['test_acc2']:.4f}"
+            f" | outer_ce {results['data_nll_outer_nats']:.4f}n"
+            f" | hsic {results['hsic']:.4f}"
+            f" | {time.time()-t0:.2f}s"
+        )
+
+        # Patience check — only restart outer (inner is frozen)
+        if early_stopping_patience > 0 and epochs_since_best >= early_stopping_patience:
+            print(f"  Early stopping at epoch {ep+1} "
+                  f"(no improvement for {early_stopping_patience} epochs)")
+            break
+
+        if (restart_patience > 0
+                and best["outer_params"] is not None
+                and epochs_since_best >= restart_patience):
+            outer_state = outer_state.replace(
+                params=best["outer_params"],
+                opt_state=outer_state.tx.init(best["outer_params"]),
+            )
+            epochs_since_best = 0
+            n_restarts += 1
+            print(f"  RESTART #{n_restarts} at epoch {ep+1} "
+                  f"-> best checkpoint (epoch {best['epoch']})")
+
+    results["best_test_acc"] = best["test_acc"]
+    results["best_epoch"] = best["epoch"]
+    results["n_restarts"] = n_restarts
+
+    if run_dir is not None:
+        save_checkpoint(outer_state.params,
+                        checkpoint_path(run_dir, "outer_final.npz"))
+        save_checkpoint_meta(run_dir, ep + 1, best["test_acc"],
+                             best_checkpoint_epoch=best["epoch"])
+        save_results(run_dir, results)
+
+    results["train_acc"] = results["train_acc2"]
+    results["test_acc"] = results["test_acc2"]
+    results["lambda"] = float(lamb)
+    return results
+
+
 # ---- MDL single-model runner ----
 
 def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,

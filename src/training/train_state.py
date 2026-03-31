@@ -33,6 +33,25 @@ def create_state_inner(rng, model, input_shape, cfg):
     )
 
 
+def create_state_oracle(rng, model, input_shape, cfg):
+    """Initialize oracle (deterministic MLP) model state."""
+    params = model.init(
+        rng,
+        jnp.ones(input_shape, jnp.float32),
+        train=True,
+    )["params"]
+    tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
+    opt_state = tx.init(params)
+
+    return train_state.TrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
+    )
+
+
 class MDLTrainState(train_state.TrainState):
     """TrainState with Gumbel temperature for MDL models."""
     tau: jnp.ndarray

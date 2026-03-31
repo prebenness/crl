@@ -1,0 +1,52 @@
+# Oracle pair: frozen oracle inner + trainable outer with HSIC.
+# Requires oracle_checkpoint to be set to the best.npz from an oracle_train run.
+# Use with: python colored_mnist.py config/colored_mnist/oracle_pair.yaml
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "oracle_pair"
+  inner: "oracle_mlp"
+  outer: "ula_mlp"
+  num_classes: 10
+  oracle_checkpoint: "results/colored_mnist/20260331_001100_oracle_train_cmnist_ula_oracle_train/runs/lambda_1.0e+00/checkpoints/best.npz"
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 0.0
+  weight_decay_outer: 1.0e-4
+  epochs: 10
+  batch_size: 128
+  seed: 0
+  alpha: 0.01
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+
+controller:
+  beta_min: 0.0
+  beta_max: 1.0
+  ctrl_ki: 1.0
+
+mc_samples:
+  train: 2
+  eval: 8
+
+hsic:
+  weight: 0.50
+
+sweep:
+  lambda_min_exp: 0
+  lambda_max_exp: 0
+  lambda_steps: 1
+  log_sweep: true

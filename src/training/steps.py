@@ -112,6 +112,106 @@ def make_train_step(cfg):
     return train_step
 
 
+def make_train_step_oracle(cfg):
+    """Return a JIT-compiled train step for oracle (deterministic CE-only)."""
+    @jax.jit
+    def train_step(state, batch, rng, lamb, alpha):
+        x, y = batch
+
+        def loss_fn(params):
+            logits, aux = state.apply_fn(
+                {"params": params}, x, train=True,
+            )
+            ce = optax.softmax_cross_entropy_with_integer_labels(
+                logits, y,
+            ).mean()
+            return ce, logits
+
+        (loss, logits), grads = (
+            jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        )
+        state = state.apply_gradients(grads=grads)
+
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        metrics = {
+            "objective_total_nats": loss,
+            "data_nll_nats": loss,
+            "reconstruction_nll_nats": jnp.array(0.0),
+            "kl_latent_nats": jnp.array(0.0),
+            "beta_controller": jnp.array(0.0),
+            "accuracy": acc,
+        }
+        return state, metrics
+
+    return train_step
+
+
+def make_eval_step_oracle(cfg):
+    """Return a JIT-compiled eval step for oracle (deterministic forward)."""
+    @jax.jit
+    def eval_step(state, batch, rng):
+        x, y = batch
+        logits, _ = state.apply_fn(
+            {"params": state.params}, x, train=False,
+        )
+        nll = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        return nll, acc
+
+    return eval_step
+
+
+def make_train_step_oracle_pair(cfg):
+    """Return a JIT-compiled pair step: frozen oracle inner + trainable outer with HSIC."""
+    def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,
+                        hsic_w, num_classes):
+        x, y = batch
+        hsic_w = jnp.asarray(hsic_w, jnp.float32)
+
+        # --- Inner model (oracle, frozen) ---
+        logits1, aux1 = inner_state.apply_fn(
+            {"params": inner_state.params}, x, train=False,
+        )
+        z1 = aux1["z"]
+        z1_sg = lax.stop_gradient(z1)
+
+        # --- Outer model (standard classifier + HSIC) ---
+        def loss_fn2(params):
+            logits2, aux2 = outer_state.apply_fn(
+                {"params": params}, x, train=True,
+            )
+            z2 = aux2["z"]
+
+            ce2 = optax.softmax_cross_entropy_with_integer_labels(
+                logits2, y
+            ).mean()
+            hsic = class_cond_hsic_rbf(
+                z1_sg, z2, y, num_classes=num_classes,
+            )
+
+            total = ce2 * (1 - hsic_w) + hsic * hsic_w
+            return total, (logits2, ce2, hsic)
+
+        (loss2, (logits2, ce2, hsic_loss)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": ce2,
+            "hsic": hsic_loss,
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
 def make_train_step_pair(cfg):
     """Return a JIT-compiled dual-model train_step_pair."""
     beta_min = cfg.controller.beta_min

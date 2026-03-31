@@ -36,6 +36,7 @@ class ModelConfig:
     num_classes: int = 10
     bottleneck_width: int = 16
     outer_rep_dim: int = 100
+    oracle_checkpoint: str = ""
 
 
 @dataclass

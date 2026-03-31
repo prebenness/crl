@@ -29,6 +29,25 @@ class StdClassifier(nn.Module):
         return logits, aux
 
 
+class OracleMLP(nn.Module):
+    """Deterministic MLP for oracle color classification.
+
+    Architecture matches ULAMLPVarClassifier's encoder path but without
+    variational components (no KL, no reconstruction, no sampling).
+    Bottleneck is 50-d for direct comparability with VIB mu.
+    """
+    num_classes: int
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(100)(x)
+        x = nn.relu(x)
+        z = nn.Dense(50)(x)
+        logits = nn.Dense(self.num_classes)(nn.relu(nn.Dense(100)(z)))
+        return logits, {"z": z}
+
+
 class ULAMLPClassifier(nn.Module):
     """
     cMNIST classifier matching uLA / CCDB architecture:

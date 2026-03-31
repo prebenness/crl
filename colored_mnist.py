@@ -33,18 +33,20 @@ from src.datasets.datasets import (
     build_dataset, dataset_to_jax_arrays, DATASET_NUM_CLASSES,
 )
 from src.models.ib_classifiers import VIBClassifier, ULAMLPVarClassifier
-from src.models.classifiers import StdClassifier, ULAMLPClassifier
+from src.models.classifiers import StdClassifier, ULAMLPClassifier, OracleMLP
 from src.models.mdl_classifiers import GumbelSoftmaxMLP
 from mdl.src.mdl.coding import grid_values_and_codelengths
 from src.training.train_state import (
     create_state_inner, create_state_outer, create_state_mdl,
-    create_state_mdl_shared,
+    create_state_mdl_shared, create_state_oracle,
 )
 from src.training.steps import (
     make_train_step, make_train_step_pair, make_eval_step,
     make_train_step_mdl, make_train_step_mdl_pair, make_eval_step_mdl,
     make_train_step_mdl_shared, make_train_step_mdl_shared_pair,
     make_eval_step_mdl_shared,
+    make_train_step_oracle, make_eval_step_oracle,
+    make_train_step_oracle_pair,
 )
 from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
@@ -53,6 +55,7 @@ from src.training.epochs import (
 from src.training.runners import (
     run_train_eval, run_train_eval_pair,
     run_train_eval_mdl, run_train_eval_mdl_pair,
+    run_train_eval_oracle_pair,
 )
 from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 
@@ -85,6 +88,9 @@ INNER_MODELS = {
         num_classes=cfg.model.num_classes,
     ),
     "mdl_mlp": _make_mdl_mlp,
+    "oracle_mlp": lambda cfg: OracleMLP(
+        num_classes=cfg.model.num_classes,
+    ),
 }
 
 OUTER_MODELS = {
@@ -267,6 +273,22 @@ def main(argv=None):
         train_epoch_pair = make_train_epoch_pair(train_step_pair)
         eval_epoch = make_eval_epoch(eval_step)
 
+    if mode == "oracle_train":
+        oracle_train_step = make_train_step_oracle(cfg)
+        oracle_eval_step = make_eval_step_oracle(cfg)
+
+        oracle_train_epoch = make_train_epoch(oracle_train_step)
+        oracle_eval_epoch = make_eval_epoch(oracle_eval_step)
+
+    if mode == "oracle_pair":
+        oracle_pair_step = make_train_step_oracle_pair(cfg)
+        oracle_eval_step = make_eval_step_oracle(cfg)
+        outer_eval_step_op = make_eval_step_oracle(cfg)
+
+        oracle_pair_epoch = make_train_epoch_pair(oracle_pair_step)
+        oracle_inner_eval_epoch = make_eval_epoch(oracle_eval_step)
+        oracle_outer_eval_epoch = make_eval_epoch(outer_eval_step_op)
+
     if mode in ("mdl", "mdl_pair"):
         mdl_step_train = make_train_step_mdl(cfg)
         mdl_eval_step = make_eval_step_mdl(cfg)
@@ -327,6 +349,15 @@ def main(argv=None):
     print("Test shape, min, max :",
           x_test.shape, x_test.min(), x_test.max())
     print(f"Data ready in {time.time()-t0:.2f}s")
+
+    # Extract color labels for oracle training
+    if mode == "oracle_train":
+        import jax.numpy as jnp
+        y_train = jnp.array(train_ds.colors, dtype=jnp.int32)
+        y_test = jnp.array(test_ds.colors, dtype=jnp.int32)
+        print(f"Oracle mode: using color labels (train unique: "
+              f"{len(set(train_ds.colors.tolist()))}, "
+              f"test unique: {len(set(test_ds.colors.tolist()))})")
 
     # Lambda sweep
     all_results = []
@@ -483,6 +514,39 @@ def main(argv=None):
                     run_dir=run_dir,
                     start_epoch=resume_start_epoch,
                     init_inner_params=resume_params,
+                )
+            elif mode == "oracle_train":
+                res = run_train_eval(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, cfg, lamb, wandb_run=run,
+                    create_state_fn=create_state_oracle,
+                    train_epoch_fn=oracle_train_epoch,
+                    eval_epoch_fn=oracle_eval_epoch,
+                    run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_params=resume_params,
+                )
+            elif mode == "oracle_pair":
+                outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                oracle_ckpt = cfg.model.oracle_checkpoint
+                if not oracle_ckpt:
+                    raise ValueError(
+                        "oracle_pair mode requires model.oracle_checkpoint "
+                        "to be set in the config"
+                    )
+                oracle_params = load_checkpoint(oracle_ckpt)
+                print(f"  Loaded oracle checkpoint: {oracle_ckpt}")
+                res = run_train_eval_oracle_pair(
+                    x_train, y_train, x_test, y_test,
+                    inner_model, outer_model, cfg, lamb, wandb_run=run,
+                    create_inner_fn=create_state_oracle,
+                    create_outer_fn=create_state_outer,
+                    train_epoch_pair_fn=oracle_pair_epoch,
+                    eval_epoch_fn=oracle_inner_eval_epoch,
+                    run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_inner_params=oracle_params,
+                    init_outer_params=resume_params,
                 )
             else:
                 raise ValueError(f"Unknown model.mode: {cfg.model.mode!r}")

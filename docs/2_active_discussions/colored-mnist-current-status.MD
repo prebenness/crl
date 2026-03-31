@@ -14,7 +14,8 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
   - `0.8846`
 - Inner model behavior:
   - `test_acc1 = 0.1133`
-  - effectively near chance, which means the inner model is strongly shortcut-dominated
+  - At chance, but `train_acc1` was also ~11% — the inner model learned nothing, not color-only.
+  - See inner model investigation notes below.
 
 ### Best Observed VIB Pair Peak
 
@@ -36,9 +37,64 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 - The VIB pair path is currently stronger than the MDL pair path on outer accuracy.
 - The gap to the `~96%` target is still large.
 - Peak-vs-final behavior suggests model selection / best-checkpoint saving is still a meaningful bottleneck.
+  - Best-checkpoint saving now implemented (2026-03-30).
+
+## Inner Model Investigation (2026-03-30)
+
+The inner VIB model (`ula_mlp_var`, 50-dim bottleneck) must learn to capture the color
+shortcut for the pair mechanism to work: target ~95% train acc, ~10% test acc on `cmnist_ula`.
+
+### Key findings
+
+- On **binary** `colored_mnist` with Jan 28 hyperparams (`lr=1e-3, wd=1e-2, alpha=0.01,
+  epochs=5`), the ULA MLP achieves a clean color-only regime at lambda 0.5–7:
+  train ~86–89%, test ~10%.
+- On **10-class** `cmnist_ula` with identical hyperparams, the color-only regime does not
+  appear. The model transitions directly from "learns nothing" to "learns both color and shape".
+- The transition is too sharp: at every lambda where train acc is high enough to indicate
+  color was learned, test acc is well above 10% (shape has leaked through).
+
+### Best inner-model-only results so far (10-class `cmnist_ula`)
+
+Best train/test gap (most color-dominant) achieved with:
+- `lr=3e-4, wd=1e-2, alpha=0.01, epochs=20, lambda~5–9`
+- Train ~91–93%, test ~25–27%
+- ~20 points of shape information consistently leaks through.
+
+### Hyperparameters explored
+
+| Lever | Values tried | Effect |
+|-------|-------------|--------|
+| Alpha (CE vs recon) | 0.01, 0.1, 0.5, 0.9 | Higher alpha = worse (more shape leaks). Best at 0.01. |
+| Weight decay | 1e-4, 1e-2 | 1e-2 better (matches working binary setup) |
+| Learning rate | 1e-4, 3e-4, 1e-3 | 3e-4 gives best gap; lower LR doesn't help further |
+| Epochs | 5, 10, 20, 40 | More epochs helps train converge but shape leaks equally |
+| Lambda | 1e-3 to 1e3 | Sweet spot around 5–9 nats for 10-class |
+
+### Observations on binary vs 10-class
+
+- Binary `colored_mnist` produces a clean color-only regime with the same model and
+  hyperparams. 10-class `cmnist_ula` does not, under any hyperparams tried so far.
+- One known difference: binary test set has anti-correlated colors (p_test=0.1 flips the
+  label), making the color-only regime clearly visible as a dip below chance. 10-class test
+  set has uniform random colors, so a color-only model scores at chance (10%) —
+  indistinguishable from having learned nothing.
+- It is unclear whether the regime truly doesn't exist for 10-class or whether we haven't
+  found the right hyperparameters yet.
+
+### Open questions
+
+- Why does shape leak through so readily on 10-class? Is it the wider capacity gap,
+  the test correlation structure, the bottleneck width (50 vs 16), or something else?
+- Would a fixed KL penalty (instead of ControlVAE) give tighter control?
+- Could architectural changes (e.g. removing the post-bottleneck hidden layer) help
+  without violating ULA comparability?
+- Is the pair mechanism with HSIC effective even when the inner model isn't purely
+  color-dominant?
 
 ## Immediate Next Work
 
-1. Add or use explicit best-epoch selection for outer accuracy.
-2. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
-3. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
+1. ~~Add or use explicit best-epoch selection for outer accuracy.~~ Done (2026-03-30).
+2. Resolve the inner model color-only regime problem for 10-class before running more pair experiments.
+3. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
+4. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
