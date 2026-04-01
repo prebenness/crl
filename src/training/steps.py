@@ -931,3 +931,152 @@ def make_eval_step(cfg):
         return nll, acc
 
     return eval_step
+
+
+# ============================================================
+# ResNet (BatchNorm) step functions
+# ============================================================
+
+def make_train_step_resnet(cfg, augment_fn=None):
+    """Return a JIT-compiled train step for ResNet (handles batch_stats).
+
+    Args:
+        augment_fn: optional (rng, images) -> images augmentation applied before forward.
+    """
+    @jax.jit
+    def train_step(state, batch, rng, lamb, alpha):
+        x, y = batch
+
+        if augment_fn is not None:
+            rng, aug_rng = jax.random.split(rng)
+            x = augment_fn(aug_rng, x)
+
+        def loss_fn(params):
+            variables = {"params": params, "batch_stats": state.batch_stats}
+            (logits, aux_dict), new_vars = state.apply_fn(
+                variables, x, train=True, mutable=["batch_stats"],
+            )
+            ce = optax.softmax_cross_entropy_with_integer_labels(
+                logits, y,
+            ).mean()
+            return ce, (logits, new_vars)
+
+        (loss, (logits, new_vars)), grads = (
+            jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        )
+        state = state.apply_gradients(grads=grads)
+        state = state.replace(batch_stats=new_vars["batch_stats"])
+
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        metrics = {
+            "objective_total_nats": loss,
+            "data_nll_nats": loss,
+            "reconstruction_nll_nats": jnp.array(0.0),
+            "kl_latent_nats": jnp.array(0.0),
+            "beta_controller": jnp.array(0.0),
+            "accuracy": acc,
+        }
+        return state, metrics
+
+    return train_step
+
+
+def make_eval_step_resnet(cfg, transform_fn=None):
+    """Return a JIT-compiled eval step for ResNet (uses stored batch_stats).
+
+    Args:
+        transform_fn: optional images -> images transform (no rng, deterministic).
+    """
+    @jax.jit
+    def eval_step(state, batch, rng):
+        x, y = batch
+
+        if transform_fn is not None:
+            x = transform_fn(x)
+
+        variables = {"params": state.params, "batch_stats": state.batch_stats}
+        logits, _ = state.apply_fn(variables, x, train=False)
+        nll = optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        return nll, acc
+
+    return eval_step
+
+
+def make_train_step_resnet_pair(cfg, augment_fn=None):
+    """Return a JIT-compiled pair step for two ResNet (BatchNorm) models.
+
+    Inner: trains with CE only.
+    Outer: trains with CE + HSIC(z_inner, z_outer).
+    Both update batch_stats.
+    """
+    def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,
+                        hsic_w, num_classes):
+        x, y = batch
+        hsic_w = jnp.asarray(hsic_w, jnp.float32)
+
+        if augment_fn is not None:
+            rng, aug_rng = jax.random.split(rng)
+            x = augment_fn(aug_rng, x)
+
+        # --- Inner model (CE only) ---
+        def inner_loss_fn(params):
+            variables = {"params": params, "batch_stats": inner_state.batch_stats}
+            (logits1, aux1), new_vars1 = inner_state.apply_fn(
+                variables, x, train=True, mutable=["batch_stats"],
+            )
+            ce1 = optax.softmax_cross_entropy_with_integer_labels(
+                logits1, y,
+            ).mean()
+            return ce1, (logits1, aux1, new_vars1)
+
+        (loss1, (logits1, aux1, new_vars1)), grads1 = (
+            jax.value_and_grad(inner_loss_fn, has_aux=True)(inner_state.params)
+        )
+        inner_state = inner_state.apply_gradients(grads=grads1)
+        inner_state = inner_state.replace(batch_stats=new_vars1["batch_stats"])
+
+        z1 = aux1["z"]
+        z1_sg = lax.stop_gradient(z1)
+
+        # --- Outer model (CE + HSIC) ---
+        def outer_loss_fn(params):
+            variables = {"params": params, "batch_stats": outer_state.batch_stats}
+            (logits2, aux2), new_vars2 = outer_state.apply_fn(
+                variables, x, train=True, mutable=["batch_stats"],
+            )
+            z2 = aux2["z"]
+
+            ce2 = optax.softmax_cross_entropy_with_integer_labels(
+                logits2, y,
+            ).mean()
+            hsic = class_cond_hsic_rbf(
+                z1_sg, z2, y, num_classes=num_classes,
+            )
+            total = ce2 * (1 - hsic_w) + hsic * hsic_w
+            return total, (logits2, ce2, hsic, new_vars2)
+
+        (loss2, (logits2, ce2, hsic_loss, new_vars2)), grads2 = (
+            jax.value_and_grad(outer_loss_fn, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+        outer_state = outer_state.replace(batch_stats=new_vars2["batch_stats"])
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_nats": loss1,
+            "data_nll_nats": loss1,
+            "reconstruction_nll_nats": jnp.array(0.0),
+            "kl_latent_nats": jnp.array(0.0),
+            "beta_controller": jnp.array(0.0),
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": ce2,
+            "hsic": hsic_loss,
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))

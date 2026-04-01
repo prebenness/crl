@@ -6,6 +6,11 @@ from flax.training import train_state
 import optax
 
 
+class BatchNormTrainState(train_state.TrainState):
+    """TrainState with batch statistics for models using BatchNorm."""
+    batch_stats: dict
+
+
 class ControlTrainState(train_state.TrainState):
     """TrainState extended with ControlVAE controller state."""
     beta: jnp.ndarray
@@ -131,4 +136,27 @@ def create_state_outer(rng, model, input_shape, cfg):
         params=params,
         tx=tx,
         opt_state=opt_state,
+    )
+
+
+def create_state_resnet(rng, model, input_shape, cfg, weight_decay_key="weight_decay_inner"):
+    """Initialize a ResNet (BatchNorm) model state.
+
+    Args:
+        weight_decay_key: which cfg.training field to use for weight decay.
+    """
+    variables = model.init(rng, jnp.ones(input_shape, jnp.float32), train=True)
+    params = variables["params"]
+    batch_stats = variables.get("batch_stats", {})
+    wd = getattr(cfg.training, weight_decay_key)
+    tx = optax.adamw(cfg.training.lr, wd)
+    opt_state = tx.init(params)
+
+    return BatchNormTrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
+        batch_stats=batch_stats,
     )

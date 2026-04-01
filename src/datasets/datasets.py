@@ -136,56 +136,60 @@ class StandardMNISTBin(Dataset):
 
 class CMNISTuLA(Dataset):
     """
-    Option A) cMNIST (uLA / CCDB protocol).
+    cMNIST (uLA / CCDB protocol).
 
     Matches uLA Appendix D.2:
       - Target: digit y in {0..9}
       - Bias: color z in {0..9}, with a designated paired color per digit
-      - Development (train=True): P(z = paired(y)) = 1 - beta, else uniform over remaining 9 colors
-        In this class we expose p_corr := 1 - beta (so beta = 1 - p_corr).
-      - Test (train=False): unbiased; digit-color pairs random ("random chance 1/10^2"),
-        implemented as z ~ Uniform({0..9}) independent of y.
+      - Development (split="train"/"val"): biased, p_corr = 1 - beta
+      - Test (split="test"): unbiased, z ~ Uniform({0..9}) independent of y
 
-    Signature matches your existing ColoredMNIST:
-        __init__(root="./data", train=True, p_corr=0.9, seed=0)
-
-    Returns:
-        (x_rgb, y) where x_rgb is float32 CHW in [0,1], y is int32 in {0..9}.
-
-    Notes / assumptions (not specified in uLA/CCDB PDFs):
-      - Exact RGB palette is not standardized in the papers; we provide a fixed 10-color palette.
-      - We colorize the *foreground digit* (background stays black). If their implementation colors
-        the background instead, you can switch the application rule later without changing the
-        correlation structure.
-      - Train/val split is not encoded here; create val by splitting indices from the biased
-        train=True dataset object (so val is also from pdata, as described).
+    Args:
+        split: "train", "val", or "test". Train/val stratified-split from
+               biased MNIST training set (90/10). Overrides train if provided.
+        train: Legacy. True -> "train", False -> "test". Ignored when split is set.
     """
 
-    # 10 distinct RGB colors in [0,1]. You can change these later to match an official implementation.
+    VAL_FRAC = 0.1
+
+    # DFA hue-wheel palette: 10 saturated RGB colours at 36° intervals.
+    # Verified empirically from the DFA pre-built dataset (Lee et al., 2021).
+    # Values are uint8 {0..255} mapped to [0,1]; 128/255 ≈ 0.502.
     COLOR_PALETTE = np.array([
-        [1.0, 0.0, 0.0],  # red
-        [0.0, 1.0, 0.0],  # green
-        [0.0, 0.0, 1.0],  # blue
-        [1.0, 1.0, 0.0],  # yellow
-        [1.0, 0.0, 1.0],  # magenta
-        [0.0, 1.0, 1.0],  # cyan
-        [1.0, 0.5, 0.0],  # orange
-        [0.5, 0.0, 1.0],  # purple
-        [0.6, 0.3, 0.0],  # brown-ish
-        [0.2, 0.8, 0.2],  # light green
+        [1.0,       0.0,       0.0      ],  # 0: red         (255,  0,  0)
+        [1.0,       128/255.0, 0.0      ],  # 1: orange      (255,128,  0)
+        [1.0,       1.0,       0.0      ],  # 2: yellow      (255,255,  0)
+        [128/255.0, 1.0,       0.0      ],  # 3: chartreuse  (128,255,  0)
+        [0.0,       1.0,       0.0      ],  # 4: green       (  0,255,  0)
+        [0.0,       1.0,       1.0      ],  # 5: cyan        (  0,255,255)
+        [0.0,       0.0,       1.0      ],  # 6: blue        (  0,  0,255)
+        [128/255.0, 0.0,       1.0      ],  # 7: purple      (128,  0,255)
+        [1.0,       0.0,       128/255.0],  # 8: rose        (255,  0,128)
+        [1.0,       0.0,       1.0      ],  # 9: magenta     (255,  0,255)
     ], dtype=np.float32)
 
-    # Paired color per digit. Identity mapping matches the “k paired with a distinct color” description.
+    # Paired color per digit. Identity mapping matches the "k paired with a distinct color" description.
     PAIRED_COLOR = np.arange(10, dtype=np.int32)
 
-    def __init__(self, root="./data", train=True, p_corr=0.9, seed=0):
+    def __init__(self, root="./data", train=True, p_corr=0.9, seed=0, split=None):
         super().__init__()
+
+        # Resolve split
+        if split is not None:
+            if split not in ("train", "val", "test"):
+                raise ValueError(f"split must be 'train', 'val', or 'test', got {split!r}")
+            use_mnist_train = split in ("train", "val")
+        else:
+            use_mnist_train = bool(train)
+            split = "train" if use_mnist_train else "test"
+
         self.rng = np.random.RandomState(seed)
-        self.train_split = bool(train)
+        self.train_split = split != "test"
+        self.split = split
 
         base = MNIST(
             root=root,
-            train=train,
+            train=use_mnist_train,
             download=True,
             transform=transforms.ToTensor(),
         )
@@ -209,14 +213,28 @@ class CMNISTuLA(Dataset):
             # Unbiased test: z ~ Uniform({0..9}) independent of y.
             colors = self.rng.randint(0, 10, size=len(y)).astype(np.int32)
 
+        group = (y.astype(np.int32) * 10 + colors.astype(np.int32))
+
+        # Stratified train/val split from biased development set
+        if split in ("train", "val"):
+            split_rng = np.random.RandomState(seed + 7777)
+            val_mask = np.zeros(len(y), dtype=bool)
+            for g in np.unique(group):
+                g_idx = np.where(group == g)[0]
+                n_val = max(1, int(len(g_idx) * self.VAL_FRAC))
+                perm = split_rng.permutation(len(g_idx))
+                val_mask[g_idx[perm[:n_val]]] = True
+
+            keep = val_mask if split == "val" else ~val_mask
+            images = images[keep]
+            y = y[keep]
+            colors = colors[keep]
+            group = group[keep]
+
         self.images = images
         self.y = y
         self.colors = colors
-
-        # Convenience: group id for (y,z) if you want group-balanced eval later.
-        self.group = (self.y.astype(np.int32) * 10 + self.colors.astype(np.int32))
-
-        # Optional compatibility alias (if some of your code expects y_bin attribute):
+        self.group = group
         self.y_bin = self.y
 
     def __len__(self):
@@ -289,20 +307,52 @@ DATASET_NUM_CLASSES = {
     "irm_colored_mnist": 2,
     "standard_mnist_bin": 2,
     "cmnist_ula": 10,
+    "ccifar10": 10,
+    "waterbirds": 2,
+    "celeba": 2,
+    "civilcomments": 2,
 }
 
 
-def build_dataset(name: str, train: bool, p_corr: float = 0.9, seed: int = 0):
+def build_dataset(name: str, train: bool = True, p_corr: float = 0.9, seed: int = 0,
+                   split: str | None = None):
     """Construct a dataset by config name.
 
-    Normalizes constructor signatures across dataset classes (e.g.
-    StandardMNISTBin does not accept p_corr/seed).
+    Args:
+        split: "train", "val", or "test". When provided, overrides ``train``.
     """
+    if split is not None:
+        train = split != "test"
+
+    # Lazy imports to avoid loading heavy deps when not needed
+    def _ccifar10():
+        from src.datasets.ccifar10 import CCIFAR10
+        return CCIFAR10(train=train, p_corr=p_corr, seed=seed, split=split)
+
+    def _waterbirds():
+        from src.datasets.waterbirds import Waterbirds
+        s = split if split is not None else ("train" if train else "test")
+        return Waterbirds(split=s)
+
+    def _celeba():
+        from src.datasets.celeba import CelebA
+        s = split if split is not None else ("train" if train else "test")
+        return CelebA(split=s)
+
+    def _civilcomments():
+        from src.datasets.civilcomments import CivilComments
+        s = split if split is not None else ("train" if train else "test")
+        return CivilComments(split=s)
+
     factories = {
         "colored_mnist":      lambda: ColoredMNIST(train=train, p_corr=p_corr, seed=seed),
         "irm_colored_mnist":  lambda: IRMColoredMNIST(train=train, p_corr=p_corr, seed=seed),
         "standard_mnist_bin": lambda: StandardMNISTBin(train=train),
-        "cmnist_ula":         lambda: CMNISTuLA(train=train, p_corr=p_corr, seed=seed),
+        "cmnist_ula":         lambda: CMNISTuLA(train=train, p_corr=p_corr, seed=seed, split=split),
+        "ccifar10":           _ccifar10,
+        "waterbirds":         _waterbirds,
+        "celeba":             _celeba,
+        "civilcomments":      _civilcomments,
     }
     if name not in factories:
         raise KeyError(

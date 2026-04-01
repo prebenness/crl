@@ -1,6 +1,7 @@
 """Full training-loop runners with W&B logging and checkpointing."""
 
 import time
+import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 
@@ -35,9 +36,10 @@ def _check_patience(state, best, epochs_since_best, n_restarts,
     if (restart_patience > 0
             and best["params"] is not None
             and epochs_since_best >= restart_patience):
+        reloaded = jax.tree.map(jnp.copy, best["params"])
         state = state.replace(
-            params=best["params"],
-            opt_state=state.tx.init(best["params"]),
+            params=reloaded,
+            opt_state=state.tx.init(reloaded),
         )
         epochs_since_best = 0
         n_restarts += 1
@@ -94,7 +96,7 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
         current_acc = float(te_acc)
         if current_acc > best["test_acc"]:
             best["test_acc"] = current_acc
-            best["params"] = state.params
+            best["params"] = jax.tree.map(jnp.copy, state.params)
             best["epoch"] = ep + 1
             epochs_since_best = 0
             if run_dir is not None:
@@ -217,8 +219,8 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
         current_acc = float(te_acc2)
         if current_acc > best["test_acc"]:
             best["test_acc"] = current_acc
-            best["inner_params"] = inner_state.params
-            best["outer_params"] = outer_state.params
+            best["inner_params"] = jax.tree.map(jnp.copy, inner_state.params)
+            best["outer_params"] = jax.tree.map(jnp.copy, outer_state.params)
             best["epoch"] = ep + 1
             epochs_since_best = 0
             if run_dir is not None:
@@ -277,13 +279,13 @@ def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,
         if (restart_patience > 0
                 and best["inner_params"] is not None
                 and epochs_since_best >= restart_patience):
+            ri = jax.tree.map(jnp.copy, best["inner_params"])
+            ro = jax.tree.map(jnp.copy, best["outer_params"])
             inner_state = inner_state.replace(
-                params=best["inner_params"],
-                opt_state=inner_state.tx.init(best["inner_params"]),
+                params=ri, opt_state=inner_state.tx.init(ri),
             )
             outer_state = outer_state.replace(
-                params=best["outer_params"],
-                opt_state=outer_state.tx.init(best["outer_params"]),
+                params=ro, opt_state=outer_state.tx.init(ro),
             )
             epochs_since_best = 0
             n_restarts += 1
@@ -370,7 +372,7 @@ def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
         current_acc = float(te_acc2)
         if current_acc > best["test_acc"]:
             best["test_acc"] = current_acc
-            best["outer_params"] = outer_state.params
+            best["outer_params"] = jax.tree.map(jnp.copy, outer_state.params)
             best["epoch"] = ep + 1
             epochs_since_best = 0
             if run_dir is not None:
@@ -419,9 +421,9 @@ def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
         if (restart_patience > 0
                 and best["outer_params"] is not None
                 and epochs_since_best >= restart_patience):
+            ro = jax.tree.map(jnp.copy, best["outer_params"])
             outer_state = outer_state.replace(
-                params=best["outer_params"],
-                opt_state=outer_state.tx.init(best["outer_params"]),
+                params=ro, opt_state=outer_state.tx.init(ro),
             )
             epochs_since_best = 0
             n_restarts += 1
@@ -497,7 +499,7 @@ def run_train_eval_mdl(x_train, y_train, x_test, y_test, model, cfg, lamb,
         current_acc = float(te_acc)
         if current_acc > best["test_acc"]:
             best["test_acc"] = current_acc
-            best["params"] = state.params
+            best["params"] = jax.tree.map(jnp.copy, state.params)
             best["epoch"] = ep + 1
             epochs_since_best = 0
             if run_dir is not None:
@@ -647,8 +649,8 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
         current_acc = float(te_acc2)
         if current_acc > best["test_acc"]:
             best["test_acc"] = current_acc
-            best["inner_params"] = inner_state.params
-            best["outer_params"] = outer_state.params
+            best["inner_params"] = jax.tree.map(jnp.copy, inner_state.params)
+            best["outer_params"] = jax.tree.map(jnp.copy, outer_state.params)
             best["epoch"] = ep + 1
             epochs_since_best = 0
             if run_dir is not None:
@@ -720,13 +722,13 @@ def run_train_eval_mdl_pair(x_train, y_train, x_test, y_test, inner_model,
         if (restart_patience > 0
                 and best["inner_params"] is not None
                 and epochs_since_best >= restart_patience):
+            ri = jax.tree.map(jnp.copy, best["inner_params"])
+            ro = jax.tree.map(jnp.copy, best["outer_params"])
             inner_state = inner_state.replace(
-                params=best["inner_params"],
-                opt_state=inner_state.tx.init(best["inner_params"]),
+                params=ri, opt_state=inner_state.tx.init(ri),
             )
             outer_state = outer_state.replace(
-                params=best["outer_params"],
-                opt_state=outer_state.tx.init(best["outer_params"]),
+                params=ro, opt_state=outer_state.tx.init(ro),
             )
             epochs_since_best = 0
             n_restarts += 1

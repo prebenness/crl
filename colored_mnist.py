@@ -19,7 +19,7 @@ import jax
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 
-from src.config import load_config
+from src.config import load_config, apply_overrides
 from src.utils.checkpointing import (
     TeeLogger,
     save_config,
@@ -106,11 +106,20 @@ OUTER_MODELS = {
 
 
 def parse_args(argv=None):
-    """Parse CLI arguments and optional dataloader overrides."""
+    """Parse CLI arguments and optional dataloader overrides.
+
+    Any trailing ``section.key=value`` arguments override the YAML config.
+    Example:
+        python colored_mnist.py config.yaml training.epochs=20 hsic.weight=0.3
+    """
     parser = argparse.ArgumentParser(
         description="Run the colored-MNIST lambda sweep from a YAML config.",
     )
     parser.add_argument("config", help="Path to the experiment YAML config.")
+    parser.add_argument(
+        "overrides", nargs="*",
+        help="Config overrides in section.key=value format.",
+    )
     parser.add_argument(
         "--dataloader-workers",
         type=int,
@@ -236,6 +245,8 @@ def _print_timing_table(results, dataset_name):
 def main(argv=None):
     args = parse_args(argv)
     cfg = load_config(args.config)
+    if args.overrides:
+        apply_overrides(cfg, args.overrides)
     _apply_cli_overrides(cfg, args)
 
     expected_nc = DATASET_NUM_CLASSES.get(cfg.dataset.name)

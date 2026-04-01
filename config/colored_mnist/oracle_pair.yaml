@@ -16,7 +16,7 @@ model:
   inner: "oracle_mlp"
   outer: "ula_mlp"
   num_classes: 10
-  oracle_checkpoint: "results/colored_mnist/20260331_001100_oracle_train_cmnist_ula_oracle_train/runs/lambda_1.0e+00/checkpoints/best.npz"
+  oracle_checkpoint: "results/colored_mnist/20260331_172654_oracle_train_cmnist_ula_oracle_train/runs/lambda_1.0e+00/checkpoints/best.npz"
 
 training:
   lr: 1.0e-3

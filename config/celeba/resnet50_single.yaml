@@ -1,0 +1,48 @@
+# CelebA single ResNet-50 baseline (pretrained).
+# Use with: python train.py config/celeba/resnet50_single.yaml
+
+wandb:
+  entity: "prebenness-crl"
+  project: "celeba"
+
+dataset:
+  name: "celeba"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "single"
+  inner: "resnet50"
+  num_classes: 2
+
+training:
+  lr: 1.0e-4
+  weight_decay_inner: 1.0e-4
+  epochs: 20
+  batch_size: 64
+  seed: 0
+  alpha: 0.01
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+
+controller:
+  beta_min: 0.0
+  beta_max: 1.0
+  ctrl_ki: 1.0
+
+mc_samples:
+  train: 2
+  eval: 8
+
+hsic:
+  weight: 0.50
+
+sweep:
+  lambda_min_exp: 0
+  lambda_max_exp: 0
+  lambda_steps: 1
+  log_sweep: true
