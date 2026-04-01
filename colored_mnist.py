@@ -91,6 +91,10 @@ INNER_MODELS = {
     "oracle_mlp": lambda cfg: OracleMLP(
         num_classes=cfg.model.num_classes,
     ),
+    "ula_mlp": lambda cfg: ULAMLPClassifier(
+        rep_dim=cfg.model.outer_rep_dim,
+        num_classes=cfg.model.num_classes,
+    ),
 }
 
 OUTER_MODELS = {
@@ -284,7 +288,7 @@ def main(argv=None):
         train_epoch_pair = make_train_epoch_pair(train_step_pair)
         eval_epoch = make_eval_epoch(eval_step)
 
-    if mode == "oracle_train":
+    if mode in ("oracle_train", "erm"):
         oracle_train_step = make_train_step_oracle(cfg)
         oracle_eval_step = make_eval_step_oracle(cfg)
 
@@ -526,7 +530,7 @@ def main(argv=None):
                     start_epoch=resume_start_epoch,
                     init_inner_params=resume_params,
                 )
-            elif mode == "oracle_train":
+            elif mode in ("oracle_train", "erm"):
                 res = run_train_eval(
                     x_train, y_train, x_test, y_test,
                     inner_model, cfg, lamb, wandb_run=run,
