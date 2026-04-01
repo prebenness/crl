@@ -49,29 +49,43 @@ class TeeLogger:
 
 
 def save_checkpoint(params, path):
-    """Save a params dict (JAX/numpy arrays) to a .npz file."""
+    """Save a params dict (JAX/numpy arrays) to a .npz file.
+
+    Handles arbitrary nesting depth by flattening keys with '/' separator.
+    """
     flat = {}
-    for k, v in params.items():
-        if isinstance(v, dict):
-            for k2, v2 in v.items():
-                flat[f"{k}/{k2}"] = np.array(v2)
-        else:
-            flat[k] = np.array(v)
+
+    def _flatten(d, prefix=""):
+        for k, v in d.items():
+            key = f"{prefix}{k}" if not prefix else f"{prefix}/{k}"
+            if isinstance(v, dict):
+                _flatten(v, key)
+            else:
+                flat[key] = np.array(v)
+
+    _flatten(params)
     np.savez(str(path), **flat)
 
 
 def load_checkpoint(path):
-    """Load a params dict from a .npz file. Returns dict of jnp arrays."""
-    data = np.load(str(path))
+    """Load a params dict from a .npz file. Returns nested dict of jnp arrays."""
+    data = np.load(str(path), allow_pickle=True)
     params = {}
     for k in data.files:
-        if "/" in k:
-            outer, inner = k.split("/", 1)
-            if outer not in params:
-                params[outer] = {}
-            params[outer][inner] = jnp.array(data[k])
-        else:
-            params[k] = jnp.array(data[k])
+        parts = k.split("/")
+        d = params
+        for part in parts[:-1]:
+            if part not in d:
+                d[part] = {}
+            d = d[part]
+        val = data[k]
+        # Handle legacy object arrays (dicts saved as 0-d object arrays)
+        if val.dtype == object and val.shape == ():
+            sub = val.item()
+            if isinstance(sub, dict):
+                d[parts[-1]] = {sk: jnp.array(sv) for sk, sv in sub.items()}
+                continue
+        d[parts[-1]] = jnp.array(val)
     return params
 
 
