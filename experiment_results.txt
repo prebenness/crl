@@ -1,0 +1,216 @@
+=== Experiment Sweep Wed Apr  1 11:19:28 BST 2026 ===
+
+--- cMNIST ERM β=0.005 (p_train=0.995) ---
+    >>> NEW BEST test_acc=0.2139 (epoch 1)
+    >>> NEW BEST test_acc=0.2423 (epoch 2)
+    >>> NEW BEST test_acc=0.2831 (epoch 3)
+    >>> NEW BEST test_acc=0.2955 (epoch 5)
+    >>> NEW BEST test_acc=0.3271 (epoch 7)
+    >>> NEW BEST test_acc=0.3722 (epoch 8)
+    >>> NEW BEST test_acc=0.3779 (epoch 9)
+    >>> NEW BEST test_acc=0.3953 (epoch 12)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		5.98	1.000		0.390
+
+--- cMNIST ERM β=0.01 (p_train=0.99) ---
+    >>> NEW BEST test_acc=0.3504 (epoch 1)
+    >>> NEW BEST test_acc=0.4550 (epoch 2)
+    >>> NEW BEST test_acc=0.4666 (epoch 3)
+    >>> NEW BEST test_acc=0.5657 (epoch 4)
+    >>> NEW BEST test_acc=0.5771 (epoch 5)
+    >>> NEW BEST test_acc=0.5904 (epoch 9)
+    >>> NEW BEST test_acc=0.5915 (epoch 13)
+    >>> NEW BEST test_acc=0.5938 (epoch 16)
+    >>> NEW BEST test_acc=0.6266 (epoch 17)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		6.23	1.000		0.610
+
+--- cMNIST ERM β=0.02 (p_train=0.98) ---
+    >>> NEW BEST test_acc=0.5448 (epoch 1)
+    >>> NEW BEST test_acc=0.6632 (epoch 3)
+    >>> NEW BEST test_acc=0.6917 (epoch 4)
+    >>> NEW BEST test_acc=0.7127 (epoch 5)
+    >>> NEW BEST test_acc=0.7144 (epoch 7)
+    >>> NEW BEST test_acc=0.7302 (epoch 8)
+    >>> NEW BEST test_acc=0.7309 (epoch 9)
+    >>> NEW BEST test_acc=0.7395 (epoch 10)
+    >>> NEW BEST test_acc=0.7488 (epoch 16)
+    >>> NEW BEST test_acc=0.7492 (epoch 23)
+    >>> NEW BEST test_acc=0.7497 (epoch 27)
+    >>> NEW BEST test_acc=0.7503 (epoch 28)
+    >>> NEW BEST test_acc=0.7511 (epoch 29)
+    >>> NEW BEST test_acc=0.7521 (epoch 32)
+    >>> NEW BEST test_acc=0.7522 (epoch 33)
+    >>> NEW BEST test_acc=0.7524 (epoch 34)
+    >>> NEW BEST test_acc=0.7530 (epoch 35)
+    >>> NEW BEST test_acc=0.7535 (epoch 37)
+    >>> NEW BEST test_acc=0.7543 (epoch 38)
+    >>> NEW BEST test_acc=0.7548 (epoch 39)
+    >>> NEW BEST test_acc=0.7551 (epoch 40)
+    >>> NEW BEST test_acc=0.7556 (epoch 44)
+    >>> NEW BEST test_acc=0.7560 (epoch 45)
+    >>> NEW BEST test_acc=0.7561 (epoch 49)
+    >>> NEW BEST test_acc=0.7565 (epoch 50)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		7.99	1.000		0.756
+
+--- cMNIST ERM β=0.05 (p_train=0.95) ---
+    >>> NEW BEST test_acc=0.6970 (epoch 1)
+    >>> NEW BEST test_acc=0.7633 (epoch 2)
+    >>> NEW BEST test_acc=0.7938 (epoch 3)
+    >>> NEW BEST test_acc=0.8007 (epoch 4)
+    >>> NEW BEST test_acc=0.8065 (epoch 5)
+    >>> NEW BEST test_acc=0.8225 (epoch 6)
+    >>> NEW BEST test_acc=0.8251 (epoch 7)
+    >>> NEW BEST test_acc=0.8436 (epoch 8)
+    >>> NEW BEST test_acc=0.8458 (epoch 11)
+    >>> NEW BEST test_acc=0.8471 (epoch 13)
+    >>> NEW BEST test_acc=0.8473 (epoch 14)
+    >>> NEW BEST test_acc=0.8534 (epoch 15)
+    >>> NEW BEST test_acc=0.8576 (epoch 17)
+    >>> NEW BEST test_acc=0.8616 (epoch 20)
+    >>> NEW BEST test_acc=0.8664 (epoch 24)
+    >>> NEW BEST test_acc=0.8668 (epoch 36)
+    >>> NEW BEST test_acc=0.8673 (epoch 37)
+    >>> NEW BEST test_acc=0.8674 (epoch 39)
+    >>> NEW BEST test_acc=0.8680 (epoch 40)
+    >>> NEW BEST test_acc=0.8682 (epoch 41)
+    >>> NEW BEST test_acc=0.8687 (epoch 42)
+    >>> NEW BEST test_acc=0.8691 (epoch 47)
+    >>> NEW BEST test_acc=0.8694 (epoch 48)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		8.15	1.000		0.869
+
+--- cMNIST Oracle Pair β=0.005 (p_train=0.995) hsic=0.7 ---
+    >>> NEW BEST outer_test_acc=0.2317 (epoch 1)
+    >>> NEW BEST outer_test_acc=0.2473 (epoch 2)
+    >>> NEW BEST outer_test_acc=0.2990 (epoch 3)
+    >>> NEW BEST outer_test_acc=0.3127 (epoch 5)
+    >>> NEW BEST outer_test_acc=0.3616 (epoch 6)
+    >>> NEW BEST outer_test_acc=0.3861 (epoch 10)
+    >>> NEW BEST outer_test_acc=0.3899 (epoch 15)
+    >>> NEW BEST outer_test_acc=0.3919 (epoch 16)
+    >>> NEW BEST outer_test_acc=0.4024 (epoch 30)
+  RESTART #1 at epoch 45 -> best checkpoint (epoch 30)
+  RESTART #2 at epoch 60 -> best checkpoint (epoch 30)
+  RESTART #3 at epoch 75 -> best checkpoint (epoch 30)
+    >>> NEW BEST outer_test_acc=0.4033 (epoch 76)
+  RESTART #4 at epoch 91 -> best checkpoint (epoch 76)
+  RESTART #5 at epoch 106 -> best checkpoint (epoch 76)
+  RESTART #6 at epoch 121 -> best checkpoint (epoch 76)
+    >>> NEW BEST outer_test_acc=0.4035 (epoch 124)
+  RESTART #7 at epoch 139 -> best checkpoint (epoch 124)
+    >>> NEW BEST outer_test_acc=0.4128 (epoch 143)
+  RESTART #8 at epoch 158 -> best checkpoint (epoch 143)
+    >>> NEW BEST outer_test_acc=0.4130 (epoch 169)
+  RESTART #9 at epoch 184 -> best checkpoint (epoch 169)
+  RESTART #10 at epoch 199 -> best checkpoint (epoch 169)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		49.24	1.000		0.361
+
+--- cMNIST Oracle Pair β=0.01 (p_train=0.99) hsic=0.7 ---
+    >>> NEW BEST outer_test_acc=0.3571 (epoch 1)
+    >>> NEW BEST outer_test_acc=0.4369 (epoch 2)
+    >>> NEW BEST outer_test_acc=0.4739 (epoch 3)
+    >>> NEW BEST outer_test_acc=0.5363 (epoch 4)
+    >>> NEW BEST outer_test_acc=0.5540 (epoch 5)
+    >>> NEW BEST outer_test_acc=0.5637 (epoch 6)
+    >>> NEW BEST outer_test_acc=0.5851 (epoch 9)
+    >>> NEW BEST outer_test_acc=0.6002 (epoch 10)
+    >>> NEW BEST outer_test_acc=0.6097 (epoch 21)
+  RESTART #1 at epoch 36 -> best checkpoint (epoch 21)
+  RESTART #2 at epoch 51 -> best checkpoint (epoch 21)
+    >>> NEW BEST outer_test_acc=0.6142 (epoch 55)
+  RESTART #3 at epoch 70 -> best checkpoint (epoch 55)
+  RESTART #4 at epoch 85 -> best checkpoint (epoch 55)
+  RESTART #5 at epoch 100 -> best checkpoint (epoch 55)
+    >>> NEW BEST outer_test_acc=0.6147 (epoch 114)
+    >>> NEW BEST outer_test_acc=0.6154 (epoch 126)
+    >>> NEW BEST outer_test_acc=0.6256 (epoch 127)
+  RESTART #6 at epoch 142 -> best checkpoint (epoch 127)
+  RESTART #7 at epoch 157 -> best checkpoint (epoch 127)
+  RESTART #8 at epoch 172 -> best checkpoint (epoch 127)
+  RESTART #9 at epoch 187 -> best checkpoint (epoch 127)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		49.57	1.000		0.608
+
+--- cMNIST Oracle Pair β=0.02 (p_train=0.98) hsic=0.7 ---
+    >>> NEW BEST outer_test_acc=0.5561 (epoch 1)
+    >>> NEW BEST outer_test_acc=0.5687 (epoch 2)
+    >>> NEW BEST outer_test_acc=0.6843 (epoch 3)
+    >>> NEW BEST outer_test_acc=0.6974 (epoch 5)
+    >>> NEW BEST outer_test_acc=0.7056 (epoch 6)
+    >>> NEW BEST outer_test_acc=0.7288 (epoch 7)
+    >>> NEW BEST outer_test_acc=0.7312 (epoch 15)
+    >>> NEW BEST outer_test_acc=0.7405 (epoch 19)
+    >>> NEW BEST outer_test_acc=0.7529 (epoch 25)
+    >>> NEW BEST outer_test_acc=0.7535 (epoch 26)
+    >>> NEW BEST outer_test_acc=0.7560 (epoch 28)
+    >>> NEW BEST outer_test_acc=0.7560 (epoch 33)
+    >>> NEW BEST outer_test_acc=0.7584 (epoch 34)
+    >>> NEW BEST outer_test_acc=0.7592 (epoch 49)
+    >>> NEW BEST outer_test_acc=0.7599 (epoch 57)
+    >>> NEW BEST outer_test_acc=0.7605 (epoch 58)
+    >>> NEW BEST outer_test_acc=0.7616 (epoch 61)
+  RESTART #1 at epoch 76 -> best checkpoint (epoch 61)
+  RESTART #2 at epoch 91 -> best checkpoint (epoch 61)
+  RESTART #3 at epoch 106 -> best checkpoint (epoch 61)
+  RESTART #4 at epoch 121 -> best checkpoint (epoch 61)
+  RESTART #5 at epoch 136 -> best checkpoint (epoch 61)
+  RESTART #6 at epoch 151 -> best checkpoint (epoch 61)
+  RESTART #7 at epoch 166 -> best checkpoint (epoch 61)
+  RESTART #8 at epoch 181 -> best checkpoint (epoch 61)
+  RESTART #9 at epoch 196 -> best checkpoint (epoch 61)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		49.10	0.999		0.714
+
+--- cMNIST Oracle Pair β=0.05 (p_train=0.95) hsic=0.7 ---
+    >>> NEW BEST outer_test_acc=0.6883 (epoch 1)
+    >>> NEW BEST outer_test_acc=0.7667 (epoch 2)
+    >>> NEW BEST outer_test_acc=0.8050 (epoch 3)
+    >>> NEW BEST outer_test_acc=0.8271 (epoch 5)
+    >>> NEW BEST outer_test_acc=0.8272 (epoch 6)
+    >>> NEW BEST outer_test_acc=0.8279 (epoch 7)
+    >>> NEW BEST outer_test_acc=0.8392 (epoch 8)
+    >>> NEW BEST outer_test_acc=0.8426 (epoch 9)
+    >>> NEW BEST outer_test_acc=0.8466 (epoch 10)
+    >>> NEW BEST outer_test_acc=0.8507 (epoch 14)
+    >>> NEW BEST outer_test_acc=0.8647 (epoch 15)
+    >>> NEW BEST outer_test_acc=0.8674 (epoch 23)
+    >>> NEW BEST outer_test_acc=0.8737 (epoch 25)
+    >>> NEW BEST outer_test_acc=0.8757 (epoch 26)
+    >>> NEW BEST outer_test_acc=0.8768 (epoch 27)
+    >>> NEW BEST outer_test_acc=0.8769 (epoch 28)
+    >>> NEW BEST outer_test_acc=0.8802 (epoch 29)
+  RESTART #1 at epoch 44 -> best checkpoint (epoch 29)
+  RESTART #2 at epoch 59 -> best checkpoint (epoch 29)
+  RESTART #3 at epoch 74 -> best checkpoint (epoch 29)
+    >>> NEW BEST outer_test_acc=0.8829 (epoch 80)
+    >>> NEW BEST outer_test_acc=0.8845 (epoch 81)
+    >>> NEW BEST outer_test_acc=0.8858 (epoch 82)
+    >>> NEW BEST outer_test_acc=0.8872 (epoch 83)
+  RESTART #4 at epoch 98 -> best checkpoint (epoch 83)
+  RESTART #5 at epoch 113 -> best checkpoint (epoch 83)
+  RESTART #6 at epoch 128 -> best checkpoint (epoch 83)
+  RESTART #7 at epoch 143 -> best checkpoint (epoch 83)
+  RESTART #8 at epoch 158 -> best checkpoint (epoch 83)
+  RESTART #9 at epoch 173 -> best checkpoint (epoch 83)
+  RESTART #10 at epoch 188 -> best checkpoint (epoch 83)
+cmnist_ula results
+Lambda		Run Time	Train Acc.	Test Acc.
+1.000E+00		49.19	0.999		0.858
+
+--- cCIFAR10 ERM β=0.05 ResNet18 ---
+
+--- cCIFAR10 ERM β=0.01 ResNet18 ---
+
+--- cCIFAR10 ERM β=0.02 ResNet18 ---
+
+=== All experiments complete Wed Apr  1 11:26:07 BST 2026 ===

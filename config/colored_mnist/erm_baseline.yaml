@@ -1,0 +1,42 @@
+# ERM baseline: standard CE training on biased cMNIST with uLA MLP architecture.
+# No HSIC, no VIB, no oracle — just cross-entropy on digit labels.
+# Use with: python colored_mnist.py config/colored_mnist/erm_baseline.yaml
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "erm"
+  inner: "ula_mlp"
+  num_classes: 10
+  outer_rep_dim: 100
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-4
+  weight_decay_outer: 0.0
+  epochs: 50
+  batch_size: 128
+  seed: 0
+  alpha: 0.01
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+
+checkpointing:
+  early_stopping_patience: 15
+
+sweep:
+  lambda_min_exp: 0
+  lambda_max_exp: 0
+  lambda_steps: 1
+  log_sweep: true

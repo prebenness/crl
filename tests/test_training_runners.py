@@ -7,7 +7,9 @@ import optax
 import pytest
 from flax.training import train_state
 
-from src.training.runners import run_train_eval, run_train_eval_pair
+from src.training.runners import (
+    run_train_eval, run_train_eval_pair, run_train_eval_oracle_pair,
+)
 
 
 class _DummyWandbRun:
@@ -46,7 +48,7 @@ def _make_pair_cfg(**ckpt_kw):
             alpha=0.25,
         ),
         hsic=SimpleNamespace(weight=0.5),
-        model=SimpleNamespace(num_classes=2),
+        model=SimpleNamespace(num_classes=2, outer_loss="hsic"),
         checkpointing=_ckpt_cfg(**ckpt_kw),
     )
 
@@ -307,6 +309,67 @@ def test_restart_with_patience_reloads_best_params():
     # After restart: params reset to 1.1, then train adds 0.1 -> 1.2, ...
     # So param_snapshots[3] should be ~1.2 (best=1.1 + one train step)
     assert param_snapshots[3] == pytest.approx(1.2, abs=0.01)
+
+
+def test_oracle_pair_runner_schema():
+    """Oracle pair runner should expose oracle-specific result keys."""
+    cfg = _make_pair_cfg()
+    run = _DummyWandbRun()
+    x = jnp.zeros((4, 1), dtype=jnp.float32)
+    y = jnp.zeros((4,), dtype=jnp.int32)
+
+    def create_inner_fn(rng, model, input_shape, cfg_):
+        return SimpleNamespace(params={"w": jnp.array(1.0)})
+
+    def create_outer_fn(rng, model, input_shape, cfg_):
+        return SimpleNamespace(params={"w": jnp.array(2.0)})
+
+    def train_epoch_pair_fn(inner_state, outer_state, xb, yb, rng, lamb,
+                            alpha, hsic_w, num_classes):
+        metrics = {
+            "accuracy_inner": jnp.array(0.95),
+            "accuracy_outer": jnp.array(0.70),
+            "objective_total_outer_nats": jnp.array(0.45),
+            "data_nll_outer_nats": jnp.array(0.35),
+            "hsic": jnp.array(0.15),
+        }
+        return inner_state, outer_state, metrics
+
+    def eval_epoch_fn(state, xb, yb, rng, counts=None):
+        return jnp.array(0.40), jnp.array(0.72)
+
+    results = run_train_eval_oracle_pair(
+        x, y, x, y,
+        inner_model=None,
+        outer_model=None,
+        cfg=cfg,
+        lamb=0.2,
+        wandb_run=run,
+        create_inner_fn=create_inner_fn,
+        create_outer_fn=create_outer_fn,
+        train_epoch_pair_fn=train_epoch_pair_fn,
+        eval_epoch_fn=eval_epoch_fn,
+        run_dir=None,
+    )
+
+    assert results["train_acc1"] == pytest.approx(0.95)
+    assert results["test_acc1"] == pytest.approx(0.72)
+    assert results["train_acc2"] == pytest.approx(0.70)
+    assert results["test_acc2"] == pytest.approx(0.72)
+    assert results["objective_total_outer_nats"] == pytest.approx(0.45)
+    assert results["data_nll_outer_nats"] == pytest.approx(0.35)
+    assert results["hsic"] == pytest.approx(0.15)
+    assert results["train_acc"] == pytest.approx(0.70)
+    assert results["test_acc"] == pytest.approx(0.72)
+    assert results["lambda"] == pytest.approx(0.2)
+    assert results["best_test_acc"] == pytest.approx(0.72)
+    assert results["best_epoch"] == 1
+    assert results["n_restarts"] == 0
+    # Should NOT have VIB-specific keys
+    assert "kl_latent_nats" not in results
+    assert "reconstruction_nll_nats" not in results
+    assert "beta_controller" not in results
+    assert run.logged and "hsic" in run.logged[0]
 
 
 def test_best_tracking_across_improving_epochs():

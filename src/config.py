@@ -1,7 +1,11 @@
-"""Experiment configuration: YAML loading + typed ExperimentConfig."""
+"""Experiment configuration: YAML loading + typed ExperimentConfig.
+
+CLI override syntax (applied after YAML load):
+    python script.py config.yaml training.epochs=20 hsic.weight=0.3
+"""
 
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 import yaml
 import jax.numpy as jnp
@@ -18,6 +22,7 @@ class DatasetConfig:
     name: str = "colored_mnist"
     p_train: float = 0.9
     p_test: float = 0.1
+    beta: float = 0.0  # bias-conflicting ratio; when > 0, p_train = 1 - beta
 
 
 @dataclass
@@ -33,9 +38,11 @@ class ModelConfig:
     mode: str = "pair"
     inner: str = "ula_mlp_var"
     outer: str = "ula_mlp"
+    outer_loss: str = "hsic"  # "hsic" or "mmd"
     num_classes: int = 10
     bottleneck_width: int = 16
     outer_rep_dim: int = 100
+    oracle_checkpoint: str = ""
 
 
 @dataclass
@@ -81,11 +88,24 @@ class MDLConfig:
 
 
 @dataclass
+class MMDConfig:
+    weight: float = 1.0          # lambda for MMD penalty
+    w_max: float = 500.0         # importance weight clip
+    smoothing_eps: float = 1e-6  # Laplace smoothing for p(s|y)
+
+
+@dataclass
 class CheckpointingConfig:
     early_stopping_patience: int = 0    # 0 = disabled
     restart_patience: int = 0           # 0 = disabled
     resume_from: str = ""               # path to run_dir to resume from
     ckpt_select: str = "auto"           # "auto", "best", or "final"
+
+
+@dataclass
+class CBAOMConfig:
+    embed_dim: int = 16
+    num_colors: int = 10
 
 
 @dataclass
@@ -106,7 +126,9 @@ class ExperimentConfig:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     mc_samples: MCSamplesConfig = field(default_factory=MCSamplesConfig)
     hsic: HSICConfig = field(default_factory=HSICConfig)
+    mmd: MMDConfig = field(default_factory=MMDConfig)
     mdl: MDLConfig = field(default_factory=MDLConfig)
+    cba_om: CBAOMConfig = field(default_factory=CBAOMConfig)
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     sweep: SweepConfig = field(default_factory=SweepConfig)
 
@@ -135,7 +157,9 @@ def load_config(yaml_path: str) -> ExperimentConfig:
         "controller": ControllerConfig,
         "mc_samples": MCSamplesConfig,
         "hsic": HSICConfig,
+        "mmd": MMDConfig,
         "mdl": MDLConfig,
+        "cba_om": CBAOMConfig,
         "checkpointing": CheckpointingConfig,
         "sweep": SweepConfig,
     }
@@ -157,5 +181,62 @@ def load_config(yaml_path: str) -> ExperimentConfig:
             "early_stopping_patience and restart_patience are mutually "
             "exclusive — set at most one to a positive value"
         )
+
+    return cfg
+
+
+def _cast_value(value_str: str, target_type: type):
+    """Cast a CLI string to the type of the target field."""
+    if target_type is bool:
+        if value_str.lower() in ("true", "1", "yes"):
+            return True
+        if value_str.lower() in ("false", "0", "no"):
+            return False
+        raise ValueError(f"Cannot parse {value_str!r} as bool")
+    return target_type(value_str)
+
+
+def apply_overrides(cfg: ExperimentConfig, overrides: list[str]):
+    """Apply dotted key=value overrides to a loaded config.
+
+    Each override must be ``section.key=value``, e.g.
+    ``training.epochs=20`` or ``hsic.weight=0.3``.
+
+    Type casting is inferred from the dataclass field's default type.
+    Raises on unknown sections or keys so typos fail fast.
+    """
+    for token in overrides:
+        if "=" not in token:
+            raise ValueError(
+                f"Override {token!r} is not in section.key=value format"
+            )
+        path, value_str = token.split("=", 1)
+        parts = path.split(".")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Override path {path!r} must be section.key "
+                f"(got {len(parts)} parts)"
+            )
+        section_name, key = parts
+
+        if not hasattr(cfg, section_name):
+            raise ValueError(f"Unknown config section {section_name!r}")
+        section_obj = getattr(cfg, section_name)
+
+        if not hasattr(section_obj, key):
+            raise ValueError(
+                f"Unknown key {key!r} in section {section_name!r}. "
+                f"Available: {[f.name for f in fields(section_obj)]}"
+            )
+
+        # Infer target type from the dataclass field
+        field_type = type(getattr(section_obj, key))
+        try:
+            setattr(section_obj, key, _cast_value(value_str, field_type))
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Cannot set {path}={value_str!r} "
+                f"(expected {field_type.__name__}): {e}"
+            ) from None
 
     return cfg
