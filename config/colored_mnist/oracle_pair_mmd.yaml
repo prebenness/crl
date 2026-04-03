@@ -1,6 +1,6 @@
-# Oracle pair: frozen oracle inner + trainable outer with HSIC.
-# Requires oracle_checkpoint to be set to the best.npz from an oracle_train run.
-# Use with: python colored_mnist.py config/colored_mnist/oracle_pair.yaml
+# Oracle pair with MMD conditional invariance outer loss.
+# Frozen oracle inner + trainable outer with weighted CE + MMD.
+# Use with: python colored_mnist.py config/colored_mnist/oracle_pair_mmd.yaml
 
 wandb:
   entity: "prebenness-crl"
@@ -15,6 +15,7 @@ model:
   mode: "oracle_pair"
   inner: "oracle_mlp"
   outer: "ula_mlp"
+  outer_loss: "mmd"
   num_classes: 10
   oracle_checkpoint: "results/colored_mnist/20260331_172654_oracle_train_cmnist_ula_oracle_train/runs/lambda_1.0e+00/checkpoints/best.npz"
 
@@ -43,10 +44,12 @@ mc_samples:
   eval: 8
 
 checkpointing:
-  restart_patience: 3
+  restart_patience: 300
 
-hsic:
+mmd:
   weight: 1.0
+  w_max: 10.0
+  smoothing_eps: 1.0e-2
 
 sweep:
   lambda_min_exp: 0

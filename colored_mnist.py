@@ -48,17 +48,21 @@ from src.training.steps import (
     make_train_step_oracle, make_eval_step_oracle,
     make_train_step_oracle_pair,
     make_train_step_cba_om, make_eval_step_cba_om,
+    make_train_step_pair_mmd, make_train_step_oracle_pair_mmd,
+    make_train_step_mdl_pair_mmd, make_train_step_mdl_shared_pair_mmd,
 )
 from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
     make_train_epoch_mdl, make_train_epoch_mdl_pair,
     make_train_epoch_cba_om,
+    make_train_epoch_pair_mmd, make_train_epoch_mdl_pair_mmd,
 )
 from src.training.runners import (
     run_train_eval, run_train_eval_pair,
     run_train_eval_mdl, run_train_eval_mdl_pair,
     run_train_eval_oracle_pair,
     run_train_eval_cba_om,
+    _forward_vib, _forward_oracle, _forward_mdl, _forward_mdl_shared,
 )
 from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 
@@ -248,10 +252,11 @@ def _make_sweep_plot(results, cfg, out_path):
 def _print_timing_table(results, dataset_name):
     results = sorted(results, key=lambda r: r["lambda"])
     print(f"\n{dataset_name} results")
-    print("Lambda\t\tRun Time\tTrain Acc.\tTest Acc.")
+    print("Lambda\t\tRun Time\tTrain Acc.\tBest Test Acc.\tBest Epoch")
     for r in results:
         print(f"{r['lambda']:.3E}\t\t{r['run_time']:.2f}"
-              f"\t{r['train_acc']:.3f}\t\t{r['test_acc']:.3f}")
+              f"\t{r['train_acc']:.3f}\t\t{r['test_acc']:.3f}"
+              f"\t\t{r.get('best_epoch', '-')}")
 
 
 def main(argv=None):
@@ -287,6 +292,8 @@ def main(argv=None):
     # Build JIT-compiled functions from config
     mode = cfg.model.mode
 
+    use_mmd = cfg.model.outer_loss == "mmd"
+
     if mode in ("single", "pair"):
         train_step = make_train_step(cfg)
         train_step_pair = make_train_step_pair(cfg)
@@ -295,6 +302,10 @@ def main(argv=None):
         train_epoch = make_train_epoch(train_step)
         train_epoch_pair = make_train_epoch_pair(train_step_pair)
         eval_epoch = make_eval_epoch(eval_step)
+
+        if mode == "pair" and use_mmd:
+            mmd_step_pair = make_train_step_pair_mmd(cfg)
+            mmd_epoch_pair = make_train_epoch_pair_mmd(mmd_step_pair)
 
     if mode == "cba_om":
         cba_om_train_step = make_train_step_cba_om(cfg)
@@ -319,6 +330,12 @@ def main(argv=None):
         oracle_inner_eval_epoch = make_eval_epoch(oracle_eval_step)
         oracle_outer_eval_epoch = make_eval_epoch(outer_eval_step_op)
 
+        if use_mmd:
+            mmd_oracle_pair_step = make_train_step_oracle_pair_mmd(cfg)
+            mmd_oracle_pair_epoch = make_train_epoch_pair_mmd(
+                mmd_oracle_pair_step,
+            )
+
     if mode in ("mdl", "mdl_pair"):
         mdl_step_train = make_train_step_mdl(cfg)
         mdl_eval_step = make_eval_step_mdl(cfg)
@@ -340,6 +357,12 @@ def main(argv=None):
         mdl_pair_epoch_train = make_train_epoch_mdl_pair(mdl_pair_step_train)
         outer_eval_epoch = make_eval_epoch(vib_eval_step)
 
+        if use_mmd:
+            mmd_mdl_pair_step = make_train_step_mdl_pair_mmd(cfg)
+            mmd_mdl_pair_epoch = make_train_epoch_mdl_pair_mmd(
+                mmd_mdl_pair_step,
+            )
+
     if mode == "mdl_shared_pair":
         mdl_shared_pair_step_train = make_train_step_mdl_shared_pair(cfg)
         vib_eval_step = make_eval_step(cfg)
@@ -347,6 +370,12 @@ def main(argv=None):
         mdl_shared_pair_epoch_train = make_train_epoch_mdl_pair(
             mdl_shared_pair_step_train,
         )
+
+        if use_mmd:
+            mmd_mdl_shared_pair_step = make_train_step_mdl_shared_pair_mmd(cfg)
+            mmd_mdl_shared_pair_epoch = make_train_epoch_mdl_pair_mmd(
+                mmd_mdl_shared_pair_step,
+            )
         outer_eval_epoch = make_eval_epoch(vib_eval_step)
 
     # Load data
@@ -514,6 +543,12 @@ def main(argv=None):
                 )
             elif mode == "pair":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                mmd_kw = {}
+                if use_mmd:
+                    mmd_kw = {
+                        "inner_forward_fn": _forward_vib,
+                        "train_epoch_pair_mmd_fn": mmd_epoch_pair,
+                    }
                 res = run_train_eval_pair(
                     x_train, y_train, x_test, y_test,
                     inner_model, outer_model, cfg, lamb, wandb_run=run,
@@ -524,6 +559,7 @@ def main(argv=None):
                     run_dir=run_dir,
                     start_epoch=resume_start_epoch,
                     init_inner_params=resume_params,
+                    **mmd_kw,
                 )
             elif mode == "mdl":
                 res = run_train_eval_mdl(
@@ -538,6 +574,12 @@ def main(argv=None):
                 )
             elif mode == "mdl_pair":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                mmd_kw = {}
+                if use_mmd:
+                    mmd_kw = {
+                        "inner_forward_fn": _forward_mdl,
+                        "train_epoch_mmd_fn": mmd_mdl_pair_epoch,
+                    }
                 res = run_train_eval_mdl_pair(
                     x_train, y_train, x_test, y_test,
                     inner_model, outer_model, cfg, lamb, wandb_run=run,
@@ -549,6 +591,7 @@ def main(argv=None):
                     run_dir=run_dir,
                     start_epoch=resume_start_epoch,
                     init_inner_params=resume_params,
+                    **mmd_kw,
                 )
             elif mode == "mdl_shared":
                 res = run_train_eval_mdl(
@@ -563,6 +606,12 @@ def main(argv=None):
                 )
             elif mode == "mdl_shared_pair":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                mmd_kw = {}
+                if use_mmd:
+                    mmd_kw = {
+                        "inner_forward_fn": _forward_mdl_shared,
+                        "train_epoch_mmd_fn": mmd_mdl_shared_pair_epoch,
+                    }
                 res = run_train_eval_mdl_pair(
                     x_train, y_train, x_test, y_test,
                     inner_model, outer_model, cfg, lamb, wandb_run=run,
@@ -574,6 +623,7 @@ def main(argv=None):
                     run_dir=run_dir,
                     start_epoch=resume_start_epoch,
                     init_inner_params=resume_params,
+                    **mmd_kw,
                 )
             elif mode in ("oracle_train", "erm"):
                 res = run_train_eval(
@@ -596,6 +646,12 @@ def main(argv=None):
                     )
                 oracle_params = load_checkpoint(oracle_ckpt)
                 print(f"  Loaded oracle checkpoint: {oracle_ckpt}")
+                mmd_kw = {}
+                if use_mmd:
+                    mmd_kw = {
+                        "inner_forward_fn": _forward_oracle,
+                        "train_epoch_pair_mmd_fn": mmd_oracle_pair_epoch,
+                    }
                 res = run_train_eval_oracle_pair(
                     x_train, y_train, x_test, y_test,
                     inner_model, outer_model, cfg, lamb, wandb_run=run,
@@ -607,6 +663,7 @@ def main(argv=None):
                     start_epoch=resume_start_epoch,
                     init_inner_params=oracle_params,
                     init_outer_params=resume_params,
+                    **mmd_kw,
                 )
             elif mode == "cba_om":
                 outer_model = OUTER_MODELS[cfg.model.outer](cfg)

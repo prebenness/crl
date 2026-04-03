@@ -38,6 +38,7 @@ class ModelConfig:
     mode: str = "pair"
     inner: str = "ula_mlp_var"
     outer: str = "ula_mlp"
+    outer_loss: str = "hsic"  # "hsic" or "mmd"
     num_classes: int = 10
     bottleneck_width: int = 16
     outer_rep_dim: int = 100
@@ -87,6 +88,13 @@ class MDLConfig:
 
 
 @dataclass
+class MMDConfig:
+    weight: float = 1.0          # lambda for MMD penalty
+    w_max: float = 500.0         # importance weight clip
+    smoothing_eps: float = 1e-6  # Laplace smoothing for p(s|y)
+
+
+@dataclass
 class CheckpointingConfig:
     early_stopping_patience: int = 0    # 0 = disabled
     restart_patience: int = 0           # 0 = disabled
@@ -118,6 +126,7 @@ class ExperimentConfig:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     mc_samples: MCSamplesConfig = field(default_factory=MCSamplesConfig)
     hsic: HSICConfig = field(default_factory=HSICConfig)
+    mmd: MMDConfig = field(default_factory=MMDConfig)
     mdl: MDLConfig = field(default_factory=MDLConfig)
     cba_om: CBAOMConfig = field(default_factory=CBAOMConfig)
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
@@ -148,6 +157,7 @@ def load_config(yaml_path: str) -> ExperimentConfig:
         "controller": ControllerConfig,
         "mc_samples": MCSamplesConfig,
         "hsic": HSICConfig,
+        "mmd": MMDConfig,
         "mdl": MDLConfig,
         "cba_om": CBAOMConfig,
         "checkpointing": CheckpointingConfig,

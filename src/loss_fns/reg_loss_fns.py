@@ -115,6 +115,84 @@ def hsic_rbf(z1: jnp.ndarray, z2: jnp.ndarray) -> jnp.ndarray:
     n = z1.shape[0]
     return jnp.sum(K * L) / ((n - 1.0) ** 2)
 
+def class_cond_mmd_rbf(
+    z: jnp.ndarray,
+    y: jnp.ndarray,
+    s: jnp.ndarray,
+    num_classes: int | None = None,
+    num_colors: int | None = None,
+    eps: float = 1e-6,
+) -> jnp.ndarray:
+    """Class-conditional all-pairs MMD penalty.
+
+    Computes the conditional invariance penalty from Eq. 8 of the note:
+        R_inv = mean over valid pairs of MMD^2(z|y,s ; z|y,s')
+    for all classes y and all color pairs (s, s') with s < s'.
+
+    Args:
+        z: [B, D] representation from the outer model.
+        y: [B] integer class labels.
+        s: [B] integer predicted color labels (from inner model argmax).
+        num_classes: number of classes (static for JIT).
+        num_colors: number of color values (static for JIT).
+        eps: numerical stability constant.
+
+    Returns:
+        Scalar penalty (0 when no valid pairs exist).
+    """
+    z = _standardize(z.reshape((z.shape[0], -1)), eps=eps)
+    y = y.reshape((-1,))
+    s = s.reshape((-1,))
+
+    K_full = rbf_gram(z)
+    B = z.shape[0]
+
+    classes = jnp.arange(num_classes)
+    colors = jnp.arange(num_colors)
+
+    # Build all (s, s') pairs with s < s'
+    pair_s = []
+    pair_sp = []
+    for i in range(num_colors):
+        for j in range(i + 1, num_colors):
+            pair_s.append(i)
+            pair_sp.append(j)
+    n_pairs = len(pair_s)
+    pair_s_arr = jnp.array(pair_s, dtype=jnp.int32)
+    pair_sp_arr = jnp.array(pair_sp, dtype=jnp.int32)
+
+    def mmd_for_class_pair(c, si, sj):
+        """MMD^2 between z[y=c, s=si] and z[y=c, s=sj]."""
+        m_a = ((y == c) & (s == si)).astype(K_full.dtype)
+        m_b = ((y == c) & (s == sj)).astype(K_full.dtype)
+        n_a = jnp.sum(m_a)
+        n_b = jnp.sum(m_b)
+
+        M_aa = m_a[:, None] * m_a[None, :]
+        M_bb = m_b[:, None] * m_b[None, :]
+        M_ab = m_a[:, None] * m_b[None, :]
+
+        mean_aa = jnp.sum(K_full * M_aa) / (n_a * n_a + eps)
+        mean_bb = jnp.sum(K_full * M_bb) / (n_b * n_b + eps)
+        mean_ab = jnp.sum(K_full * M_ab) / (n_a * n_b + eps)
+
+        mmd_sq = mean_aa + mean_bb - 2.0 * mean_ab
+        valid = ((n_a >= 2.0) & (n_b >= 2.0)).astype(K_full.dtype)
+        return mmd_sq * valid, valid
+
+    def mmd_for_class(c):
+        """Sum over all color pairs for class c."""
+        def per_pair(idx):
+            return mmd_for_class_pair(c, pair_s_arr[idx], pair_sp_arr[idx])
+
+        vals, valids = jax.vmap(per_pair)(jnp.arange(n_pairs))
+        return jnp.sum(vals), jnp.sum(valids)
+
+    all_vals, all_counts = jax.vmap(mmd_for_class)(classes)
+    total_valid = jnp.sum(all_counts)
+    return jnp.sum(all_vals) / (total_valid + eps)
+
+
 def _weighted_center_gram(K: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
     """
     Weighted centering: H K H^T with H = I - 1 w^T, where sum(w)=1.

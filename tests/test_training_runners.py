@@ -48,7 +48,7 @@ def _make_pair_cfg(**ckpt_kw):
             alpha=0.25,
         ),
         hsic=SimpleNamespace(weight=0.5),
-        model=SimpleNamespace(num_classes=2),
+        model=SimpleNamespace(num_classes=2, outer_loss="hsic"),
         checkpointing=_ckpt_cfg(**ckpt_kw),
     )
 

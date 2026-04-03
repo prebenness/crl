@@ -13,7 +13,7 @@ import optax
 
 from mdl.src.mdl.coding import grid_values_and_codelengths
 from mdl.src.mdl.shared_weights import compute_p_base, epsilon_bound_simplex
-from src.loss_fns.reg_loss_fns import class_cond_hsic_rbf
+from src.loss_fns.reg_loss_fns import class_cond_hsic_rbf, class_cond_mmd_rbf
 
 
 def _vib_loss(apply_fn, params, x, y, rng, train_mc_samples, alpha,
@@ -239,8 +239,9 @@ def make_train_step_oracle_pair(cfg):
         logits1, aux1 = inner_state.apply_fn(
             {"params": inner_state.params}, x, train=False,
         )
-        z1 = aux1["z"]
-        z1_sg = lax.stop_gradient(z1)
+        s1 = lax.stop_gradient(
+            jax.nn.one_hot(jnp.argmax(logits1, -1), num_classes)
+        )
 
         # --- Outer model (standard classifier + HSIC) ---
         def loss_fn2(params):
@@ -253,7 +254,7 @@ def make_train_step_oracle_pair(cfg):
                 logits2, y
             ).mean()
             hsic = class_cond_hsic_rbf(
-                z1_sg, z2, y, num_classes=num_classes,
+                s1, z2, y, num_classes=num_classes,
             )
 
             total = ce2 * (1 - hsic_w) + hsic * hsic_w
@@ -307,7 +308,9 @@ def make_train_step_pair(cfg):
         inner_state = inner_state.apply_gradients(grads=grads1)
         inner_state = inner_state.replace(beta=beta1)
 
-        mu1_sg = lax.stop_gradient(mu1)
+        s1 = lax.stop_gradient(
+            jax.nn.one_hot(jnp.argmax(logits1, -1), num_classes)
+        )
 
         # --- Outer model (standard classifier + HSIC) ---
         def loss_fn2(params):
@@ -320,7 +323,7 @@ def make_train_step_pair(cfg):
                 logits2, y
             ).mean()
             hsic = class_cond_hsic_rbf(
-                mu1_sg, z2, y, num_classes=num_classes,
+                s1, z2, y, num_classes=num_classes,
             )
 
             total = ce2 * (1 - hsic_w) + hsic * hsic_w
@@ -345,6 +348,289 @@ def make_train_step_pair(cfg):
             "data_nll_outer_nats": ce2,
             "accuracy_outer": acc2,
             "hsic": hsic_loss,
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
+def _outer_loss_mmd(outer_state, params, x, y, s, w, mmd_w, num_classes):
+    """Shared outer-model MMD loss: weighted CE + class-conditional MMD.
+
+    Returns (total_loss, (logits, weighted_ce, mmd_penalty)).
+    """
+    mmd_w = jnp.asarray(mmd_w, jnp.float32)
+    logits, aux = outer_state.apply_fn({"params": params}, x, train=True)
+    z = aux["z"]
+
+    ce_per_example = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    weighted_ce = jnp.sum(ce_per_example * w) / (jnp.sum(w) + 1e-8)
+
+    mmd = class_cond_mmd_rbf(
+        z, y, s, num_classes=num_classes, num_colors=num_classes,
+    )
+
+    total = weighted_ce * (1 - mmd_w) + mmd * mmd_w
+    return total, (logits, weighted_ce, mmd)
+
+
+def make_train_step_pair_mmd(cfg):
+    """Return a JIT-compiled VIB-inner + MMD-outer pair train step."""
+    beta_min = cfg.controller.beta_min
+    beta_max = cfg.controller.beta_max
+    ctrl_ki = cfg.controller.ctrl_ki
+    train_mc_samples = cfg.mc_samples.train
+
+    def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,
+                        mmd_w, num_classes):
+        x, y, s, w = batch
+        rng1, rng2 = jrandom.split(rng, 2)
+
+        # --- Inner model (VIB) — identical to HSIC variant ---
+        def loss_fn1(params):
+            return _vib_loss(
+                inner_state.apply_fn, params, x, y, rng1,
+                train_mc_samples, alpha,
+                inner_state.beta, ctrl_ki, beta_min, beta_max, lamb,
+            )
+
+        (loss1, (logits1, ce1, recon1, kl1, beta1, mu1)), grads1 = (
+            jax.value_and_grad(loss_fn1, has_aux=True)(inner_state.params)
+        )
+        inner_state = inner_state.apply_gradients(grads=grads1)
+        inner_state = inner_state.replace(beta=beta1)
+
+        # --- Outer model (weighted CE + MMD) ---
+        def loss_fn2(params):
+            return _outer_loss_mmd(
+                outer_state, params, x, y, s, w, mmd_w, num_classes,
+            )
+
+        (loss2, (logits2, wce2, mmd_loss)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "objective_total_nats": loss1,
+            "data_nll_nats": ce1,
+            "reconstruction_nll_nats": recon1,
+            "kl_latent_nats": kl1,
+            "beta_controller": beta1,
+            "accuracy_inner": acc1,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": wce2,
+            "accuracy_outer": acc2,
+            "mmd": mmd_loss,
+            "hsic": jnp.array(0.0),
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
+def make_train_step_oracle_pair_mmd(cfg):
+    """Return a JIT-compiled frozen-oracle-inner + MMD-outer pair train step."""
+    def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,
+                        mmd_w, num_classes):
+        x, y, s, w = batch
+
+        # --- Inner model (oracle, frozen) ---
+        logits1, aux1 = inner_state.apply_fn(
+            {"params": inner_state.params}, x, train=False,
+        )
+
+        # --- Outer model (weighted CE + MMD) ---
+        def loss_fn2(params):
+            return _outer_loss_mmd(
+                outer_state, params, x, y, s, w, mmd_w, num_classes,
+            )
+
+        (loss2, (logits2, wce2, mmd_loss)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": wce2,
+            "mmd": mmd_loss,
+            "hsic": jnp.array(0.0),
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
+def make_train_step_mdl_pair_mmd(cfg, deterministic_st=False):
+    """Return a JIT-compiled MDL-inner + MMD-outer pair train step."""
+    n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
+
+    def train_step_pair(inner_state, outer_state, batch, rng, mdl_lambda,
+                        n_train, mmd_w, num_classes):
+        x, y, s, w = batch
+        rng_inner = rng
+
+        # --- Inner model (MDL) — identical to HSIC variant ---
+        def loss_fn1(params):
+            return _mdl_loss(
+                inner_state.apply_fn, params, x, y, rng_inner,
+                inner_state.tau, mdl_lambda, n_train, n_samples,
+                deterministic_st,
+            )
+
+        (
+            objective_total_nats,
+            (logits1, data_nll_nats, complexity_expected_nats,
+             entropy_weights_nats, z1),
+        ), grads1 = (
+            jax.value_and_grad(loss_fn1, has_aux=True)(inner_state.params)
+        )
+        inner_state = inner_state.apply_gradients(grads=grads1)
+
+        ln2 = jnp.log(2.0)
+        hyp_scale = 1.0 / jnp.maximum(n_train, 1)
+        reg_entropy_bonus_unscaled_nats = inner_state.tau * entropy_weights_nats
+        reg_complexity_weighted_nats = (
+            mdl_lambda * hyp_scale * complexity_expected_nats
+        )
+        reg_entropy_bonus_nats = hyp_scale * reg_entropy_bonus_unscaled_nats
+        reg_net_nats = reg_complexity_weighted_nats - reg_entropy_bonus_nats
+
+        # --- Outer model (weighted CE + MMD) ---
+        def loss_fn2(params):
+            return _outer_loss_mmd(
+                outer_state, params, x, y, s, w, mmd_w, num_classes,
+            )
+
+        (loss2, (logits2, wce2, mmd_loss)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "objective_total_nats": objective_total_nats,
+            "data_nll_nats": data_nll_nats,
+            "complexity_expected_nats": complexity_expected_nats,
+            "entropy_weights_nats": entropy_weights_nats,
+            "reg_complexity_weighted_nats": reg_complexity_weighted_nats,
+            "reg_entropy_bonus_nats": reg_entropy_bonus_nats,
+            "reg_net_nats": reg_net_nats,
+            "objective_total_bits": objective_total_nats / ln2,
+            "data_nll_bits": data_nll_nats / ln2,
+            "complexity_expected_bits": complexity_expected_nats / ln2,
+            "entropy_weights_bits": entropy_weights_nats / ln2,
+            "reg_complexity_weighted_bits": reg_complexity_weighted_nats / ln2,
+            "reg_entropy_bonus_bits": reg_entropy_bonus_nats / ln2,
+            "reg_net_bits": reg_net_nats / ln2,
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": wce2,
+            "mmd": mmd_loss,
+            "hsic": jnp.array(0.0),
+        }
+        return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
+def make_train_step_mdl_shared_pair_mmd(cfg, deterministic_st=False):
+    """Return a JIT-compiled shared-MDL-inner + MMD-outer pair train step."""
+    n_samples = 1 if cfg.mdl.mode_forward else cfg.mdl.n_samples
+    lambda2 = jnp.asarray(cfg.mdl.shared_lambda2, dtype=jnp.float32)
+    epsilon = float(cfg.mdl.shared_epsilon)
+    _, grid_codelengths = grid_values_and_codelengths(cfg.mdl.n_max, cfg.mdl.m_max)
+    p_base = compute_p_base(grid_codelengths)
+
+    def train_step_pair(inner_state, outer_state, batch, rng, lambda1,
+                        n_train, mmd_w, num_classes):
+        x, y, s, w = batch
+        lambda1_arr = jnp.asarray(lambda1, dtype=jnp.float32)
+        rng_inner = rng
+
+        # --- Inner model (shared MDL) — identical to HSIC variant ---
+        def loss_fn1(params):
+            return _mdl_shared_loss(
+                inner_state.apply_fn, params, x, y, rng_inner, inner_state.tau,
+                lambda1_arr, lambda2, epsilon, p_base, n_train,
+                n_samples, deterministic_st,
+            )
+
+        (
+            objective_total_nats,
+            (
+                logits1, data_nll_nats, complexity_expected_nats,
+                code_cross_entropy_nats, entropy_weights_nats,
+                kl_pi_phi_nats, kl_phi_pbase_nats, phi_entropy_nats,
+                phi_min_prob, phi_max_prob, z1,
+            ),
+        ), grads1 = jax.value_and_grad(loss_fn1, has_aux=True)(inner_state.params)
+        inner_state = inner_state.apply_gradients(grads=grads1)
+
+        ln2 = jnp.log(2.0)
+        hyp_scale = 1.0 / jnp.maximum(n_train, 1)
+        reg_entropy_bonus_unscaled_nats = inner_state.tau * entropy_weights_nats
+        reg_complexity_weighted_nats = hyp_scale * complexity_expected_nats
+        reg_entropy_bonus_nats = hyp_scale * reg_entropy_bonus_unscaled_nats
+        reg_net_nats = reg_complexity_weighted_nats - reg_entropy_bonus_nats
+
+        # --- Outer model (weighted CE + MMD) ---
+        def loss_fn2(params):
+            return _outer_loss_mmd(
+                outer_state, params, x, y, s, w, mmd_w, num_classes,
+            )
+
+        (loss2, (logits2, wce2, mmd_loss)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "objective_total_nats": objective_total_nats,
+            "data_nll_nats": data_nll_nats,
+            "complexity_expected_nats": complexity_expected_nats,
+            "code_cross_entropy_nats": code_cross_entropy_nats,
+            "entropy_weights_nats": entropy_weights_nats,
+            "reg_complexity_weighted_nats": reg_complexity_weighted_nats,
+            "reg_entropy_bonus_nats": reg_entropy_bonus_nats,
+            "reg_net_nats": reg_net_nats,
+            "kl_pi_phi_nats": kl_pi_phi_nats,
+            "kl_phi_pbase_nats": kl_phi_pbase_nats,
+            "phi_entropy_nats": phi_entropy_nats,
+            "phi_min_prob": phi_min_prob,
+            "phi_max_prob": phi_max_prob,
+            "objective_total_bits": objective_total_nats / ln2,
+            "data_nll_bits": data_nll_nats / ln2,
+            "complexity_expected_bits": complexity_expected_nats / ln2,
+            "code_cross_entropy_bits": code_cross_entropy_nats / ln2,
+            "entropy_weights_bits": entropy_weights_nats / ln2,
+            "reg_complexity_weighted_bits": reg_complexity_weighted_nats / ln2,
+            "reg_entropy_bonus_bits": reg_entropy_bonus_nats / ln2,
+            "reg_net_bits": reg_net_nats / ln2,
+            "kl_pi_phi_bits": kl_pi_phi_nats / ln2,
+            "kl_phi_pbase_bits": kl_phi_pbase_nats / ln2,
+            "phi_entropy_bits": phi_entropy_nats / ln2,
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": wce2,
+            "mmd": mmd_loss,
+            "hsic": jnp.array(0.0),
         }
         return inner_state, outer_state, metrics
 
@@ -774,7 +1060,9 @@ def make_train_step_mdl_pair(cfg, deterministic_st=False):
         reg_entropy_bonus_nats = hyp_scale * reg_entropy_bonus_unscaled_nats
         reg_net_nats = reg_complexity_weighted_nats - reg_entropy_bonus_nats
 
-        z1_sg = lax.stop_gradient(z1)
+        s1 = lax.stop_gradient(
+            jax.nn.one_hot(jnp.argmax(logits1, -1), num_classes)
+        )
 
         # --- Outer model (standard classifier + HSIC) ---
         def loss_fn2(params):
@@ -787,7 +1075,7 @@ def make_train_step_mdl_pair(cfg, deterministic_st=False):
                 logits2, y
             ).mean()
             hsic = class_cond_hsic_rbf(
-                z1_sg, z2, y, num_classes=num_classes,
+                s1, z2, y, num_classes=num_classes,
             )
 
             total = ce2 * (1 - hsic_w) + hsic * hsic_w
@@ -875,7 +1163,9 @@ def make_train_step_mdl_shared_pair(cfg, deterministic_st=False):
         reg_entropy_bonus_nats = hyp_scale * reg_entropy_bonus_unscaled_nats
         reg_net_nats = reg_complexity_weighted_nats - reg_entropy_bonus_nats
 
-        z1_sg = lax.stop_gradient(z1)
+        s1 = lax.stop_gradient(
+            jax.nn.one_hot(jnp.argmax(logits1, -1), num_classes)
+        )
 
         def loss_fn2(params):
             logits2, aux2 = outer_state.apply_fn(
@@ -887,7 +1177,7 @@ def make_train_step_mdl_shared_pair(cfg, deterministic_st=False):
                 logits2, y
             ).mean()
             hsic = class_cond_hsic_rbf(
-                z1_sg, z2, y, num_classes=num_classes,
+                s1, z2, y, num_classes=num_classes,
             )
 
             total = ce2 * (1 - hsic_w) + hsic * hsic_w
@@ -1103,8 +1393,9 @@ def make_train_step_resnet_pair(cfg, augment_fn=None):
         inner_state = inner_state.apply_gradients(grads=grads1)
         inner_state = inner_state.replace(batch_stats=new_vars1["batch_stats"])
 
-        z1 = aux1["z"]
-        z1_sg = lax.stop_gradient(z1)
+        s1 = lax.stop_gradient(
+            jax.nn.one_hot(jnp.argmax(logits1, -1), num_classes)
+        )
 
         # --- Outer model (CE + HSIC) ---
         def outer_loss_fn(params):
@@ -1118,7 +1409,7 @@ def make_train_step_resnet_pair(cfg, augment_fn=None):
                 logits2, y,
             ).mean()
             hsic = class_cond_hsic_rbf(
-                z1_sg, z2, y, num_classes=num_classes,
+                s1, z2, y, num_classes=num_classes,
             )
             total = ce2 * (1 - hsic_w) + hsic * hsic_w
             return total, (logits2, ce2, hsic, new_vars2)

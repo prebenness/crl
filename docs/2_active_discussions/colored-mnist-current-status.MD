@@ -6,7 +6,23 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 
 ## Current Best Results (`cmnist_ula`, ULA-comparable models)
 
-### Best Final VIB Pair Result
+### Best Oracle Pair + MMD Result (2026-04-01)
+
+- Run:
+  - `results/colored_mnist/20260401_2*_oracle_pair_mmd_*` (multiple runs, see session log)
+- Best outer test accuracy:
+  - **`0.9224`** (MMD weight=0.5, batch=256, lr=1e-3, wd=1e-4, 200 epochs)
+- Oracle: frozen color-predicting inner model (train acc ~95%), outer trained with weighted CE + MMD.
+- All MMD runs plateau around 0.92 — likely architecture ceiling for 3x100 MLP.
+
+### Best Oracle Pair + HSIC Result (2026-04-01)
+
+- Best outer test accuracy:
+  - `0.884` (HSIC weight=0.5, 100 epochs)
+- HSIC now uses `one_hot(argmax(inner_logits))` as color signal (same as MMD).
+- MMD outperforms HSIC by ~4 points under identical conditions.
+
+### Best VIB Pair Result (2026-02-28)
 
 - Run:
   - `results/colored_mnist/20260228_220856_cmnist_pair_ula_lam1e-3_alpha1e-3_wd1e-4_e40_cmnist_ula_pair`
@@ -17,7 +33,7 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
   - At chance, but `train_acc1` was also ~11% — the inner model learned nothing, not color-only.
   - See inner model investigation notes below.
 
-### Best Observed VIB Pair Peak
+### Best Observed VIB Pair Peak (2026-02-28)
 
 - Run:
   - `results/colored_mnist/20260228_220952_cmnist_pair_ula_lam3e-3_alpha1e-3_wd1e-4_e40_cmnist_ula_pair`
@@ -25,7 +41,7 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
   - `0.8896`
 - Final value dropped after the peak.
 
-### Best Final MDL Pair Result
+### Best MDL Pair Result (2026-02-28)
 
 - Run:
   - `results/colored_mnist/20260228_215807_cmnist_mdl_pair_g10_lam1e-1_hsic0p8_softtau_cmnist_ula_mdl_pair`
@@ -34,10 +50,11 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 
 ## Interpretation
 
-- The VIB pair path is currently stronger than the MDL pair path on outer accuracy.
-- The gap to the `~96%` target is still large.
-- Peak-vs-final behavior suggests model selection / best-checkpoint saving is still a meaningful bottleneck.
-  - Best-checkpoint saving now implemented (2026-03-30).
+- Oracle pair + MMD is the current best path at **0.9224**.
+- MMD consistently beats HSIC (~0.92 vs ~0.88) with the same oracle inner model.
+- The gap to the `~96%` target is narrowing but still significant.
+- The 0.92 ceiling may be fundamental to the 3x100 MLP — needs investigation.
+- Best-checkpoint saving implemented (2026-03-30), summary table reports best (2026-04-01).
 
 ## Inner Model Investigation (2026-03-30)
 
@@ -95,6 +112,9 @@ Best train/test gap (most color-dominant) achieved with:
 ## Immediate Next Work
 
 1. ~~Add or use explicit best-epoch selection for outer accuracy.~~ Done (2026-03-30).
-2. Resolve the inner model color-only regime problem for 10-class before running more pair experiments.
-3. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
-4. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
+2. ~~Implement MMD conditional invariance outer loss.~~ Done (2026-04-01). See session log `20260401-200000-conditional-invariance-mmd.MD`.
+3. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
+4. Run VIB pair (non-oracle) with MMD — the real use case where inner model learns jointly.
+5. Resolve the inner model color-only regime problem for 10-class.
+6. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
+7. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
