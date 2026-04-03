@@ -1,0 +1,36 @@
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "cba_om"
+  inner: "oracle_mlp"           # inner = colour oracle (ground truth if no checkpoint)
+  outer: "cba_om_mlp"           # outer = colour-conditioned classifier
+  num_classes: 10
+  oracle_checkpoint: ""         # empty = use ground-truth colours; set path for model oracle
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-4
+  epochs: 50
+  batch_size: 128
+  seed: 0
+  alpha: 0.01
+
+cba_om:
+  embed_dim: 16
+  num_colors: 10
+
+checkpointing:
+  early_stopping_patience: 15
+
+sweep:
+  lambda_min_exp: 0
+  lambda_max_exp: 0
+  lambda_steps: 1
+  log_sweep: true

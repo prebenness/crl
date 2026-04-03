@@ -95,6 +95,12 @@ class CheckpointingConfig:
 
 
 @dataclass
+class CBAOMConfig:
+    embed_dim: int = 16
+    num_colors: int = 10
+
+
+@dataclass
 class SweepConfig:
     lambda_min_exp: float = -3.0
     lambda_max_exp: float = 3.0
@@ -113,6 +119,7 @@ class ExperimentConfig:
     mc_samples: MCSamplesConfig = field(default_factory=MCSamplesConfig)
     hsic: HSICConfig = field(default_factory=HSICConfig)
     mdl: MDLConfig = field(default_factory=MDLConfig)
+    cba_om: CBAOMConfig = field(default_factory=CBAOMConfig)
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     sweep: SweepConfig = field(default_factory=SweepConfig)
 
@@ -142,6 +149,7 @@ def load_config(yaml_path: str) -> ExperimentConfig:
         "mc_samples": MCSamplesConfig,
         "hsic": HSICConfig,
         "mdl": MDLConfig,
+        "cba_om": CBAOMConfig,
         "checkpointing": CheckpointingConfig,
         "sweep": SweepConfig,
     }

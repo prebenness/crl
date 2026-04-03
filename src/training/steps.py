@@ -161,6 +161,73 @@ def make_eval_step_oracle(cfg):
     return eval_step
 
 
+def make_train_step_cba_om(cfg):
+    """Return a JIT-compiled train step for CBA-OM (colour-conditioned CE)."""
+    @jax.jit
+    def train_step(state, batch, rng, lamb, alpha):
+        x, y, s = batch
+
+        def loss_fn(params):
+            logits, aux = state.apply_fn(
+                {"params": params}, x, s, train=True,
+            )
+            ce = optax.softmax_cross_entropy_with_integer_labels(
+                logits, y,
+            ).mean()
+            return ce, logits
+
+        (loss, logits), grads = (
+            jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        )
+        state = state.apply_gradients(grads=grads)
+
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        metrics = {
+            "objective_total_nats": loss,
+            "data_nll_nats": loss,
+            "reconstruction_nll_nats": jnp.array(0.0),
+            "kl_latent_nats": jnp.array(0.0),
+            "beta_controller": jnp.array(0.0),
+            "accuracy": acc,
+        }
+        return state, metrics
+
+    return train_step
+
+
+def make_eval_step_cba_om(cfg):
+    """Return a JIT-compiled eval step with backdoor marginalisation.
+
+    At test time, marginalise over all colours:
+        p(y|x) = (1/|S|) * sum_s p(y|x,s)
+    No oracle needed at inference.
+    """
+    num_colors = cfg.cba_om.num_colors
+
+    @jax.jit
+    def eval_step(state, batch, rng):
+        x, y = batch
+        B = x.shape[0]
+        all_colors = jnp.arange(num_colors, dtype=jnp.int32)
+
+        def forward_one_color(s_val):
+            s_batch = jnp.full((B,), s_val, dtype=jnp.int32)
+            logits, _ = state.apply_fn(
+                {"params": state.params}, x, s_batch, train=False,
+            )
+            return jax.nn.softmax(logits, axis=-1)
+
+        all_probs = jax.vmap(forward_one_color)(all_colors)
+        avg_probs = jnp.mean(all_probs, axis=0)
+
+        preds = jnp.argmax(avg_probs, axis=-1)
+        acc = (preds == y).mean()
+        nll = -jnp.mean(jnp.log(avg_probs[jnp.arange(B), y] + 1e-10))
+        return nll, acc
+
+    return eval_step
+
+
 def make_train_step_oracle_pair(cfg):
     """Return a JIT-compiled pair step: frozen oracle inner + trainable outer with HSIC."""
     def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,

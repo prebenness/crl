@@ -159,6 +159,109 @@ def run_train_eval(x_train, y_train, x_test, y_test, model, cfg, lamb,
     return results
 
 
+# ---- CBA-OM runner ----
+
+def run_train_eval_cba_om(x_train, y_train, s_train, x_test, y_test,
+                          model, cfg, lamb, wandb_run, *,
+                          create_state_fn, train_epoch_fn,
+                          eval_epoch_fn, run_dir=None,
+                          start_epoch=0, init_params=None):
+    """CBA-OM training loop: colour-conditioned training, marginalised eval."""
+    rng = jrandom.PRNGKey(cfg.training.seed)
+    input_shape = (cfg.training.batch_size,) + x_train.shape[1:]
+    rng, rng_init = jrandom.split(rng)
+
+    state = create_state_fn(rng_init, model, input_shape, cfg)
+    if init_params is not None:
+        state = state.replace(params=init_params)
+
+    xt, yt, te_counts = make_eval_batches(
+        x_test, y_test, cfg.training.batch_size,
+    )
+
+    early_stopping_patience, restart_patience = _get_patience_cfg(cfg)
+    best = {"test_acc": -1.0, "params": None, "epoch": 0}
+    epochs_since_best = 0
+    n_restarts = 0
+
+    for ep in range(start_epoch, cfg.training.epochs):
+        t0 = time.time()
+        seed_tr = cfg.training.seed * 10_000 + ep
+        rng, rng_epoch = jrandom.split(rng)
+
+        xb, yb, sb = make_epoch_batches(
+            x_train, y_train, cfg.training.batch_size, seed_tr, s_train,
+        )
+
+        state, metrics = train_epoch_fn(
+            state, xb, yb, sb, rng_epoch, lamb, cfg.training.alpha,
+        )
+
+        rng, rng_eval = jrandom.split(rng)
+        te_loss, te_acc = eval_epoch_fn(state, xt, yt, rng_eval, te_counts)
+
+        current_acc = float(te_acc)
+        if current_acc > best["test_acc"]:
+            best["test_acc"] = current_acc
+            best["params"] = jax.tree.map(jnp.copy, state.params)
+            best["epoch"] = ep + 1
+            epochs_since_best = 0
+            if run_dir is not None:
+                save_checkpoint(state.params,
+                                checkpoint_path(run_dir, "best.npz"))
+                save_checkpoint_meta(run_dir, ep + 1, best["test_acc"],
+                                     best_checkpoint_epoch=ep + 1)
+            print(f"    >>> NEW BEST test_acc={current_acc:.4f} "
+                  f"(epoch {ep+1})")
+        else:
+            epochs_since_best += 1
+
+        results = {
+            "epoch": ep + 1,
+            "train_acc": float(metrics["accuracy"]),
+            "test_acc": float(te_acc),
+            "objective_total_nats": float(metrics["objective_total_nats"]),
+            "data_nll_nats": float(metrics["data_nll_nats"]),
+            "reconstruction_nll_nats": float(metrics["reconstruction_nll_nats"]),
+            "kl_latent_nats": float(metrics["kl_latent_nats"]),
+            "beta_controller": float(metrics["beta_controller"]),
+            "test_nll_nats": float(te_loss),
+            "capacity_target_nats": float(lamb),
+            "kl_target_gap_nats": float(lamb - metrics["kl_latent_nats"]),
+            "best_test_acc": best["test_acc"],
+            "best_epoch": best["epoch"],
+        }
+        wandb_run.log(results)
+
+        print(
+            f"  Epoch {ep+1}/{cfg.training.epochs}"
+            f"  train_acc {float(metrics['accuracy']):.4f}"
+            f" test_acc {float(te_acc):.4f}"
+            f"  ce_loss {float(metrics['data_nll_nats']):.4f}n"
+            f"  best {best['test_acc']:.4f}"
+            f"  ({time.time()-t0:.2f}s)"
+        )
+
+        state, epochs_since_best, n_restarts, should_stop = _check_patience(
+            state, best, epochs_since_best, n_restarts,
+            early_stopping_patience, restart_patience, ep,
+        )
+        if should_stop:
+            break
+
+    results["best_test_acc"] = best["test_acc"]
+    results["best_epoch"] = best["epoch"]
+    results["n_restarts"] = n_restarts
+
+    if run_dir is not None:
+        save_checkpoint(state.params, checkpoint_path(run_dir, "final.npz"))
+        save_checkpoint_meta(run_dir, ep + 1, best["test_acc"],
+                             best_checkpoint_epoch=best["epoch"])
+        save_results(run_dir, results)
+
+    return results
+
+
 # ---- Pair-model runner ----
 
 def run_train_eval_pair(x_train, y_train, x_test, y_test, inner_model,

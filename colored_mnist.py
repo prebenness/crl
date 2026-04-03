@@ -33,12 +33,12 @@ from src.datasets.datasets import (
     build_dataset, dataset_to_jax_arrays, DATASET_NUM_CLASSES,
 )
 from src.models.ib_classifiers import VIBClassifier, ULAMLPVarClassifier
-from src.models.classifiers import StdClassifier, ULAMLPClassifier, OracleMLP
+from src.models.classifiers import StdClassifier, ULAMLPClassifier, OracleMLP, CBAOMMlp
 from src.models.mdl_classifiers import GumbelSoftmaxMLP
 from mdl.src.mdl.coding import grid_values_and_codelengths
 from src.training.train_state import (
     create_state_inner, create_state_outer, create_state_mdl,
-    create_state_mdl_shared, create_state_oracle,
+    create_state_mdl_shared, create_state_oracle, create_state_cba_om,
 )
 from src.training.steps import (
     make_train_step, make_train_step_pair, make_eval_step,
@@ -47,15 +47,18 @@ from src.training.steps import (
     make_eval_step_mdl_shared,
     make_train_step_oracle, make_eval_step_oracle,
     make_train_step_oracle_pair,
+    make_train_step_cba_om, make_eval_step_cba_om,
 )
 from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
     make_train_epoch_mdl, make_train_epoch_mdl_pair,
+    make_train_epoch_cba_om,
 )
 from src.training.runners import (
     run_train_eval, run_train_eval_pair,
     run_train_eval_mdl, run_train_eval_mdl_pair,
     run_train_eval_oracle_pair,
+    run_train_eval_cba_om,
 )
 from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
 
@@ -105,6 +108,11 @@ OUTER_MODELS = {
     "ula_mlp": lambda cfg: ULAMLPClassifier(
         rep_dim=cfg.model.outer_rep_dim,
         num_classes=cfg.model.num_classes,
+    ),
+    "cba_om_mlp": lambda cfg: CBAOMMlp(
+        num_classes=cfg.model.num_classes,
+        num_colors=cfg.cba_om.num_colors,
+        embed_dim=cfg.cba_om.embed_dim,
     ),
 }
 
@@ -288,6 +296,13 @@ def main(argv=None):
         train_epoch_pair = make_train_epoch_pair(train_step_pair)
         eval_epoch = make_eval_epoch(eval_step)
 
+    if mode == "cba_om":
+        cba_om_train_step = make_train_step_cba_om(cfg)
+        cba_om_eval_step = make_eval_step_cba_om(cfg)
+
+        cba_om_train_epoch = make_train_epoch_cba_om(cba_om_train_step)
+        cba_om_eval_epoch = make_eval_epoch(cba_om_eval_step)
+
     if mode in ("oracle_train", "erm"):
         oracle_train_step = make_train_step_oracle(cfg)
         oracle_eval_step = make_eval_step_oracle(cfg)
@@ -373,6 +388,36 @@ def main(argv=None):
         print(f"Oracle mode: using color labels (train unique: "
               f"{len(set(train_ds.colors.tolist()))}, "
               f"test unique: {len(set(test_ds.colors.tolist()))})")
+
+    # Extract colour labels for CBA-OM outer model
+    if mode == "cba_om":
+        import jax.numpy as jnp
+        oracle_ckpt = cfg.model.oracle_checkpoint
+        if oracle_ckpt:
+            # Phase 2: use trained oracle model to predict colours
+            oracle_model = INNER_MODELS["oracle_mlp"](cfg)
+            oracle_params = load_checkpoint(oracle_ckpt)
+            print(f"  CBA-OM: loaded oracle checkpoint: {oracle_ckpt}")
+            oracle_state = create_state_oracle(
+                jrandom.PRNGKey(0), oracle_model,
+                (cfg.training.batch_size,) + x_train.shape[1:], cfg,
+            )
+            oracle_state = oracle_state.replace(params=oracle_params)
+            from src.training.runners import precompute_predictions
+            s_train = precompute_predictions(
+                oracle_state, x_train, cfg.training.batch_size,
+                lambda state, x: state.apply_fn(
+                    {"params": state.params}, x, train=False,
+                )[0],
+            )
+            oracle_acc = float((s_train == jnp.array(
+                train_ds.colors, dtype=jnp.int32)).mean())
+            print(f"  CBA-OM: oracle colour accuracy on train: {oracle_acc:.4f}")
+        else:
+            # Phase 1: use ground-truth colour labels
+            s_train = jnp.array(train_ds.colors, dtype=jnp.int32)
+            print(f"CBA-OM mode: using ground-truth colour labels as oracle "
+                  f"(train unique: {len(set(train_ds.colors.tolist()))})")
 
     # Lambda sweep
     all_results = []
@@ -562,6 +607,18 @@ def main(argv=None):
                     start_epoch=resume_start_epoch,
                     init_inner_params=oracle_params,
                     init_outer_params=resume_params,
+                )
+            elif mode == "cba_om":
+                outer_model = OUTER_MODELS[cfg.model.outer](cfg)
+                res = run_train_eval_cba_om(
+                    x_train, y_train, s_train, x_test, y_test,
+                    outer_model, cfg, lamb, wandb_run=run,
+                    create_state_fn=create_state_cba_om,
+                    train_epoch_fn=cba_om_train_epoch,
+                    eval_epoch_fn=cba_om_eval_epoch,
+                    run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_params=resume_params,
                 )
             else:
                 raise ValueError(f"Unknown model.mode: {cfg.model.mode!r}")

@@ -368,7 +368,7 @@ def build_dataset(name: str, train: bool = True, p_corr: float = 0.9, seed: int 
     return factories[name]()
 
 
-def make_epoch_batches(x, y, batch_size, seed):
+def make_epoch_batches(x, y, batch_size, seed, *aux_arrays):
     """
     Fast host-side permutation, device-side gather.
     Avoids jax.random.permutation (slow + sync).
@@ -376,6 +376,10 @@ def make_epoch_batches(x, y, batch_size, seed):
     Note: drops remainder samples (n % batch_size).  Since a fresh random
     permutation is used each epoch, different samples are dropped each time,
     so all samples are seen over multiple epochs.
+
+    Optional ``aux_arrays`` (e.g. predicted colors S, weights W) are shuffled
+    and batched with the same permutation.  Each must have leading dim == n.
+    Returns ``(xb, yb, *aux_batched)``.
     """
     n = x.shape[0]
     rng = np.random.default_rng(int(seed))
@@ -392,7 +396,16 @@ def make_epoch_batches(x, y, batch_size, seed):
     n_batches = n_trim // batch_size
     xb = x_shuf.reshape((n_batches, batch_size) + x.shape[1:])
     yb = y_shuf.reshape((n_batches, batch_size))
-    return xb, yb
+
+    if not aux_arrays:
+        return xb, yb
+
+    aux_batched = []
+    for arr in aux_arrays:
+        arr_shuf = jnp.take(arr, perm, axis=0)
+        arr_b = arr_shuf.reshape((n_batches, batch_size) + arr.shape[1:])
+        aux_batched.append(arr_b)
+    return (xb, yb, *aux_batched)
 
 
 def make_eval_batches(x, y, batch_size):

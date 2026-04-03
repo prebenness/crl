@@ -1,3 +1,4 @@
+import jax.numpy as jnp
 import flax.linen as nn
 
 
@@ -80,6 +81,37 @@ class ULAMLPClassifier(nn.Module):
         h = nn.Dense(100)(z); h = nn.relu(h)
 
         # z is penpenultimate rep (100-d)
+        logits = nn.Dense(self.num_classes)(h)
+        return logits, {"z": z}
+
+
+class CBAOMMlp(nn.Module):
+    """Colour-conditioned classifier for CBA-OM (backdoor adjustment).
+
+    Takes (x, s) where s is the oracle-provided colour label.
+    Late fusion: encoder processes x alone, then [encoder(x); embed(s)]
+    is fed to a single linear classification head.
+    At test time, marginalise over all colours externally.
+    """
+    num_classes: int
+    num_colors: int = 10
+    embed_dim: int = 16
+
+    @nn.compact
+    def __call__(self, x, s, train: bool = True):
+        # Early fusion: concatenate colour embedding with flattened image
+        # (proposal recommends late fusion for larger encoders, but with
+        # 3x100 the linear head lacks capacity for deconfounding —
+        # early fusion lets colour modulate all 3 layers)
+        x = x.reshape((x.shape[0], -1))
+        s_emb = nn.Embed(num_embeddings=self.num_colors,
+                         features=self.embed_dim)(s)
+        x = jnp.concatenate([x, s_emb], axis=-1)
+
+        x = nn.Dense(100)(x); x = nn.relu(x)
+        x = nn.Dense(100)(x); z = nn.relu(x)
+        h = nn.Dense(100)(z); h = nn.relu(h)
+
         logits = nn.Dense(self.num_classes)(h)
         return logits, {"z": z}
 
