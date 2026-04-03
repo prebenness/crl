@@ -162,19 +162,48 @@ def make_eval_step_oracle(cfg):
 
 
 def make_train_step_cba_om(cfg):
-    """Return a JIT-compiled train step for CBA-OM (colour-conditioned CE)."""
+    """Return a JIT-compiled train step for CBA-OM (colour-conditioned CE).
+
+    Uses counterfactual colour augmentation to prevent the model from using
+    the colour input s as a shortcut for predicting y.  For each real sample
+    (x, y, s_true), we also train on (x, y, s_cf) where s_cf is sampled
+    uniformly from {0..K-1}.  The counterfactual term forces the model to
+    predict y correctly regardless of what colour it is told, meaning it
+    must rely on shape features.  The real term lets it additionally learn
+    how colour modulates the prediction (useful for the minority group).
+
+    The two losses are combined as:
+        L = (1 - alpha) * CE(x, y, s_true) + alpha * CE(x, y, s_cf)
+    where alpha is taken from cfg.training.alpha.
+    """
+    num_colors = cfg.cba_om.num_colors
+
     @jax.jit
     def train_step(state, batch, rng, lamb, alpha):
         x, y, s = batch
 
         def loss_fn(params):
-            logits, aux = state.apply_fn(
+            # --- Factual term: train with true oracle colour ---
+            logits_real, _ = state.apply_fn(
                 {"params": params}, x, s, train=True,
             )
-            ce = optax.softmax_cross_entropy_with_integer_labels(
-                logits, y,
+            ce_real = optax.softmax_cross_entropy_with_integer_labels(
+                logits_real, y,
             ).mean()
-            return ce, logits
+
+            # --- Counterfactual term: train with random colour ---
+            rng_cf = jrandom.fold_in(rng, 0)
+            s_cf = jrandom.randint(rng_cf, s.shape, 0, num_colors)
+            logits_cf, _ = state.apply_fn(
+                {"params": params}, x, s_cf, train=True,
+            )
+            ce_cf = optax.softmax_cross_entropy_with_integer_labels(
+                logits_cf, y,
+            ).mean()
+
+            # Combined loss: alpha controls counterfactual strength
+            loss = (1.0 - alpha) * ce_real + alpha * ce_cf
+            return loss, logits_real
 
         (loss, logits), grads = (
             jax.value_and_grad(loss_fn, has_aux=True)(state.params)

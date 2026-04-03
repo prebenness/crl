@@ -17,17 +17,17 @@ model:
 training:
   lr: 1.0e-3
   weight_decay_inner: 1.0e-4
-  epochs: 50
+  epochs: 100
   batch_size: 128
   seed: 0
-  alpha: 0.01
+  alpha: 0.8              # counterfactual colour augmentation weight (high = force shape learning)
 
 cba_om:
-  embed_dim: 16
+  embed_dim: 32            # increased from 16 for richer colour conditioning
   num_colors: 10
 
 checkpointing:
-  early_stopping_patience: 15
+  early_stopping_patience: 20
 
 sweep:
   lambda_min_exp: 0

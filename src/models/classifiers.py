@@ -89,29 +89,31 @@ class CBAOMMlp(nn.Module):
     """Colour-conditioned classifier for CBA-OM (backdoor adjustment).
 
     Takes (x, s) where s is the oracle-provided colour label.
-    Late fusion: encoder processes x alone, then [encoder(x); embed(s)]
-    is fed to a single linear classification head.
+    Late fusion: encoder processes x alone through 3x100 MLP (matching
+    uLA/CCDB architecture), then [encoder(x); embed(s)] is fed to the
+    classification head.  This prevents the colour embedding from being
+    diluted in the early layers and lets the encoder build shape features
+    at full capacity.
     At test time, marginalise over all colours externally.
     """
     num_classes: int
     num_colors: int = 10
-    embed_dim: int = 16
+    embed_dim: int = 32
 
     @nn.compact
     def __call__(self, x, s, train: bool = True):
-        # Early fusion: concatenate colour embedding with flattened image
-        # (proposal recommends late fusion for larger encoders, but with
-        # 3x100 the linear head lacks capacity for deconfounding —
-        # early fusion lets colour modulate all 3 layers)
+        # --- Image encoder: 3 hidden layers, 100 units (uLA protocol) ---
         x = x.reshape((x.shape[0], -1))
-        s_emb = nn.Embed(num_embeddings=self.num_colors,
-                         features=self.embed_dim)(s)
-        x = jnp.concatenate([x, s_emb], axis=-1)
-
         x = nn.Dense(100)(x); x = nn.relu(x)
         x = nn.Dense(100)(x); z = nn.relu(x)
         h = nn.Dense(100)(z); h = nn.relu(h)
 
-        logits = nn.Dense(self.num_classes)(h)
+        # --- Colour embedding (late fusion) ---
+        s_emb = nn.Embed(num_embeddings=self.num_colors,
+                         features=self.embed_dim)(s)
+
+        # --- Classification head: operates on [image_features; colour_emb] ---
+        fused = jnp.concatenate([h, s_emb], axis=-1)
+        logits = nn.Dense(self.num_classes)(fused)
         return logits, {"z": z}
 
