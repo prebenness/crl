@@ -68,6 +68,17 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 - Reconstruction weight and cycle consistency not yet tuned.
 - See session log `20260403-195000-ipsn-implementation.MD`.
 
+### FG-CCDB Replication (2026-04-03, in progress)
+
+- Replicating Zhao, Zhang & Li, 2025 (arXiv:2505.06831v1) — current SOTA on cMNIST.
+- Paper targets: 89.02% (0.5%), 94.93% (1%), 96.18% (2%), 98.21% (5% bc_ratio).
+- Script: `fg_ccdb_replication.py` (JAX/Flax, standalone).
+- Stage 1 (BEO) works: bias prediction accuracy = 94% (paper reports 100%).
+- Stage 2 (weights) computes correctly: N_mat diagonal 96%, weight range [2e-5, 594].
+- **Stage 3 (debiased training) underperforms**: 67.75% test acc vs 98.21% target (seed=0, 5% ratio).
+- Root cause under investigation: extreme weight dynamic range causes near-exclusive minority sampling, unstable training dynamics.
+- See session log `20260403-fg-ccdb-replication-script.MD`.
+
 ## Interpretation
 
 - Oracle pair + MMD is the current best path at **0.9224**.
@@ -137,9 +148,10 @@ Best train/test gap (most color-dominant) achieved with:
 2. ~~Implement MMD conditional invariance outer loss.~~ Done (2026-04-01). See session log `20260401-200000-conditional-invariance-mmd.MD`.
 3. ~~Implement CBA-OM (causal backdoor adjustment).~~ Done (2026-04-03). Best 0.9047.
 4. ~~Implement IPSN (interventional path surgery network).~~ Done (2026-04-03). Best 0.838.
-5. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
-6. Run VIB pair (non-oracle) with MMD — the real use case where inner model learns jointly.
-7. IPSN tuning: sweep rho_recon, enable cycle consistency (nu_cycle), try gradient clipping for higher gamma_adv.
-8. Resolve the inner model color-only regime problem for 10-class.
-9. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
-10. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
+5. **FG-CCDB replication: debug Stage 3 accuracy gap** (67% vs 98%). Investigate BEO accuracy (94% vs 100%), weight dynamics, and optimizer equivalence.
+6. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
+7. Run VIB pair (non-oracle) with MMD — the real use case where inner model learns jointly.
+8. IPSN tuning: sweep rho_recon, enable cycle consistency (nu_cycle), try gradient clipping for higher gamma_adv.
+9. Resolve the inner model color-only regime problem for 10-class.
+10. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
+11. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
