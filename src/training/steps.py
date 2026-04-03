@@ -228,6 +228,128 @@ def make_eval_step_cba_om(cfg):
     return eval_step
 
 
+def make_train_step_ipsn(cfg):
+    """Return a JIT-compiled train step for IPSN (path surgery network).
+
+    Loss = CE_digit + λ·CE_color + γ·CE_adv + ρ·L1_recon + ν·cycle_KL
+    Gradient reversal is handled inside the model on the c→a_s path.
+    """
+    lambda_color = cfg.ipsn.lambda_color
+    gamma_adv = cfg.ipsn.gamma_adv
+    rho_recon = cfg.ipsn.rho_recon
+    nu_cycle = cfg.ipsn.nu_cycle
+    num_colors = cfg.ipsn.num_colors
+
+    @jax.jit
+    def train_step(state, batch, rng, lamb, alpha):
+        x, y, s = batch
+
+        def loss_fn(params):
+            logits, aux = state.apply_fn(
+                {"params": params}, x, s, train=True,
+            )
+            # 1. Digit classification
+            ce_digit = optax.softmax_cross_entropy_with_integer_labels(
+                aux["digit_logits"], y,
+            ).mean()
+            # 2. Colour classification from colour code
+            ce_color = optax.softmax_cross_entropy_with_integer_labels(
+                aux["color_logits"], s,
+            ).mean()
+            # 3. Adversarial colour from content code (gradient reversal
+            #    inside model makes this push c away from colour info)
+            ce_adv = optax.softmax_cross_entropy_with_integer_labels(
+                aux["adversary_logits"], s,
+            ).mean()
+            # 4. Reconstruction L1
+            x_recon = jax.nn.sigmoid(aux["x_recon_logits"]).reshape(x.shape)
+            recon_l1 = jnp.abs(x - x_recon).mean()
+
+            # 5. Cycle consistency
+            if nu_cycle > 0:
+                c = aux["c"]
+                B = x.shape[0]
+                p_orig = jax.nn.softmax(aux["digit_logits"], axis=-1)
+
+                def cycle_one_color(s_val):
+                    s_b = jnp.full((B,), s_val, dtype=jnp.int32)
+                    rec_logits = state.apply_fn(
+                        {"params": params}, c, s_b, method="decode",
+                    )
+                    x_rec = jax.nn.sigmoid(rec_logits).reshape((B, 28, 28, 3))
+                    c_prime = state.apply_fn(
+                        {"params": params}, x_rec, method="encode_content",
+                    )
+                    logits_prime = state.apply_fn(
+                        {"params": params}, c_prime, method="classify_digit",
+                    )
+                    return jax.nn.softmax(logits_prime, axis=-1)
+
+                all_probs = jax.vmap(cycle_one_color)(
+                    jnp.arange(num_colors),
+                )  # (num_colors, B, num_classes)
+                kl = jnp.sum(
+                    p_orig[None]
+                    * (jnp.log(p_orig[None] + 1e-10)
+                       - jnp.log(all_probs + 1e-10)),
+                    axis=-1,
+                )  # (num_colors, B)
+                cycle_loss = kl.mean()
+            else:
+                cycle_loss = jnp.array(0.0)
+
+            total = (
+                ce_digit
+                + lambda_color * ce_color
+                + gamma_adv * ce_adv
+                + rho_recon * recon_l1
+                + nu_cycle * cycle_loss
+            )
+            return total, (logits, ce_digit, ce_color, ce_adv,
+                           recon_l1, cycle_loss)
+
+        (loss, (logits, ce_digit, ce_color, ce_adv, recon_l1, cycle_loss)), grads = (
+            jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        )
+        state = state.apply_gradients(grads=grads)
+
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        metrics = {
+            "objective_total_nats": loss,
+            "data_nll_nats": ce_digit,
+            "reconstruction_nll_nats": recon_l1,
+            "kl_latent_nats": cycle_loss,
+            "beta_controller": jnp.array(0.0),
+            "accuracy": acc,
+            "ce_color": ce_color,
+            "ce_adversary": ce_adv,
+        }
+        return state, metrics
+
+    return train_step
+
+
+def make_eval_step_ipsn(cfg):
+    """Return a JIT-compiled IPSN eval step.
+
+    At test time, only the content path g(E_c(x)) is used — no oracle needed.
+    The content code is trained to be colour-invariant via gradient reversal.
+    """
+    @jax.jit
+    def eval_step(state, batch, rng):
+        x, y = batch
+        logits, _ = state.apply_fn(
+            {"params": state.params}, x, train=False,
+        )
+        nll = optax.softmax_cross_entropy_with_integer_labels(
+            logits, y,
+        ).mean()
+        acc = (jnp.argmax(logits, -1) == y).mean()
+        return nll, acc
+
+    return eval_step
+
+
 def make_train_step_oracle_pair(cfg):
     """Return a JIT-compiled pair step: frozen oracle inner + trainable outer with HSIC."""
     def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,

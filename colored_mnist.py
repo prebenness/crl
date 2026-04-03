@@ -34,11 +34,13 @@ from src.datasets.datasets import (
 )
 from src.models.ib_classifiers import VIBClassifier, ULAMLPVarClassifier
 from src.models.classifiers import StdClassifier, ULAMLPClassifier, OracleMLP, CBAOMMlp
+from src.models.ipsn_classifier import IPSNMlp
 from src.models.mdl_classifiers import GumbelSoftmaxMLP
 from mdl.src.mdl.coding import grid_values_and_codelengths
 from src.training.train_state import (
     create_state_inner, create_state_outer, create_state_mdl,
     create_state_mdl_shared, create_state_oracle, create_state_cba_om,
+    create_state_ipsn,
 )
 from src.training.steps import (
     make_train_step, make_train_step_pair, make_eval_step,
@@ -48,6 +50,7 @@ from src.training.steps import (
     make_train_step_oracle, make_eval_step_oracle,
     make_train_step_oracle_pair,
     make_train_step_cba_om, make_eval_step_cba_om,
+    make_train_step_ipsn, make_eval_step_ipsn,
     make_train_step_pair_mmd, make_train_step_oracle_pair_mmd,
     make_train_step_mdl_pair_mmd, make_train_step_mdl_shared_pair_mmd,
 )
@@ -55,6 +58,7 @@ from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
     make_train_epoch_mdl, make_train_epoch_mdl_pair,
     make_train_epoch_cba_om,
+    make_train_epoch_ipsn,
     make_train_epoch_pair_mmd, make_train_epoch_mdl_pair_mmd,
 )
 from src.training.runners import (
@@ -62,6 +66,7 @@ from src.training.runners import (
     run_train_eval_mdl, run_train_eval_mdl_pair,
     run_train_eval_oracle_pair,
     run_train_eval_cba_om,
+    run_train_eval_ipsn,
     _forward_vib, _forward_oracle, _forward_mdl, _forward_mdl_shared,
 )
 from src.utils.plotting.colored_mnist_plots import wandb_summary_plot
@@ -117,6 +122,15 @@ OUTER_MODELS = {
         num_classes=cfg.model.num_classes,
         num_colors=cfg.cba_om.num_colors,
         embed_dim=cfg.cba_om.embed_dim,
+    ),
+    "ipsn_mlp": lambda cfg: IPSNMlp(
+        num_classes=cfg.model.num_classes,
+        num_colors=cfg.ipsn.num_colors,
+        c_dim=cfg.ipsn.c_dim,
+        b_dim=cfg.ipsn.b_dim,
+        embed_dim=cfg.ipsn.embed_dim,
+        decoder_hidden=cfg.ipsn.decoder_hidden,
+        grad_rev_scale=cfg.ipsn.grad_rev_scale,
     ),
 }
 
@@ -314,6 +328,13 @@ def main(argv=None):
         cba_om_train_epoch = make_train_epoch_cba_om(cba_om_train_step)
         cba_om_eval_epoch = make_eval_epoch(cba_om_eval_step)
 
+    if mode == "ipsn":
+        ipsn_train_step = make_train_step_ipsn(cfg)
+        ipsn_eval_step = make_eval_step_ipsn(cfg)
+
+        ipsn_train_epoch = make_train_epoch_ipsn(ipsn_train_step)
+        ipsn_eval_epoch = make_eval_epoch(ipsn_eval_step)
+
     if mode in ("oracle_train", "erm"):
         oracle_train_step = make_train_step_oracle(cfg)
         oracle_eval_step = make_eval_step_oracle(cfg)
@@ -446,6 +467,34 @@ def main(argv=None):
             # Phase 1: use ground-truth colour labels
             s_train = jnp.array(train_ds.colors, dtype=jnp.int32)
             print(f"CBA-OM mode: using ground-truth colour labels as oracle "
+                  f"(train unique: {len(set(train_ds.colors.tolist()))})")
+
+    # Extract colour labels for IPSN
+    if mode == "ipsn":
+        import jax.numpy as jnp
+        oracle_ckpt = cfg.model.oracle_checkpoint
+        if oracle_ckpt:
+            oracle_model = INNER_MODELS["oracle_mlp"](cfg)
+            oracle_params = load_checkpoint(oracle_ckpt)
+            print(f"  IPSN: loaded oracle checkpoint: {oracle_ckpt}")
+            oracle_state = create_state_oracle(
+                jrandom.PRNGKey(0), oracle_model,
+                (cfg.training.batch_size,) + x_train.shape[1:], cfg,
+            )
+            oracle_state = oracle_state.replace(params=oracle_params)
+            from src.training.runners import precompute_predictions
+            s_train = precompute_predictions(
+                oracle_state, x_train, cfg.training.batch_size,
+                lambda state, x: state.apply_fn(
+                    {"params": state.params}, x, train=False,
+                )[0],
+            )
+            oracle_acc = float((s_train == jnp.array(
+                train_ds.colors, dtype=jnp.int32)).mean())
+            print(f"  IPSN: oracle colour accuracy on train: {oracle_acc:.4f}")
+        else:
+            s_train = jnp.array(train_ds.colors, dtype=jnp.int32)
+            print(f"IPSN mode: using ground-truth colour labels as oracle "
                   f"(train unique: {len(set(train_ds.colors.tolist()))})")
 
     # Lambda sweep
@@ -673,6 +722,18 @@ def main(argv=None):
                     create_state_fn=create_state_cba_om,
                     train_epoch_fn=cba_om_train_epoch,
                     eval_epoch_fn=cba_om_eval_epoch,
+                    run_dir=run_dir,
+                    start_epoch=resume_start_epoch,
+                    init_params=resume_params,
+                )
+            elif mode == "ipsn":
+                ipsn_model = OUTER_MODELS[cfg.model.outer](cfg)
+                res = run_train_eval_ipsn(
+                    x_train, y_train, s_train, x_test, y_test,
+                    ipsn_model, cfg, lamb, wandb_run=run,
+                    create_state_fn=create_state_ipsn,
+                    train_epoch_fn=ipsn_train_epoch,
+                    eval_epoch_fn=ipsn_eval_epoch,
                     run_dir=run_dir,
                     start_epoch=resume_start_epoch,
                     init_params=resume_params,

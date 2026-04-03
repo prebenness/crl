@@ -78,6 +78,27 @@ def create_state_cba_om(rng, model, input_shape, cfg):
     )
 
 
+def create_state_ipsn(rng, model, input_shape, cfg):
+    """Initialize IPSN model state (needs dummy colour input for decoder init)."""
+    batch_size = input_shape[0]
+    params = model.init(
+        rng,
+        jnp.ones(input_shape, jnp.float32),
+        jnp.zeros((batch_size,), dtype=jnp.int32),
+        train=True,
+    )["params"]
+    tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
+    opt_state = tx.init(params)
+
+    return train_state.TrainState(
+        step=0,
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        opt_state=opt_state,
+    )
+
+
 class MDLTrainState(train_state.TrainState):
     """TrainState with Gumbel temperature for MDL models."""
     tau: jnp.ndarray

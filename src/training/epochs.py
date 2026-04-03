@@ -48,6 +48,27 @@ def make_train_epoch_cba_om(train_step_fn):
     return jax.jit(train_epoch, donate_argnums=(0,))
 
 
+def make_train_epoch_ipsn(train_step_fn):
+    """Return a JIT-compiled IPSN train_epoch (batches include colour labels)."""
+    def train_epoch(state, xb, yb, sb, rng, lamb, alpha):
+        n_batches = xb.shape[0]
+        rngs = jrandom.split(rng, n_batches)
+
+        def body(carry, inputs):
+            st = carry
+            x, y, s, r = inputs
+            st, metrics = train_step_fn(st, (x, y, s), r, lamb, alpha)
+            return st, metrics
+
+        state, metrics_history = lax.scan(
+            body, state, (xb, yb, sb, rngs),
+        )
+        avg_metrics = {k: jnp.mean(v) for k, v in metrics_history.items()}
+        return state, avg_metrics
+
+    return jax.jit(train_epoch, donate_argnums=(0,))
+
+
 def make_train_epoch_pair(train_step_pair_fn):
     """Return a JIT-compiled train_epoch_pair using the given train_step_pair."""
     def train_epoch_pair(inner_state, outer_state, xb, yb, rng, lamb, alpha,

@@ -109,6 +109,20 @@ class CBAOMConfig:
 
 
 @dataclass
+class IPSNConfig:
+    c_dim: int = 50
+    b_dim: int = 16
+    num_colors: int = 10
+    embed_dim: int = 16
+    decoder_hidden: int = 64
+    grad_rev_scale: float = 1.0
+    lambda_color: float = 1.0
+    gamma_adv: float = 0.5
+    rho_recon: float = 0.1
+    nu_cycle: float = 0.1
+
+
+@dataclass
 class SweepConfig:
     lambda_min_exp: float = -3.0
     lambda_max_exp: float = 3.0
@@ -129,6 +143,7 @@ class ExperimentConfig:
     mmd: MMDConfig = field(default_factory=MMDConfig)
     mdl: MDLConfig = field(default_factory=MDLConfig)
     cba_om: CBAOMConfig = field(default_factory=CBAOMConfig)
+    ipsn: IPSNConfig = field(default_factory=IPSNConfig)
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     sweep: SweepConfig = field(default_factory=SweepConfig)
 
@@ -160,6 +175,7 @@ def load_config(yaml_path: str) -> ExperimentConfig:
         "mmd": MMDConfig,
         "mdl": MDLConfig,
         "cba_om": CBAOMConfig,
+        "ipsn": IPSNConfig,
         "checkpointing": CheckpointingConfig,
         "sweep": SweepConfig,
     }
