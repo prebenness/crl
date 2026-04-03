@@ -233,6 +233,9 @@ def make_train_step_ipsn(cfg):
 
     Loss = CE_digit + λ·CE_color + γ·CE_adv + ρ·L1_recon + ν·cycle_KL
     Gradient reversal is handled inside the model on the c→a_s path.
+
+    Colour labels s_soft are always (B, num_colors) distributions —
+    one-hot for hard labels, soft probs for oracle predictions.
     """
     lambda_color = cfg.ipsn.lambda_color
     gamma_adv = cfg.ipsn.gamma_adv
@@ -242,39 +245,45 @@ def make_train_step_ipsn(cfg):
 
     @jax.jit
     def train_step(state, batch, rng, lamb, alpha):
-        x, y, s = batch
+        x, y, s_soft = batch  # s_soft: (B, num_colors)
 
         def loss_fn(params):
             logits, aux = state.apply_fn(
-                {"params": params}, x, s, train=True,
+                {"params": params}, x, s_soft, train=True,
             )
-            # 1. Digit classification
+            # 1. Digit classification (hard integer labels)
             ce_digit = optax.softmax_cross_entropy_with_integer_labels(
                 aux["digit_logits"], y,
             ).mean()
-            # 2. Colour classification from colour code
-            ce_color = optax.softmax_cross_entropy_with_integer_labels(
-                aux["color_logits"], s,
+            # 2. Colour classification — soft-target CE
+            ce_color = -jnp.sum(
+                s_soft * jax.nn.log_softmax(aux["color_logits"], axis=-1),
+                axis=-1,
             ).mean()
-            # 3. Adversarial colour from content code (gradient reversal
+            # 3. Adversarial — same soft-target CE (gradient reversal
             #    inside model makes this push c away from colour info)
-            ce_adv = optax.softmax_cross_entropy_with_integer_labels(
-                aux["adversary_logits"], s,
+            ce_adv = -jnp.sum(
+                s_soft * jax.nn.log_softmax(aux["adversary_logits"], axis=-1),
+                axis=-1,
             ).mean()
             # 4. Reconstruction L1
             x_recon = jax.nn.sigmoid(aux["x_recon_logits"]).reshape(x.shape)
             recon_l1 = jnp.abs(x - x_recon).mean()
 
-            # 5. Cycle consistency
+            # 5. Cycle consistency: decode to each hard colour, re-encode,
+            #    verify digit prediction is stable
             if nu_cycle > 0:
                 c = aux["c"]
                 B = x.shape[0]
                 p_orig = jax.nn.softmax(aux["digit_logits"], axis=-1)
 
-                def cycle_one_color(s_val):
-                    s_b = jnp.full((B,), s_val, dtype=jnp.int32)
+                def cycle_one_color(s_idx):
+                    s_onehot = jax.nn.one_hot(
+                        jnp.full((B,), s_idx, dtype=jnp.int32),
+                        num_colors,
+                    )  # (B, num_colors)
                     rec_logits = state.apply_fn(
-                        {"params": params}, c, s_b, method="decode",
+                        {"params": params}, c, s_onehot, method="decode",
                     )
                     x_rec = jax.nn.sigmoid(rec_logits).reshape((B, 28, 28, 3))
                     c_prime = state.apply_fn(

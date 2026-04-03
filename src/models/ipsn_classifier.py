@@ -6,7 +6,11 @@ Disentangled encoder E(x) = (c, b) with:
   - g(c): digit classifier
   - h_s(b): colour classifier
   - a_s(grad_rev(c)): colour adversary
-  - D(c, s): decoder / recolourer
+  - D(c, s_soft): decoder / recolourer
+
+Colour labels s are always soft distributions (B, num_colors).
+Hard labels (ground truth or argmax) are one-hot encoded at the boundary.
+Soft labels (oracle predicted distributions) are used directly.
 
 Reference: Ganin et al. (2016), "Domain-Adversarial Training of Neural
 Networks", JMLR 17(1), adapted as path-specific causal intervention.
@@ -21,8 +25,10 @@ import flax.linen as nn
 class IPSNMlp(nn.Module):
     """IPSN for cMNIST: shared encoder trunk + disentangled heads.
 
-    The encoder→g(c) inference path is 3 hidden ReLU layers of width 100,
+    The encoder->g(c) inference path is 3 hidden ReLU layers of width 100,
     matching the ULA protocol.  Auxiliary heads (h_s, a_s, D) are small.
+
+    Colour input s is always a soft distribution of shape (B, num_colors).
     """
     num_classes: int
     num_colors: int = 10
@@ -46,10 +52,9 @@ class IPSNMlp(nn.Module):
         self.h_s = nn.Dense(self.num_colors)
         # Colour adversary a_s(c) — single linear (gradient reversal applied externally)
         self.a_s = nn.Dense(self.num_colors)
-        # Decoder D(c, s)
-        self.dec_embed = nn.Embed(
-            num_embeddings=self.num_colors, features=self.embed_dim,
-        )
+        # Decoder D(c, s_soft): linear projection from soft colour dist to embedding
+        # Equivalent to nn.Embed lookup when s_soft is one-hot.
+        self.dec_color_proj = nn.Dense(self.embed_dim, use_bias=False)
         self.dec_hidden_layer = nn.Dense(self.decoder_hidden)
         self.dec_out = nn.Dense(28 * 28 * 3)
 
@@ -72,18 +77,30 @@ class IPSNMlp(nn.Module):
         h = nn.relu(self.g_hidden(c))
         return self.g_out(h)
 
-    def decode(self, c, s):
-        """(c, s) -> reconstruction logits (B, 2352)."""
-        s_emb = self.dec_embed(s)
+    def decode(self, c, s_soft):
+        """(c, s_soft) -> reconstruction logits (B, 2352).
+
+        Args:
+            c: content code (B, c_dim)
+            s_soft: colour distribution (B, num_colors) — one-hot or soft
+        """
+        s_emb = self.dec_color_proj(s_soft)
         h = jnp.concatenate([c, s_emb], axis=-1)
         h = nn.relu(self.dec_hidden_layer(h))
         return self.dec_out(h)
 
-    def __call__(self, x, s=None, train=True):
+    def __call__(self, x, s_soft=None, train=True):
+        """Forward pass.
+
+        Args:
+            x: images (B, 28, 28, 3)
+            s_soft: colour distribution (B, num_colors) or None (eval)
+            train: if False, only content path is used
+        """
         c, b = self.encode(x)
         digit_logits = self.classify_digit(c)
 
-        if s is None:
+        if s_soft is None:
             # Eval: content path only
             return digit_logits, {"z": c}
 
@@ -97,7 +114,7 @@ class IPSNMlp(nn.Module):
         )
         adversary_logits = self.a_s(c_rev)
 
-        x_recon_logits = self.decode(c, s)
+        x_recon_logits = self.decode(c, s_soft)
 
         return digit_logits, {
             "z": c,

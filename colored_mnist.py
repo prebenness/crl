@@ -469,9 +469,10 @@ def main(argv=None):
             print(f"CBA-OM mode: using ground-truth colour labels as oracle "
                   f"(train unique: {len(set(train_ds.colors.tolist()))})")
 
-    # Extract colour labels for IPSN
+    # Extract colour labels for IPSN (always as soft distributions)
     if mode == "ipsn":
         import jax.numpy as jnp
+        num_colors = cfg.ipsn.num_colors
         oracle_ckpt = cfg.model.oracle_checkpoint
         if oracle_ckpt:
             oracle_model = INNER_MODELS["oracle_mlp"](cfg)
@@ -482,19 +483,23 @@ def main(argv=None):
                 (cfg.training.batch_size,) + x_train.shape[1:], cfg,
             )
             oracle_state = oracle_state.replace(params=oracle_params)
+            # Hard labels via argmax — convert to one-hot
             from src.training.runners import precompute_predictions
-            s_train = precompute_predictions(
+            s_hard = precompute_predictions(
                 oracle_state, x_train, cfg.training.batch_size,
                 lambda state, x: state.apply_fn(
                     {"params": state.params}, x, train=False,
                 )[0],
             )
-            oracle_acc = float((s_train == jnp.array(
+            s_train = jax.nn.one_hot(s_hard, num_colors)
+            oracle_acc = float((s_hard == jnp.array(
                 train_ds.colors, dtype=jnp.int32)).mean())
             print(f"  IPSN: oracle colour accuracy on train: {oracle_acc:.4f}")
         else:
-            s_train = jnp.array(train_ds.colors, dtype=jnp.int32)
-            print(f"IPSN mode: using ground-truth colour labels as oracle "
+            # Ground truth — one-hot encode
+            s_hard = jnp.array(train_ds.colors, dtype=jnp.int32)
+            s_train = jax.nn.one_hot(s_hard, num_colors)
+            print(f"IPSN mode: using ground-truth colour labels (one-hot) "
                   f"(train unique: {len(set(train_ds.colors.tolist()))})")
 
     # Lambda sweep

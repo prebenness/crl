@@ -79,12 +79,13 @@ def create_state_cba_om(rng, model, input_shape, cfg):
 
 
 def create_state_ipsn(rng, model, input_shape, cfg):
-    """Initialize IPSN model state (needs dummy colour input for decoder init)."""
+    """Initialize IPSN model state (needs dummy soft colour dist for decoder init)."""
     batch_size = input_shape[0]
+    num_colors = cfg.ipsn.num_colors
     params = model.init(
         rng,
         jnp.ones(input_shape, jnp.float32),
-        jnp.zeros((batch_size,), dtype=jnp.int32),
+        jnp.ones((batch_size, num_colors), dtype=jnp.float32) / num_colors,
         train=True,
     )["params"]
     tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
