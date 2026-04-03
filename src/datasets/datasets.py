@@ -152,27 +152,31 @@ class CMNISTuLA(Dataset):
     Returns:
         (x_rgb, y) where x_rgb is float32 CHW in [0,1], y is int32 in {0..9}.
 
-    Notes / assumptions (not specified in uLA/CCDB PDFs):
-      - Exact RGB palette is not standardized in the papers; we provide a fixed 10-color palette.
-      - We colorize the *foreground digit* (background stays black). If their implementation colors
-        the background instead, you can switch the application rule later without changing the
-        correlation structure.
-      - Train/val split is not encoded here; create val by splitting indices from the biased
-        train=True dataset object (so val is also from pdata, as described).
+    Notes (resolved from LfF codebase, github.com/alinlab/LfF):
+      - RGB palette: exact values from data/resource/colors.th (see COLOR_PALETTE below).
+      - LfF colorizes foreground digit pixels (multiplied by grayscale intensity); background black.
+      - LfF adds Gaussian noise: clamp(mu_k + N(0, sigma^2 I), 0, 1) * pixel_intensity.
+        sigma depends on "severity" level: {0.05, 0.02, 0.01, 0.005} for severity {1,2,3,4}.
+      - LfF code (make_dataset.py) generates UNBIASED val (bias_aligned_ratio=0.1),
+        but uLA/CCDB use the DFA pre-built dataset which has BIASED validation sets
+        matching training bias ratio. Verified empirically from DFA Google Drive data.
     """
 
-    # 10 distinct RGB colors in [0,1]. You can change these later to match an official implementation.
+    # Exact 10 RGB colours from DFA pre-built dataset (used by uLA/CCDB).
+    # Verified empirically from google.com/drive DFA data (github.com/kakaoenterprise/
+    # Learning-Debiased-Disentangled). These are 10 evenly-spaced saturated hues with
+    # NO Gaussian noise — the DFA data does NOT use LfF's colors.th or noise model.
     COLOR_PALETTE = np.array([
-        [1.0, 0.0, 0.0],  # red
-        [0.0, 1.0, 0.0],  # green
-        [0.0, 0.0, 1.0],  # blue
-        [1.0, 1.0, 0.0],  # yellow
-        [1.0, 0.0, 1.0],  # magenta
-        [0.0, 1.0, 1.0],  # cyan
-        [1.0, 0.5, 0.0],  # orange
-        [0.5, 0.0, 1.0],  # purple
-        [0.6, 0.3, 0.0],  # brown-ish
-        [0.2, 0.8, 0.2],  # light green
+        [1.0,  0.0,  0.0 ],  # 0: red
+        [1.0,  0.502, 0.0 ],  # 1: orange
+        [1.0,  1.0,  0.0 ],  # 2: yellow
+        [0.502, 1.0,  0.0 ],  # 3: chartreuse
+        [0.0,  1.0,  0.0 ],  # 4: green
+        [0.0,  1.0,  1.0 ],  # 5: cyan
+        [0.0,  0.0,  1.0 ],  # 6: blue
+        [0.502, 0.0,  1.0 ],  # 7: purple
+        [1.0,  0.0,  0.502],  # 8: rose
+        [1.0,  0.0,  1.0 ],  # 9: magenta
     ], dtype=np.float32)
 
     # Paired color per digit. Identity mapping matches the “k paired with a distinct color” description.
