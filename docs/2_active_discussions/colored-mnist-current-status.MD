@@ -48,9 +48,31 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 - Final outer test accuracy:
   - `0.8755`
 
+### Best CBA-OM Result (2026-04-03)
+
+- Best test accuracy:
+  - `0.9047` (wd=1e-4, lr=1e-3, batch=128, 50 epochs, gt oracle)
+- Single-stage CE training on colour-conditioned classifier p(y|x,s), backdoor
+  marginalisation at test time. No distribution matching or reweighting.
+- Beats HSIC and VIB pair with far simpler pipeline; ~2 points below Oracle+MMD.
+- See session log `20260403-182900-cba-om-implementation.MD`.
+
+### Best IPSN Result (2026-04-03)
+
+- Best test accuracy:
+  - `0.838` (gamma_adv=0.05, nu_cycle=0, rho_recon=0.1, gt oracle)
+- Disentangled encoder with gradient-reversed adversary for colour invariance.
+  Adversary converges to chance (ce_adv ≈ ln(10)), confirming content code is colour-free.
+- Adversarial training is fragile: gamma_adv ≥ 0.2 causes training collapse.
+  Stable range is gamma_adv ∈ [0.05, 0.1].
+- Reconstruction weight and cycle consistency not yet tuned.
+- See session log `20260403-195000-ipsn-implementation.MD`.
+
 ## Interpretation
 
 - Oracle pair + MMD is the current best path at **0.9224**.
+- CBA-OM (0.9047) is a strong second with a much simpler pipeline.
+- IPSN (0.838) works but underperforms simpler methods; adversarial instability limits it.
 - MMD consistently beats HSIC (~0.92 vs ~0.88) with the same oracle inner model.
 - The gap to the `~96%` target is narrowing but still significant.
 - The 0.92 ceiling may be fundamental to the 3x100 MLP — needs investigation.
@@ -113,8 +135,11 @@ Best train/test gap (most color-dominant) achieved with:
 
 1. ~~Add or use explicit best-epoch selection for outer accuracy.~~ Done (2026-03-30).
 2. ~~Implement MMD conditional invariance outer loss.~~ Done (2026-04-01). See session log `20260401-200000-conditional-invariance-mmd.MD`.
-3. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
-4. Run VIB pair (non-oracle) with MMD — the real use case where inner model learns jointly.
-5. Resolve the inner model color-only regime problem for 10-class.
-6. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
-7. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.
+3. ~~Implement CBA-OM (causal backdoor adjustment).~~ Done (2026-04-03). Best 0.9047.
+4. ~~Implement IPSN (interventional path surgery network).~~ Done (2026-04-03). Best 0.838.
+5. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
+6. Run VIB pair (non-oracle) with MMD — the real use case where inner model learns jointly.
+7. IPSN tuning: sweep rho_recon, enable cycle consistency (nu_cycle), try gradient clipping for higher gamma_adv.
+8. Resolve the inner model color-only regime problem for 10-class.
+9. Continue tuning only on ULA-style models (`ula_mlp_var` + `ula_mlp`, and `mdl_mlp` + `ula_mlp`).
+10. Improve the ANBN MDL method further before leaning harder on MDL pair for cMNIST.

@@ -59,18 +59,34 @@ Training collapses at epoch 8 due to adversarial instability. ce_adv explodes fr
 | Oracle + MMD | 0.9224 |
 | CCDB target | ~0.96 |
 
+### gamma_adv sweep (nu_cycle=0, rho_recon=0.1, gt oracle)
+
+| gamma_adv | Best Test Acc | Notes |
+|-----------|--------------|-------|
+| 0.05 | **0.838** | Stable, best result |
+| 0.10 | 0.818 | Stable |
+| 0.20 | 0.113 | Collapses |
+| 0.30 | 0.113 | Collapses |
+
+### Soft colour label refactor
+
+After initial results, refactored IPSN to accept soft colour distributions (B, num_colors)
+instead of hard integer labels. `nn.Embed` replaced with `nn.Dense(embed_dim, use_bias=False)`.
+Colour and adversary losses use soft-target CE. Hard labels are one-hot encoded at the boundary.
+This enables Phase 2: using full predicted distributions from a trained inner model, not just argmax.
+
 ## Observations
 
 - Gradient reversal works: adversary converges to ce_adv ~2.3 (= ln(10), chance level), confirming content code c is colour-invariant.
 - Colour classifier also works: ce_color converges to ~0, confirming colour code b captures colour.
-- Adversarial training is inherently unstable with gamma_adv >= 0.5 for this architecture.
-- Best result (0.8366) is below VIB pair (0.8846) and CBA-OM (0.9047). The method works but doesn't yet outperform simpler approaches.
-- The gap may be addressable via hyperparameter tuning (gamma_adv, rho_recon, learning rate schedule, gradient clipping).
+- Adversarial training is fragile: gamma_adv >= 0.2 collapses. Stable range is [0.05, 0.1].
+- Best result (0.838) is below VIB pair (0.8846) and CBA-OM (0.9047). The method works but doesn't yet outperform simpler approaches.
+- Reconstruction weight, cycle consistency, and learning rate schedule remain unexplored.
 
 ## Next steps
 
-- Hyperparameter sweep: gamma_adv in {0.01, 0.05, 0.1, 0.2}, rho_recon in {0.01, 0.05, 0.1, 0.5}
+- Sweep rho_recon with gamma_adv=0.05
 - Enable cycle consistency (nu_cycle > 0) once base is tuned
-- Try gradient clipping to allow higher gamma_adv
+- Try gradient clipping to allow higher gamma_adv without collapse
 - Try learning rate warmup or adversarial weight scheduling
-- Phase 2: model oracle instead of ground truth colours
+- Phase 2: model oracle (argmax and soft predictions) instead of ground truth colours
