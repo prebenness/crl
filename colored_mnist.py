@@ -53,6 +53,8 @@ from src.training.steps import (
     make_train_step_ipsn, make_eval_step_ipsn,
     make_train_step_pair_mmd, make_train_step_oracle_pair_mmd,
     make_train_step_mdl_pair_mmd, make_train_step_mdl_shared_pair_mmd,
+    make_train_step_oracle_pair_mmd_banked,
+    make_train_step_oracle_pair_mean_match,
 )
 from src.training.epochs import (
     make_train_epoch, make_train_epoch_pair, make_eval_epoch,
@@ -60,6 +62,8 @@ from src.training.epochs import (
     make_train_epoch_cba_om,
     make_train_epoch_ipsn,
     make_train_epoch_pair_mmd, make_train_epoch_mdl_pair_mmd,
+    make_train_epoch_pair_mmd_banked,
+    make_train_epoch_pair_mean_match,
 )
 from src.training.runners import (
     run_train_eval, run_train_eval_pair,
@@ -352,10 +356,25 @@ def main(argv=None):
         oracle_outer_eval_epoch = make_eval_epoch(outer_eval_step_op)
 
         if use_mmd:
-            mmd_oracle_pair_step = make_train_step_oracle_pair_mmd(cfg)
-            mmd_oracle_pair_epoch = make_train_epoch_pair_mmd(
-                mmd_oracle_pair_step,
-            )
+            mmd_mode = getattr(cfg.mmd, "mode", "kernel")
+            if mmd_mode == "mean_match":
+                mm_step = make_train_step_oracle_pair_mean_match(cfg)
+                mm_epoch = make_train_epoch_pair_mean_match(mm_step)
+                mmd_oracle_pair_step = None
+                mmd_oracle_pair_epoch = None
+            else:
+                mm_epoch = None
+                use_bank = getattr(cfg.mmd, "bank_size", 0) > 0
+                if use_bank:
+                    mmd_oracle_pair_step = make_train_step_oracle_pair_mmd_banked(cfg)
+                    mmd_oracle_pair_epoch = make_train_epoch_pair_mmd_banked(
+                        mmd_oracle_pair_step,
+                    )
+                else:
+                    mmd_oracle_pair_step = make_train_step_oracle_pair_mmd(cfg)
+                    mmd_oracle_pair_epoch = make_train_epoch_pair_mmd(
+                        mmd_oracle_pair_step,
+                    )
 
     if mode in ("mdl", "mdl_pair"):
         mdl_step_train = make_train_step_mdl(cfg)
@@ -705,6 +724,8 @@ def main(argv=None):
                     mmd_kw = {
                         "inner_forward_fn": _forward_oracle,
                         "train_epoch_pair_mmd_fn": mmd_oracle_pair_epoch,
+                        "train_step_pair_mmd_fn": mmd_oracle_pair_step,
+                        "train_epoch_pair_mean_match_fn": mm_epoch,
                     }
                 res = run_train_eval_oracle_pair(
                     x_train, y_train, x_test, y_test,
@@ -717,6 +738,8 @@ def main(argv=None):
                     start_epoch=resume_start_epoch,
                     init_inner_params=oracle_params,
                     init_outer_params=resume_params,
+                    s_train_gt=np.array(train_ds.colors, dtype=np.int32),
+                    s_test_gt=np.array(test_ds.colors, dtype=np.int32),
                     **mmd_kw,
                 )
             elif mode == "cba_om":

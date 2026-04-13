@@ -1,0 +1,60 @@
+# Stratified batching + kernel MMD, no importance reweighting
+# python colored_mnist.py config/colored_mnist/stratified_mmd.yaml
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "oracle_pair"
+  inner: "oracle_mlp"
+  outer: "ula_mlp"
+  outer_loss: "mmd"
+  num_classes: 10
+  oracle_checkpoint: "results/colored_mnist/20260331_172654_oracle_train_cmnist_ula_oracle_train/runs/lambda_1.0e+00/checkpoints/best.npz"
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 0.0
+  weight_decay_outer: 1.0e-4
+  epochs: 200
+  batch_size: 256
+  seed: 0
+  alpha: 0.01
+
+dataloader:
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  prefetch_factor: 2
+
+controller:
+  beta_min: 0.0
+  beta_max: 1.0
+  ctrl_ki: 1.0
+
+mc_samples:
+  train: 2
+  eval: 8
+
+checkpointing:
+  restart_patience: 0
+
+mmd:
+  weight: 0.5
+  w_max: 10.0
+  smoothing_eps: 1.0e-2
+  uniform_weights: false
+  stratified: true
+  mode: "kernel"
+
+sweep:
+  lambda_min_exp: 0
+  lambda_max_exp: 0
+  lambda_steps: 1
+  log_sweep: true

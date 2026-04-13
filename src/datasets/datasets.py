@@ -408,6 +408,72 @@ def make_epoch_batches(x, y, batch_size, seed, *aux_arrays):
     return (xb, yb, *aux_batched)
 
 
+def make_stratified_epoch_batches(x, y, s, batch_size, seed, num_classes,
+                                  *aux_arrays):
+    """Build epoch batches with guaranteed coverage of all (y,s) cells.
+
+    For each batch:
+      1. Draw 1 sample from each of the K×K cells (with replacement)
+      2. Fill remaining (batch_size − K²) slots randomly from full dataset
+      3. Shuffle within batch
+
+    Returns ``(xb, yb, sb, *aux_batched)``.  The ``s`` array is both used
+    for stratification and returned as a batched output.
+    """
+    n = x.shape[0]
+    K = num_classes
+    n_cells = K * K
+    assert batch_size >= n_cells, (
+        f"batch_size ({batch_size}) must be >= num_cells ({n_cells})"
+    )
+
+    rng = np.random.default_rng(int(seed))
+
+    # Pre-compute per-cell index lists (numpy, CPU-side)
+    s_np = np.asarray(s)
+    y_np = np.asarray(y)
+    cell_indices = {}
+    for yv in range(K):
+        for sv in range(K):
+            idx = np.where((y_np == yv) & (s_np == sv))[0]
+            if len(idx) > 0:
+                cell_indices[(yv, sv)] = idx
+
+    n_fill = batch_size - len(cell_indices)
+    n_batches = n // batch_size
+
+    all_indices = np.empty((n_batches, batch_size), dtype=np.int64)
+    cells = list(cell_indices.keys())
+
+    for b in range(n_batches):
+        # 1) One sample per populated cell
+        strat = np.array(
+            [rng.choice(cell_indices[c]) for c in cells], dtype=np.int64,
+        )
+        # 2) Fill remaining slots from full dataset
+        fill = rng.choice(n, size=n_fill, replace=True)
+        batch_idx = np.concatenate([strat, fill])
+        # 3) Shuffle within batch
+        rng.shuffle(batch_idx)
+        all_indices[b] = batch_idx
+
+    idx_jax = jnp.asarray(all_indices)  # [n_batches, batch_size]
+
+    xb = jnp.take(x, idx_jax.ravel(), axis=0).reshape(
+        (n_batches, batch_size) + x.shape[1:],
+    )
+    yb = jnp.take(y, idx_jax.ravel(), axis=0).reshape((n_batches, batch_size))
+    sb = jnp.take(s, idx_jax.ravel(), axis=0).reshape((n_batches, batch_size))
+
+    result = [xb, yb, sb]
+    for arr in aux_arrays:
+        ab = jnp.take(arr, idx_jax.ravel(), axis=0).reshape(
+            (n_batches, batch_size) + arr.shape[1:],
+        )
+        result.append(ab)
+    return tuple(result)
+
+
 def make_eval_batches(x, y, batch_size):
     """Create deterministic (unshuffled) eval batches covering all samples.
 

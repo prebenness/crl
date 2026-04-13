@@ -13,7 +13,10 @@ import optax
 
 from mdl.src.mdl.coding import grid_values_and_codelengths
 from mdl.src.mdl.shared_weights import compute_p_base, epsilon_bound_simplex
-from src.loss_fns.reg_loss_fns import class_cond_hsic_rbf, class_cond_mmd_rbf
+from src.loss_fns.reg_loss_fns import (
+    class_cond_hsic_rbf, class_cond_mmd_rbf,
+    update_mmd_bank, mean_match_loss,
+)
 
 
 def _vib_loss(apply_fn, params, x, y, rng, train_mc_samples, alpha,
@@ -597,6 +600,142 @@ def make_train_step_oracle_pair_mmd(cfg):
             "hsic": jnp.array(0.0),
         }
         return inner_state, outer_state, metrics
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
+def _outer_loss_mmd_banked(outer_state, params, x, y, s, w, mmd_w,
+                           num_classes, bank_z, bank_y, bank_s):
+    """Outer loss with bank-augmented class-conditional MMD.
+
+    Identical to _outer_loss_mmd except the MMD is computed on the union of
+    the current batch and the memory bank.  Bank entries carry no gradient.
+    Also returns z so the caller can update the bank.
+    """
+    mmd_w = jnp.asarray(mmd_w, jnp.float32)
+    logits, aux = outer_state.apply_fn({"params": params}, x, train=True)
+    z = aux["z"]
+
+    ce_per_example = optax.softmax_cross_entropy_with_integer_labels(logits, y)
+    weighted_ce = jnp.sum(ce_per_example * w) / (jnp.sum(w) + 1e-8)
+
+    # Augment: batch z (has grad) + bank z (stop_gradient, entries with y=-1
+    # are automatically ignored by the MMD mask since no class matches -1).
+    z_aug = jnp.concatenate([z, lax.stop_gradient(bank_z)], axis=0)
+    y_aug = jnp.concatenate([y, bank_y], axis=0)
+    s_aug = jnp.concatenate([s, bank_s], axis=0)
+
+    mmd = class_cond_mmd_rbf(
+        z_aug, y_aug, s_aug,
+        num_classes=num_classes, num_colors=num_classes,
+    )
+
+    total = weighted_ce * (1 - mmd_w) + mmd * mmd_w
+    return total, (logits, weighted_ce, mmd, z)
+
+
+def make_train_step_oracle_pair_mmd_banked(cfg):
+    """Frozen-oracle-inner + MMD-outer with FIFO memory bank.
+
+    Bank stores raw x; bank_z is precomputed at epoch start from the current
+    encoder and passed as a constant.  Steps update bank x via FIFO.
+    """
+    bank_size = cfg.mmd.bank_size
+    num_classes_static = cfg.model.num_classes
+
+    def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,
+                        mmd_w, num_classes, bank,
+                        bank_z_epoch, bank_y_epoch, bank_s_epoch):
+        x, y, s, w = batch
+
+        # --- Inner model (oracle, frozen) ---
+        logits1, aux1 = inner_state.apply_fn(
+            {"params": inner_state.params}, x, train=False,
+        )
+
+        # --- Outer model (weighted CE + banked MMD) ---
+        def loss_fn2(params):
+            return _outer_loss_mmd_banked(
+                outer_state, params, x, y, s, w, mmd_w, num_classes,
+                bank_z_epoch, bank_y_epoch, bank_s_epoch,
+            )
+
+        (loss2, (logits2, wce2, mmd_loss, z2)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        # --- Update bank x (FIFO) ---
+        bank = update_mmd_bank(
+            bank, x, y, s, num_classes_static, bank_size,
+        )
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": wce2,
+            "mmd": mmd_loss,
+            "hsic": jnp.array(0.0),
+        }
+        return inner_state, outer_state, metrics, bank
+
+    return jax.jit(train_step_pair, static_argnames=("num_classes",))
+
+
+def make_train_step_oracle_pair_mean_match(cfg):
+    """Frozen-oracle-inner + weighted CE + EMA mean matching."""
+    ema_alpha = cfg.mmd.ema_alpha
+
+    def train_step_pair(inner_state, outer_state, batch, rng, lamb, alpha,
+                        mmd_w, num_classes, ema_state):
+        x, y, s, w = batch
+        mmd_w = jnp.asarray(mmd_w, jnp.float32)
+
+        # --- Inner model (oracle, frozen) ---
+        logits1, _ = inner_state.apply_fn(
+            {"params": inner_state.params}, x, train=False,
+        )
+
+        # --- Outer model (weighted CE + mean matching) ---
+        def loss_fn2(params):
+            logits, aux = outer_state.apply_fn(
+                {"params": params}, x, train=True,
+            )
+            z = aux["z"]
+
+            ce_per_example = optax.softmax_cross_entropy_with_integer_labels(
+                logits, y,
+            )
+            weighted_ce = jnp.sum(ce_per_example * w) / (jnp.sum(w) + 1e-8)
+
+            mm_loss, new_ema = mean_match_loss(
+                z, y, s, ema_state, num_classes, ema_alpha,
+            )
+
+            total = weighted_ce * (1 - mmd_w) + mm_loss * mmd_w
+            return total, (logits, weighted_ce, mm_loss, new_ema)
+
+        (loss2, (logits2, wce2, mm_loss, new_ema)), grads2 = (
+            jax.value_and_grad(loss_fn2, has_aux=True)(outer_state.params)
+        )
+        outer_state = outer_state.apply_gradients(grads=grads2)
+
+        acc1 = (jnp.argmax(logits1, -1) == y).mean()
+        acc2 = (jnp.argmax(logits2, -1) == y).mean()
+
+        metrics = {
+            "accuracy_inner": acc1,
+            "accuracy_outer": acc2,
+            "objective_total_outer_nats": loss2,
+            "data_nll_outer_nats": wce2,
+            "mmd": mm_loss,
+            "hsic": jnp.array(0.0),
+        }
+        return inner_state, outer_state, metrics, new_ema
 
     return jax.jit(train_step_pair, static_argnames=("num_classes",))
 

@@ -5,8 +5,11 @@ import jax
 import jax.numpy as jnp
 from jax import random as jrandom
 
-from src.datasets.datasets import make_epoch_batches, make_eval_batches
+from src.datasets.datasets import (
+    make_epoch_batches, make_eval_batches, make_stratified_epoch_batches,
+)
 from mdl.src.mdl.training import anneal_tau
+from src.loss_fns.reg_loss_fns import init_mmd_bank, init_ema_state
 from src.utils.checkpointing import (
     save_checkpoint, save_results, checkpoint_path, save_checkpoint_meta,
 )
@@ -661,7 +664,10 @@ def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
                                start_epoch=0, init_inner_params=None,
                                init_outer_params=None,
                                inner_forward_fn=None,
-                               train_epoch_pair_mmd_fn=None):
+                               train_epoch_pair_mmd_fn=None,
+                               train_step_pair_mmd_fn=None,
+                               train_epoch_pair_mean_match_fn=None,
+                               s_train_gt=None, s_test_gt=None):
     """Oracle pair training loop: frozen inner, trainable outer."""
     use_mmd = cfg.model.outer_loss == "mmd"
     rng = jrandom.PRNGKey(cfg.training.seed)
@@ -689,15 +695,47 @@ def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
     n_restarts = 0
 
     # Oracle inner is frozen — S and W are constant across epochs.
+    use_bank = False
+    use_mean_match = False
+    use_stratified = False
+    bank = None
+    ema_state = None
     if use_mmd:
         s_train = precompute_predictions(
             inner_state, x_train, cfg.training.batch_size,
             inner_forward_fn,
         )
-        w_train = compute_mmd_weights(
-            y_train, s_train, cfg.model.num_classes,
-            cfg.mmd.smoothing_eps, cfg.mmd.w_max,
-        )
+        use_stratified = getattr(cfg.mmd, "stratified", False)
+        if getattr(cfg.mmd, "uniform_weights", False):
+            w_train = jnp.ones(len(y_train), dtype=jnp.float32)
+        else:
+            w_train = compute_mmd_weights(
+                y_train, s_train, cfg.model.num_classes,
+                cfg.mmd.smoothing_eps, cfg.mmd.w_max,
+            )
+        if use_stratified:
+            print(f"  Stratified batching enabled: guaranteeing all "
+                  f"{cfg.model.num_classes**2} (y,s) cells per batch")
+        mmd_mode = getattr(cfg.mmd, "mode", "kernel")
+        if mmd_mode == "mean_match":
+            use_mean_match = True
+            z_dim = cfg.model.outer_rep_dim
+            ema_state = init_ema_state(cfg.model.num_classes, z_dim)
+            print(f"  EMA mean matching enabled: z_dim={z_dim}, "
+                  f"alpha={cfg.mmd.ema_alpha}")
+        else:
+            bank_size = getattr(cfg.mmd, "bank_size", 0)
+            bank_refresh_steps = getattr(cfg.mmd, "bank_refresh_steps", 0)
+            if bank_size > 0:
+                use_bank = True
+                x_shape = x_train.shape[1:]  # e.g. (28, 28, 3)
+                bank = init_mmd_bank(cfg.model.num_classes, bank_size, x_shape)
+                total_entries = cfg.model.num_classes ** 2 * bank_size
+                refresh_mode = (f"every {bank_refresh_steps} steps"
+                               if bank_refresh_steps > 0 else "per-epoch")
+                print(f"  MMD bank enabled: Q={bank_size}, x_shape={x_shape}, "
+                      f"total bank entries={total_entries}, "
+                      f"refresh={refresh_mode}")
 
     for ep in range(start_epoch, cfg.training.epochs):
         t0 = time.time()
@@ -705,15 +743,79 @@ def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
         rng, rng_epoch = jrandom.split(rng)
 
         if use_mmd:
-            xb, yb, sb, wb = make_epoch_batches(
-                x_train, y_train, cfg.training.batch_size, seed_tr,
-                s_train, w_train,
-            )
-            inner_state, outer_state, metrics = train_epoch_pair_mmd_fn(
-                inner_state, outer_state, xb, yb, sb, wb, rng_epoch,
-                lamb, cfg.training.alpha, cfg.mmd.weight,
-                num_classes=cfg.model.num_classes,
-            )
+            if use_stratified:
+                xb, yb, sb, wb = make_stratified_epoch_batches(
+                    x_train, y_train, s_train,
+                    cfg.training.batch_size, seed_tr,
+                    cfg.model.num_classes, w_train,
+                )
+            else:
+                xb, yb, sb, wb = make_epoch_batches(
+                    x_train, y_train, cfg.training.batch_size, seed_tr,
+                    s_train, w_train,
+                )
+            if use_mean_match:
+                inner_state, outer_state, metrics, ema_state = (
+                    train_epoch_pair_mean_match_fn(
+                        inner_state, outer_state, xb, yb, sb, wb, rng_epoch,
+                        lamb, cfg.training.alpha, cfg.mmd.weight,
+                        num_classes=cfg.model.num_classes,
+                        ema_state=ema_state,
+                    )
+                )
+            elif use_bank and bank_refresh_steps > 0:
+                # Per-N-step refresh: Python loop over JIT step fn
+                n_batches = xb.shape[0]
+                rngs = jrandom.split(rng_epoch, n_batches)
+                step_metrics_list = []
+                bank_z_fresh = bank_y_fresh = bank_s_fresh = None
+
+                for si in range(n_batches):
+                    if si % bank_refresh_steps == 0 or bank_z_fresh is None:
+                        _, baux = outer_state.apply_fn(
+                            {"params": outer_state.params},
+                            bank["x"], train=False,
+                        )
+                        bank_z_fresh = jax.lax.stop_gradient(baux["z"])
+                        bank_y_fresh = bank["y"]
+                        bank_s_fresh = bank["s"]
+
+                    inner_state, outer_state, sm, bank = (
+                        train_step_pair_mmd_fn(
+                            inner_state, outer_state,
+                            (xb[si], yb[si], sb[si], wb[si]),
+                            rngs[si], lamb, cfg.training.alpha,
+                            cfg.mmd.weight,
+                            num_classes=cfg.model.num_classes,
+                            bank=bank,
+                            bank_z_epoch=bank_z_fresh,
+                            bank_y_epoch=bank_y_fresh,
+                            bank_s_epoch=bank_s_fresh,
+                        )
+                    )
+                    step_metrics_list.append(sm)
+
+                metrics = {
+                    k: sum(float(m[k]) for m in step_metrics_list)
+                    / len(step_metrics_list)
+                    for k in step_metrics_list[0]
+                }
+            elif use_bank:
+                # Epoch-level refresh (via JIT epoch fn)
+                inner_state, outer_state, metrics, bank = (
+                    train_epoch_pair_mmd_fn(
+                        inner_state, outer_state, xb, yb, sb, wb, rng_epoch,
+                        lamb, cfg.training.alpha, cfg.mmd.weight,
+                        num_classes=cfg.model.num_classes,
+                        bank=bank,
+                    )
+                )
+            else:
+                inner_state, outer_state, metrics = train_epoch_pair_mmd_fn(
+                    inner_state, outer_state, xb, yb, sb, wb, rng_epoch,
+                    lamb, cfg.training.alpha, cfg.mmd.weight,
+                    num_classes=cfg.model.num_classes,
+                )
         else:
             xb, yb = make_epoch_batches(
                 x_train, y_train, cfg.training.batch_size, seed_tr,
@@ -803,6 +905,31 @@ def run_train_eval_oracle_pair(x_train, y_train, x_test, y_test,
     results["best_test_acc"] = best["test_acc"]
     results["best_epoch"] = best["epoch"]
     results["n_restarts"] = n_restarts
+
+    # ---- Run diagnostics on best checkpoint ----
+    if s_test_gt is not None and best["outer_params"] is not None:
+        from src.training.group_eval import (
+            run_all_diagnostics, print_diagnostics,
+        )
+        diag_state = outer_state.replace(params=best["outer_params"])
+        diag = run_all_diagnostics(
+            diag_state, x_test, y_test, s_test_gt,
+            num_classes=cfg.model.num_classes,
+            batch_size=cfg.training.batch_size,
+            y_train=y_train,
+            s_train=jnp.array(s_train_gt) if s_train_gt is not None else (
+                s_train if use_mmd else None),
+            w_train=w_train if use_mmd else None,
+        )
+        print_diagnostics(diag, num_classes=cfg.model.num_classes)
+
+        # Log scalar diagnostics to wandb and results
+        diag_scalars = {}
+        for k, v in diag.items():
+            if isinstance(v, (int, float)):
+                wandb_run.log({f"diag/{k}": v})
+                diag_scalars[k] = v
+        results["diagnostics"] = diag_scalars
 
     if run_dir is not None:
         save_checkpoint(outer_state.params,

@@ -92,6 +92,12 @@ class MMDConfig:
     weight: float = 1.0          # lambda for MMD penalty
     w_max: float = 500.0         # importance weight clip
     smoothing_eps: float = 1e-6  # Laplace smoothing for p(s|y)
+    uniform_weights: bool = False  # ablation: set all weights to 1.0
+    bank_size: int = 0           # FIFO memory bank per (y,s) cell; 0 = disabled
+    bank_refresh_steps: int = 0  # refresh bank z every N steps; 0 = per-epoch
+    mode: str = "kernel"         # "kernel" (standard MMD) or "mean_match" (EMA)
+    ema_alpha: float = 0.99      # EMA decay for mean matching
+    stratified: bool = False     # stratified batching: guarantee all (y,s) cells per batch
 
 
 @dataclass
