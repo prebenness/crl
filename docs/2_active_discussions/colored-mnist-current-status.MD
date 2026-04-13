@@ -68,16 +68,24 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 - Reconstruction weight and cycle consistency not yet tuned.
 - See session log `20260403-195000-ipsn-implementation.MD`.
 
-### FG-CCDB Replication (2026-04-03, in progress)
+### FG-CCDB Replication (2026-04-04, in progress)
 
 - Replicating Zhao, Zhang & Li, 2025 (arXiv:2505.06831v1) — current SOTA on cMNIST.
 - Paper targets: 89.02% (0.5%), 94.93% (1%), 96.18% (2%), 98.21% (5% bc_ratio).
-- Script: `fg_ccdb_replication.py` (JAX/Flax, standalone).
-- Stage 1 (BEO) works: bias prediction accuracy = 94% (paper reports 100%).
-- Stage 2 (weights) computes correctly: N_mat diagonal 96%, weight range [2e-5, 594].
-- **Stage 3 (debiased training) underperforms**: 67.75% test acc vs 98.21% target (seed=0, 5% ratio).
-- Root cause under investigation: extreme weight dynamic range causes near-exclusive minority sampling, unstable training dynamics.
-- See session log `20260403-fg-ccdb-replication-script.MD`.
+- Script: `fg_ccdb_replication.py` (JAX/Flax, standalone, 622 lines).
+- **Complete rewrite (2026-04-04)** to match their actual code, not the paper:
+  - Architecture: 4-layer CNN (`MNIST_CNN_fc`), not 3-layer MLP as paper claims.
+  - Bias labels: oracle ground truth (`if 1: pseudo_g = gt_g`), not BEO predictions.
+  - BEO trains on full data initially, not gamma=10% subsample.
+  - BEO enhancement uses CE + contrastive loss (lambda=0.001).
+  - Stage 3 uses both weighted sampling AND per-sample loss weighting (double correction).
+  - Batch affine augmentation (RandomResizedCrop + RandomRotation + Normalize).
+  - `--ula_mlp` flag switches to actual uLA 3x100 MLP; `--use_beo` uses BEO predictions.
+- Smoke test (seed=0, bc_ratio=5%): CNN+Oracle best val worst-class ~92%, MLP+Oracle 90.18% test.
+- BEO color accuracy: ~99.8%.
+- **Remaining gap (~6pp)**: training instability (val oscillates 65–97%). Possible causes: BN behavior JAX vs PyTorch, weight init differences, augmentation approximation.
+- Full sweep not yet run.
+- See session logs `20260403-fg-ccdb-replication-script.MD`, `20260404-fg-ccdb-rewrite-to-match-code.MD`.
 
 ### S3E — Spectral Spurious Subspace Elimination (2026-04-04)
 
