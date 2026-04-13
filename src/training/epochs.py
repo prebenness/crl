@@ -171,6 +171,80 @@ def make_train_epoch_pair_mmd(train_step_pair_fn):
     )
 
 
+def make_train_epoch_pair_mmd_banked(train_step_pair_fn):
+    """MMD pair epoch with memory bank.
+
+    At epoch start, forward-passes bank x through the current outer encoder
+    to get fresh bank_z.  This bank_z is constant for all steps in the epoch.
+    Steps update bank x via FIFO; bank_z is refreshed next epoch.
+    """
+    def train_epoch_pair(inner_state, outer_state, xb, yb, sb, wb, rng,
+                         lamb, alpha, mmd_w, num_classes, bank):
+        # Refresh bank z from bank x using current encoder (before updates)
+        _, bank_aux = outer_state.apply_fn(
+            {"params": outer_state.params}, bank["x"], train=False,
+        )
+        bank_z_epoch = lax.stop_gradient(bank_aux["z"])
+        bank_y_epoch = bank["y"]
+        bank_s_epoch = bank["s"]
+
+        n_batches = xb.shape[0]
+        rngs = jrandom.split(rng, n_batches)
+
+        def body(carry, inputs):
+            st1, st2, bank = carry
+            x, y, s, w, r = inputs
+            st1, st2, metrics, bank = train_step_pair_fn(
+                st1, st2, (x, y, s, w), r, lamb, alpha, mmd_w, num_classes,
+                bank, bank_z_epoch, bank_y_epoch, bank_s_epoch,
+            )
+            return (st1, st2, bank), metrics
+
+        (inner_state, outer_state, bank), metrics_history = lax.scan(
+            body, (inner_state, outer_state, bank), (xb, yb, sb, wb, rngs),
+        )
+        avg_metrics = {k: jnp.mean(v) for k, v in metrics_history.items()}
+        return inner_state, outer_state, avg_metrics, bank
+
+    return jax.jit(
+        train_epoch_pair, donate_argnums=(0, 1),
+        static_argnames=("num_classes",),
+    )
+
+
+def make_train_epoch_pair_mean_match(train_step_pair_fn):
+    """MMD pair epoch with EMA mean matching.
+
+    Carries EMA state through lax.scan so running means accumulate
+    across batches within each epoch.
+    """
+    def train_epoch_pair(inner_state, outer_state, xb, yb, sb, wb, rng,
+                         lamb, alpha, mmd_w, num_classes, ema_state):
+        n_batches = xb.shape[0]
+        rngs = jrandom.split(rng, n_batches)
+
+        def body(carry, inputs):
+            st1, st2, ema = carry
+            x, y, s, w, r = inputs
+            st1, st2, metrics, ema = train_step_pair_fn(
+                st1, st2, (x, y, s, w), r, lamb, alpha, mmd_w, num_classes,
+                ema,
+            )
+            return (st1, st2, ema), metrics
+
+        (inner_state, outer_state, ema_state), metrics_history = lax.scan(
+            body, (inner_state, outer_state, ema_state),
+            (xb, yb, sb, wb, rngs),
+        )
+        avg_metrics = {k: jnp.mean(v) for k, v in metrics_history.items()}
+        return inner_state, outer_state, avg_metrics, ema_state
+
+    return jax.jit(
+        train_epoch_pair, donate_argnums=(0, 1),
+        static_argnames=("num_classes",),
+    )
+
+
 def make_train_epoch_mdl_pair_mmd(train_step_pair_fn):
     """Return a JIT-compiled MMD pair train_epoch (MDL/shared-MDL inner)."""
     def train_epoch_pair(inner_state, outer_state, xb, yb, sb, wb, rng,

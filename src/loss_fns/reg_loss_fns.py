@@ -79,6 +79,61 @@ def effective_rank_penalty(z, eps=1e-10):
     return R_eff
 
 
+def init_ema_state(num_classes, z_dim):
+    """Initialize EMA state for mean matching."""
+    K, D = num_classes, z_dim
+    return {
+        "means": jnp.zeros((K, K, D), dtype=jnp.float32),
+        "valid": jnp.zeros((K, K), dtype=jnp.float32),
+    }
+
+
+def mean_match_loss(z, y, s, ema_state, num_classes, ema_alpha, eps=1e-8):
+    """EMA mean matching invariance loss.
+
+    For each (y,s) cell present in the batch, computes the batch cell mean
+    and penalizes its deviation from the EMA class mean (stop-gradiented).
+    Then updates the EMA with the batch cell means.
+
+    Returns (loss, updated_ema_state).
+    """
+    K = num_classes
+    D = z.shape[-1]
+
+    # Compute per-cell batch means
+    y_oh = jax.nn.one_hot(y, K)                     # [B, K]
+    s_oh = jax.nn.one_hot(s, K)                     # [B, K]
+    cell_mask = y_oh[:, :, None] * s_oh[:, None, :]  # [B, K, K]
+    cell_sum = jnp.einsum("bcs,bd->csd", cell_mask, z)  # [K, K, D]
+    cell_count = cell_mask.sum(axis=0)                # [K, K]
+    cell_present = (cell_count > 0).astype(jnp.float32)  # [K, K]
+    batch_cell_mean = cell_sum / (cell_count[..., None] + eps)  # [K, K, D]
+
+    # Class means from EMA (average over all valid colors for each class)
+    ema_valid = ema_state["valid"]                     # [K, K]
+    ema_means = ema_state["means"]                     # [K, K, D]
+    valid_count = ema_valid.sum(axis=1, keepdims=True) + eps  # [K, 1]
+    class_mean_ema = (ema_means * ema_valid[..., None]).sum(axis=1) / valid_count  # [K, D]
+
+    # Loss: deviation of batch cell means from class mean (stop-grad target)
+    target = lax.stop_gradient(class_mean_ema)         # [K, D]
+    deviation = batch_cell_mean - target[:, None, :]   # [K, K, D]
+    sq_dev = (deviation ** 2).sum(axis=-1)             # [K, K]
+    loss = (sq_dev * cell_present).sum() / (cell_present.sum() + eps)
+
+    # EMA update (stop-gradient on batch means for storage)
+    sg_batch = lax.stop_gradient(batch_cell_mean)
+    updated_means = jnp.where(
+        cell_present[..., None] > 0,
+        ema_alpha * ema_means + (1 - ema_alpha) * sg_batch,
+        ema_means,
+    )
+    updated_valid = jnp.maximum(ema_valid, cell_present)
+
+    new_ema = {"means": updated_means, "valid": updated_valid}
+    return loss, new_ema
+
+
 def _standardize(z: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     """Per-dimension z-score standardization for kernel stability."""
     return (z - z.mean(axis=0, keepdims=True)) / (z.std(axis=0, keepdims=True) + eps)
@@ -191,6 +246,62 @@ def class_cond_mmd_rbf(
     all_vals, all_counts = jax.vmap(mmd_for_class)(classes)
     total_valid = jnp.sum(all_counts)
     return jnp.sum(all_vals) / (total_valid + eps)
+
+
+def init_mmd_bank(num_classes, bank_size, x_shape):
+    """Initialize an empty FIFO memory bank for class-conditional MMD.
+
+    Stores raw inputs x so that z can be recomputed from the current encoder.
+
+    Returns a dict with:
+        x:   [K*K*Q, *x_shape]  stored inputs (zeros)
+        y:   [K*K*Q]            class labels (-1 = empty)
+        s:   [K*K*Q]            color labels (-1 = empty)
+        ptr: [K, K]             next write position per (y,s) cell
+    """
+    K, Q = num_classes, bank_size
+    total = K * K * Q
+    return {
+        "x": jnp.zeros((total,) + tuple(x_shape), dtype=jnp.float32),
+        "y": jnp.full((total,), -1, dtype=jnp.int32),
+        "s": jnp.full((total,), -1, dtype=jnp.int32),
+        "ptr": jnp.zeros((K, K), dtype=jnp.int32),
+    }
+
+
+def update_mmd_bank(bank, x, y, s, num_classes, bank_size):
+    """FIFO update: push current batch's (x, y, s) into the bank.
+
+    Vectorized scatter — computes per-sample within-cell offsets to avoid
+    collisions, then writes all samples in one scatter operation.
+    """
+    K, Q = num_classes, bank_size
+    B = x.shape[0]
+
+    # Compute within-cell offsets: for sample i, how many earlier samples
+    # in this batch share the same (y, s) cell?
+    cell_id = y * K + s  # [B]
+    same_cell = (cell_id[:, None] == cell_id[None, :])  # [B, B]
+    lower = jnp.tril(jnp.ones((B, B), dtype=jnp.bool_), k=-1)
+    offsets = jnp.sum(same_cell & lower, axis=1)  # [B]
+
+    # Compute flat write indices
+    ptr_base = bank["ptr"][y, s]  # [B]
+    slot = (ptr_base + offsets) % Q  # [B]
+    flat_idx = y * (K * Q) + s * Q + slot  # [B]
+
+    # Scatter writes
+    new_x = bank["x"].at[flat_idx].set(x)
+    new_y = bank["y"].at[flat_idx].set(y)
+    new_s = bank["s"].at[flat_idx].set(s)
+
+    # Advance pointers by per-cell batch counts
+    y_oh = jax.nn.one_hot(y, K)  # [B, K]
+    s_oh = jax.nn.one_hot(s, K)  # [B, K]
+    cell_counts = (y_oh.T @ s_oh).astype(jnp.int32)  # [K, K]
+    new_ptr = bank["ptr"] + cell_counts
+
+    return {"x": new_x, "y": new_y, "s": new_s, "ptr": new_ptr}
 
 
 def _weighted_center_gram(K: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
