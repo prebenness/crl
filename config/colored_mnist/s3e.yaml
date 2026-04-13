@@ -1,0 +1,47 @@
+# S3E: Spectral Spurious Subspace Elimination
+# Usage: python s3e.py config/colored_mnist/s3e.yaml [overrides...]
+# Example: python s3e.py config/colored_mnist/s3e.yaml s3e.phase1_epochs=3
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "s3e"
+  inner: "ula_mlp"
+  num_classes: 10
+  outer_rep_dim: 100
+  oracle_checkpoint: ""   # empty = ground-truth colours
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-4
+  batch_size: 128
+  seed: 0
+
+s3e:
+  num_colors: 10
+  phase1_epochs: 20
+  probe_lr: 1.0e-3
+  probe_epochs: 50
+  probe_l2: 1.0e-2
+  phase4_epochs: 50
+  phase4_lr: 1.0e-3
+  phase4_wd: 0.0
+  reweight: false
+  reweight_w_max: 500.0
+  reweight_smoothing_eps: 1.0e-6
+
+checkpointing:
+  early_stopping_patience: 15
+
+sweep:
+  lambda_min_exp: 1        # r values via linspace
+  lambda_max_exp: 9
+  lambda_steps: 9
+  log_sweep: false

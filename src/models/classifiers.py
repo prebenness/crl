@@ -80,9 +80,9 @@ class ULAMLPClassifier(nn.Module):
         x = nn.Dense(100)(x); z = nn.relu(x)
         h = nn.Dense(100)(z); h = nn.relu(h)
 
-        # z is penpenultimate rep (100-d)
+        # z is penpenultimate rep (100-d), h is penultimate (100-d)
         logits = nn.Dense(self.num_classes)(h)
-        return logits, {"z": z}
+        return logits, {"z": z, "h": h}
 
 
 class CBAOMMlp(nn.Module):

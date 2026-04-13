@@ -79,10 +79,25 @@ The near-term target is to approach the `~96%` cMNIST result range discussed in 
 - Root cause under investigation: extreme weight dynamic range causes near-exclusive minority sampling, unstable training dynamics.
 - See session log `20260403-fg-ccdb-replication-script.MD`.
 
+### S3E — Spectral Spurious Subspace Elimination (2026-04-04)
+
+- Removes spurious colour information from ERM representations via spectral identification and orthogonal projection.
+  Inspired by concept erasure (Ravfogel et al., 2020, "Null it out", ACL; Ravfogel et al., 2022, "Linear adversarial concept erasure", ICML).
+- 4-phase pipeline: ERM backbone → colour probe + SVD → orthogonal projection → retrain linear head.
+- Script: `s3e.py` (JAX/Flax, standalone). Config: `config/colored_mnist/s3e.yaml`.
+- Best test accuracy:
+  - **`0.8747`** (r=9, GT oracle, seed=0, phase1=20ep, probe=50ep, phase4=50ep)
+- Accuracy increases monotonically with r (more colour dimensions removed → better).
+  Best result removes 99.9% of probe variance — the entire colour subspace.
+- Modest lift over vanilla ERM (~0.86-0.87). Beats IPSN (0.838), trails CBA-OM (0.905) and Oracle+MMD (0.922).
+- Remaining: longer backbone training, reweighting ablation, seed sweep, model oracle, deeper Phase 4 head.
+- See session log `20260404-001800-s3e-implementation.MD` and `s3e-evaluation-plan.MD`.
+
 ## Interpretation
 
 - Oracle pair + MMD is the current best path at **0.9224**.
 - CBA-OM (0.9047) is a strong second with a much simpler pipeline.
+- S3E (0.8747) is a modest improvement over ERM, but trails distribution-matching approaches. May improve with longer backbone training or deeper Phase 4 head.
 - IPSN (0.838) works but underperforms simpler methods; adversarial instability limits it.
 - MMD consistently beats HSIC (~0.92 vs ~0.88) with the same oracle inner model.
 - The gap to the `~96%` target is narrowing but still significant.
@@ -148,8 +163,9 @@ Best train/test gap (most color-dominant) achieved with:
 2. ~~Implement MMD conditional invariance outer loss.~~ Done (2026-04-01). See session log `20260401-200000-conditional-invariance-mmd.MD`.
 3. ~~Implement CBA-OM (causal backdoor adjustment).~~ Done (2026-04-03). Best 0.9047.
 4. ~~Implement IPSN (interventional path surgery network).~~ Done (2026-04-03). Best 0.838.
-5. **FG-CCDB replication: debug Stage 3 accuracy gap** (67% vs 98%). Investigate BEO accuracy (94% vs 100%), weight dynamics, and optimizer equivalence.
-6. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
+5. **S3E smoke test + baseline sweep** (r=1..9, GT oracle). Compare best r against Oracle+MMD (0.9224).
+6. **FG-CCDB replication: debug Stage 3 accuracy gap** (67% vs 98%). Investigate BEO accuracy (94% vs 100%), weight dynamics, and optimizer equivalence.
+7. Break the 0.92 MMD plateau: try different seeds, stronger regularization, LR scheduling.
 7. Run VIB pair (non-oracle) with MMD — the real use case where inner model learns jointly.
 8. IPSN tuning: sweep rho_recon, enable cycle consistency (nu_cycle), try gradient clipping for higher gamma_adv.
 9. Resolve the inner model color-only regime problem for 10-class.
