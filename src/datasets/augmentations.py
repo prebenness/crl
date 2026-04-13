@@ -72,8 +72,7 @@ def random_hflip(rng, images):
         rng: PRNG key.
         images: (B, H, W, C) array.
     """
-    rngs = jax.random.split(rng, images.shape[0])
-    flip = jax.random.bernoulli(rngs[:, 0], 0.5, (images.shape[0],))
+    flip = jax.random.bernoulli(rng, 0.5, (images.shape[0],))
     return jnp.where(flip[:, None, None, None], images[:, :, ::-1, :], images)
 
 
@@ -129,3 +128,21 @@ def celeba_eval_transform(images):
     images = center_crop(images, 178, 178)
     images = resize(images, 224)
     return normalize_imagenet(images)
+
+
+def ccifar10_train_augment(rng, images):
+    """Train augmentation for cCIFAR-10: pad 4 + random crop 32x32 + hflip + normalize.
+
+    Standard CIFAR-10 augmentation pipeline (He et al. 2016).
+    Expects images in NHWC float32 [0, 1].
+    """
+    rng1, rng2 = jax.random.split(rng)
+    images = jnp.pad(images, ((0, 0), (4, 4), (4, 4), (0, 0)))  # 32 -> 40
+    images = random_crop(rng1, images, 32, 32)
+    images = random_hflip(rng2, images)
+    return normalize_cifar10(images)
+
+
+def ccifar10_eval_transform(images):
+    """Eval transform for cCIFAR-10: CIFAR-10 normalize only."""
+    return normalize_cifar10(images)

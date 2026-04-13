@@ -1,0 +1,36 @@
+# JEPA-OT on cCIFAR-10 with ResNet-18 encoder.
+# Usage: python jepa_ot.py config/ccifar10/jepa_ot.yaml [overrides...]
+# Example: python jepa_ot.py config/ccifar10/jepa_ot.yaml jepa_ot.lambda_ot=0.5
+
+wandb:
+  entity: "prebenness-crl"
+  project: "ccifar10"
+
+dataset:
+  name: "ccifar10"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "jepa_ot"
+  num_classes: 10
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-4
+  batch_size: 128
+  seed: 0
+
+jepa_ot:
+  encoder: "resnet18"
+  num_colors: 10
+  z_dim: 512
+  predictor_hidden_dim: 256
+  lambda_ot: 0.1
+  ema_tau: 0.996
+  sinkhorn_eps: 1.0
+  sinkhorn_iters: 10
+  epochs: 50
+
+checkpointing:
+  early_stopping_patience: 20

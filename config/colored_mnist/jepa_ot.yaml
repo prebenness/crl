@@ -1,0 +1,34 @@
+# JEPA-OT: Action-Conditioned JEPA with Latent Counterfactuals via Sinkhorn Alignment
+# Usage: python jepa_ot.py config/colored_mnist/jepa_ot.yaml [overrides...]
+# Example: python jepa_ot.py config/colored_mnist/jepa_ot.yaml jepa_ot.lambda_ot=0.5
+
+wandb:
+  entity: "prebenness-crl"
+  project: "colored-mnist-vib"
+
+dataset:
+  name: "cmnist_ula"
+  p_train: 0.95
+  p_test: 0.1
+
+model:
+  mode: "jepa_ot"
+  num_classes: 10
+
+training:
+  lr: 1.0e-3
+  weight_decay_inner: 1.0e-4
+  batch_size: 128
+  seed: 0
+
+jepa_ot:
+  num_colors: 10
+  z_dim: 100
+  lambda_ot: 1.0
+  ema_tau: 0.996
+  sinkhorn_eps: 1.0
+  sinkhorn_iters: 10
+  epochs: 100
+
+checkpointing:
+  early_stopping_patience: 20
