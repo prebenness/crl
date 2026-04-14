@@ -1,6 +1,6 @@
-# JEPA-OT: Action-Conditioned JEPA with Latent Counterfactuals via Sinkhorn Alignment
+# VICReg-OT: Counterfactual Optimal Transport with VICReg Collapse Prevention
 # Usage: python jepa_ot.py config/colored_mnist/jepa_ot.yaml [overrides...]
-# Example: python jepa_ot.py config/colored_mnist/jepa_ot.yaml jepa_ot.lambda_ot=0.5
+# Example: python jepa_ot.py config/colored_mnist/jepa_ot.yaml jepa_ot.lambda_inv=0.5
 
 wandb:
   entity: "prebenness-crl"
@@ -24,8 +24,10 @@ training:
 jepa_ot:
   num_colors: 10
   z_dim: 100
-  lambda_ot: 1.0
-  ema_tau: 0.996
+  lambda_inv: 1.0
+  lambda_var: 25.0
+  lambda_cov: 1.0
+  vicreg_gamma: 1.0
   sinkhorn_eps: 1.0
   sinkhorn_iters: 10
   epochs: 100
