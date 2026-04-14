@@ -33,6 +33,3 @@ jepa_ot:
   sinkhorn_eps: 1.0
   sinkhorn_iters: 10
   epochs: 50
-
-checkpointing:
-  early_stopping_patience: 20

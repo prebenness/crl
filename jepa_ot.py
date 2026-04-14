@@ -816,8 +816,6 @@ def main(argv=None):
     best = {"test_acc": -1.0, "params": None,
             "batch_stats": None, "epoch": 0}
     np_rng = np.random.RandomState(cfg.training.seed + 42)
-    early_patience = cfg.checkpointing.early_stopping_patience
-    epochs_since_best = 0
 
     for ep in range(jot_cfg.epochs):
         t0 = time.time()
@@ -846,7 +844,6 @@ def main(argv=None):
             best["params"] = jax.tree.map(jnp.copy, params)
             best["batch_stats"] = jax.tree.map(jnp.copy, batch_stats)
             best["epoch"] = ep + 1
-            epochs_since_best = 0
             save_checkpoint(
                 best["params"], checkpoint_path(run_dir, "best.npz"),
             )
@@ -854,8 +851,6 @@ def main(argv=None):
                 run_dir, ep + 1, best["test_acc"], best["epoch"],
             )
             print(f"    >>> NEW BEST test_acc={te_acc:.4f} (epoch {ep+1})")
-        else:
-            epochs_since_best += 1
 
         wandb_run.log({
             "train/loss_ce_u": ep_metrics["loss_ce_u"],
@@ -880,11 +875,6 @@ def main(argv=None):
               f"  train_acc {ep_metrics['accuracy']:.4f}"
               f"  test_acc {te_acc:.4f}"
               f"  ({time.time()-t0:.2f}s)")
-
-        if early_patience > 0 and epochs_since_best >= early_patience:
-            print(f"  Early stopping at epoch {ep+1} "
-                  f"(no improvement for {early_patience} epochs)")
-            break
 
     # ---- Save final state ----
     save_checkpoint(params, checkpoint_path(run_dir, "final.npz"))
