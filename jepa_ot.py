@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""JEPA-OT: Action-Conditioned JEPA with Latent Counterfactuals via Sinkhorn Alignment.
+"""VICReg-OT: Counterfactual Optimal Transport with VICReg Collapse Prevention.
 
 Decoder-free framework for learning unbiased classifiers under extreme spurious
-correlations. Uses JEPA-style online/EMA-target encoders, an interventional
-predictor for counterfactual latent translation, and Sinkhorn OT alignment.
+correlations. A single online encoder processes both anchor and bias-conflicting
+samples; VICReg regularization (variance + covariance) replaces the EMA target
+encoder for collapse prevention. An interventional predictor with FiLM
+conditioning performs counterfactual latent translation, aligned via class-
+conditional Sinkhorn OT. The classifier trains on a 50/50 mix of hallucinated
+(debiased) and raw anchor representations.
 
 References:
-  - Assran et al. 2023, "Self-Supervised Learning from Images with a
-    Joint-Embedding Predictive Architecture", CVPR (arXiv:2301.08243)
+  - Bardes, Ponce & LeCun 2022, "VICReg: Variance-Invariance-Covariance
+    Regularization for Self-Supervised Learning", ICLR (arXiv:2105.04906)
   - Feydy et al. 2019, "Interpolating between Optimal Transport and MMD
     using Sinkhorn Divergences", AISTATS (arXiv:1810.08278)
-  - Tarvainen & Valpola 2017, "Mean teachers are better role models",
-    NeurIPS (arXiv:1703.01780)
 
 Usage:
     python jepa_ot.py config/colored_mnist/jepa_ot.yaml [overrides...]
 
 Example:
-    python jepa_ot.py config/colored_mnist/jepa_ot.yaml jepa_ot.lambda_ot=0.5
+    python jepa_ot.py config/colored_mnist/jepa_ot.yaml jepa_ot.lambda_inv=0.5
 """
 
 import argparse
@@ -60,8 +62,10 @@ class JEPAOTConfig:
     num_colors: int = 10
     z_dim: int = 100
     predictor_hidden_dim: int = 128
-    lambda_ot: float = 1.0
-    ema_tau: float = 0.996
+    lambda_inv: float = 1.0
+    lambda_var: float = 25.0
+    lambda_cov: float = 1.0
+    vicreg_gamma: float = 1.0
     sinkhorn_eps: float = 1.0
     sinkhorn_iters: int = 10
     epochs: int = 100
@@ -374,6 +378,34 @@ def class_cond_sinkhorn_divergence(z_pred, z_target, y, num_classes,
 
 
 # ============================================================
+# VICReg Regularization (Bardes et al. 2022, arXiv:2105.04906)
+# ============================================================
+
+def vicreg_variance_loss(z, gamma=1.0, eps=1e-4):
+    """VICReg variance hinge: penalizes per-dimension std below gamma.
+
+    Prevents mode collapse by requiring each latent dimension to maintain
+    at least gamma standard deviation across the batch.
+    """
+    std = jnp.sqrt(jnp.var(z, axis=0) + eps)
+    return jnp.mean(jnp.maximum(0.0, gamma - std))
+
+
+def vicreg_covariance_loss(z):
+    """VICReg covariance: penalizes off-diagonal correlations.
+
+    Decorrelates latent dimensions by driving the off-diagonal entries
+    of the batch covariance matrix toward zero.
+    """
+    z_c = z - jnp.mean(z, axis=0)
+    n = z.shape[0]
+    cov = (z_c.T @ z_c) / (n - 1)
+    D = cov.shape[0]
+    off_diag = cov - jnp.diag(jnp.diag(cov))
+    return jnp.sum(off_diag ** 2) / D
+
+
+# ============================================================
 # Bias-Conflicting Sample Pool
 # ============================================================
 
@@ -619,8 +651,6 @@ def main(argv=None):
         "predictor": pred_params,
         "classifier": cls_params,
     }
-    target_params = jax.tree.map(jnp.copy, enc_params)
-    target_batch_stats = jax.tree.map(jnp.copy, batch_stats)
 
     tx = optax.adamw(cfg.training.lr, cfg.training.weight_decay_inner)
     opt_state = tx.init(params)
@@ -633,17 +663,17 @@ def main(argv=None):
     print(f"  Predictor params:  {n_pred:,}")
     print(f"  Classifier params: {n_cls:,}")
     print(f"  Total trainable:   {n_enc + n_pred + n_cls:,}")
-    print(f"  Target (EMA) copy: {n_enc:,}")
 
     # ---- Build JIT-compiled functions ----
     eps = jot_cfg.sinkhorn_eps
     n_iters = jot_cfg.sinkhorn_iters
-    lambda_ot = jot_cfg.lambda_ot
-    ema_tau = jot_cfg.ema_tau
+    lambda_inv = jot_cfg.lambda_inv
+    lambda_var = jot_cfg.lambda_var
+    lambda_cov = jot_cfg.lambda_cov
+    vicreg_gamma = jot_cfg.vicreg_gamma
 
     @jax.jit
-    def train_step(params, target_params, batch_stats, target_batch_stats,
-                   opt_state, x_a, y_a, x_c, s_c, rng):
+    def train_step(params, batch_stats, opt_state, x_a, y_a, x_c, s_c, rng):
         rng, rng_s = jrandom.split(rng)
         s_rand = jrandom.randint(rng_s, y_a.shape, 0, num_colors)
 
@@ -654,54 +684,70 @@ def main(argv=None):
             x_c = augment_fn(rng_aug_c, x_c)
 
         def loss_fn(params):
-            # Online encoder (mutable batch_stats for BN — no-op for MLP)
-            z_online, new_enc_vars = encoder.apply(
+            # Single shared encoder: concatenate anchors + BC samples for
+            # correct BN statistics, then split.  Both z_a and z_c carry
+            # gradients — no EMA target, no stop-gradient.
+            x_both = jnp.concatenate([x_a, x_c], axis=0)
+            z_both, new_enc_vars = encoder.apply(
                 {"params": params["encoder"], "batch_stats": batch_stats},
-                x_a, train=True, mutable=["batch_stats"],
+                x_both, train=True, mutable=["batch_stats"],
             )
             new_bs = new_enc_vars.get("batch_stats", batch_stats)
+            z_a, z_c = jnp.split(z_both, 2, axis=0)
 
-            # Target encoder (detached, eval mode)
-            z_target = lax.stop_gradient(
-                encoder.apply(
-                    {"params": target_params,
-                     "batch_stats": target_batch_stats},
-                    x_c, train=False,
-                ),
-            )
+            # -- Geometry: OT invariance + VICReg --
 
-            # Phase 1: counterfactual translation + OT alignment
-            # Stop-gradient on encoder: only the predictor receives OT
-            # gradients.  The encoder learns from CE alone (through the
-            # predictor -> classifier path), avoiding the feedback loop
-            # where OT and CE fight over the encoder once CE converges.
+            # Counterfactual translation: predict z_a as if it had color s_c
             s_c_oh = jax.nn.one_hot(s_c, num_colors)
             z_hat_trans = predictor.apply(
-                {"params": params["predictor"]},
-                lax.stop_gradient(z_online), s_c_oh,
-            )
-            l_ot = class_cond_sinkhorn_divergence(
-                z_hat_trans, z_target, y_a, num_classes, eps, n_iters,
+                {"params": params["predictor"]}, z_a, s_c_oh,
             )
 
-            # Phase 2: hallucinated classification
+            # Sinkhorn alignment (class-conditional, L2-normalized inside)
+            l_inv = class_cond_sinkhorn_divergence(
+                z_hat_trans, z_c, y_a, num_classes, eps, n_iters,
+            )
+
+            # VICReg: prevent collapse and decorrelate dimensions
+            l_var = (vicreg_variance_loss(z_hat_trans, gamma=vicreg_gamma)
+                     + vicreg_variance_loss(z_c, gamma=vicreg_gamma))
+            l_cov = (vicreg_covariance_loss(z_hat_trans)
+                     + vicreg_covariance_loss(z_c))
+
+            l_geom = lambda_inv * l_inv + lambda_var * l_var + lambda_cov * l_cov
+
+            # -- Task: mixed CE on hallucinated + raw representations --
+
+            # Hallucinated CE (debiased: random color)
             s_rand_oh = jax.nn.one_hot(s_rand, num_colors)
             z_hat_u = predictor.apply(
-                {"params": params["predictor"]}, z_online, s_rand_oh,
+                {"params": params["predictor"]}, z_a, s_rand_oh,
             )
-            logits = classifier.apply(
+            logits_u = classifier.apply(
                 {"params": params["classifier"]}, z_hat_u,
             )
-            l_ce = optax.softmax_cross_entropy_with_integer_labels(
-                logits, y_a,
+            l_ce_u = optax.softmax_cross_entropy_with_integer_labels(
+                logits_u, y_a,
             ).mean()
 
-            total = l_ce + lambda_ot * l_ot
-            acc = (jnp.argmax(logits, -1) == y_a).mean()
+            # Direct anchor CE (raw encoder output)
+            logits_a = classifier.apply(
+                {"params": params["classifier"]}, z_a,
+            )
+            l_ce_a = optax.softmax_cross_entropy_with_integer_labels(
+                logits_a, y_a,
+            ).mean()
+
+            l_task = 0.5 * l_ce_u + 0.5 * l_ce_a
+
+            total = l_task + l_geom
+            acc = (jnp.argmax(logits_u, -1) == y_a).mean()
             return total, {
-                "loss_ce": l_ce, "loss_ot": l_ot,
-                "loss_total": total, "accuracy": acc,
-                "new_batch_stats": new_bs,
+                "loss_ce_u": l_ce_u, "loss_ce_a": l_ce_a,
+                "loss_task": l_task, "loss_inv": l_inv,
+                "loss_var": l_var, "loss_cov": l_cov,
+                "loss_geom": l_geom, "loss_total": total,
+                "accuracy": acc, "new_batch_stats": new_bs,
             }
 
         (loss, metrics), grads = jax.value_and_grad(
@@ -713,18 +759,7 @@ def main(argv=None):
         updates, new_opt_state = tx.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        # EMA update for target encoder (params + batch_stats)
-        new_target_params = jax.tree.map(
-            lambda t, o: ema_tau * t + (1.0 - ema_tau) * o,
-            target_params, new_params["encoder"],
-        )
-        new_target_batch_stats = jax.tree.map(
-            lambda t, o: ema_tau * t + (1.0 - ema_tau) * o,
-            target_batch_stats, new_batch_stats,
-        )
-
-        return (new_params, new_target_params, new_target_batch_stats,
-                new_batch_stats, new_opt_state, metrics)
+        return new_params, new_batch_stats, new_opt_state, metrics
 
     eval_accuracy = make_eval_fn(
         encoder, predictor, classifier, num_colors, num_classes,
@@ -733,12 +768,13 @@ def main(argv=None):
 
     # ---- Training loop ----
     print("\n" + "=" * 60)
-    print("Training JEPA-OT")
-    print(f"  epochs={jot_cfg.epochs}  lambda_ot={lambda_ot}  "
-          f"ema_tau={ema_tau}  sinkhorn_eps={eps}")
+    print("Training VICReg-OT")
+    print(f"  epochs={jot_cfg.epochs}  lambda_inv={lambda_inv}  "
+          f"lambda_var={lambda_var}  lambda_cov={lambda_cov}  "
+          f"sinkhorn_eps={eps}")
     print("=" * 60)
 
-    best = {"test_acc": -1.0, "params": None, "target_params": None,
+    best = {"test_acc": -1.0, "params": None,
             "batch_stats": None, "epoch": 0}
     np_rng = np.random.RandomState(cfg.training.seed + 42)
     early_patience = cfg.checkpointing.early_stopping_patience
@@ -753,18 +789,18 @@ def main(argv=None):
         xb_c, sb_c = pool.sample_epoch(yb, np_rng)
 
         ep_metrics = {
-            "loss_ce": 0.0, "loss_ot": 0.0,
-            "loss_total": 0.0, "accuracy": 0.0,
+            "loss_ce_u": 0.0, "loss_ce_a": 0.0, "loss_task": 0.0,
+            "loss_inv": 0.0, "loss_var": 0.0, "loss_cov": 0.0,
+            "loss_geom": 0.0, "loss_total": 0.0, "accuracy": 0.0,
         }
         n_batches = xb.shape[0]
 
         for i in range(n_batches):
 
             rng, rng_step = jrandom.split(rng)
-            (params, target_params, target_batch_stats,
-             batch_stats, opt_state, metrics) = train_step(
-                params, target_params, batch_stats, target_batch_stats,
-                opt_state, xb[i], yb[i], xb_c[i], sb_c[i], rng_step,
+            params, batch_stats, opt_state, metrics = train_step(
+                params, batch_stats, opt_state,
+                xb[i], yb[i], xb_c[i], sb_c[i], rng_step,
             )
 
             for k in ep_metrics:
@@ -778,7 +814,6 @@ def main(argv=None):
         if te_acc > best["test_acc"]:
             best["test_acc"] = te_acc
             best["params"] = jax.tree.map(jnp.copy, params)
-            best["target_params"] = jax.tree.map(jnp.copy, target_params)
             best["batch_stats"] = jax.tree.map(jnp.copy, batch_stats)
             best["epoch"] = ep + 1
             epochs_since_best = 0
@@ -793,8 +828,13 @@ def main(argv=None):
             epochs_since_best += 1
 
         wandb_run.log({
-            "train/loss_ce": ep_metrics["loss_ce"],
-            "train/loss_ot": ep_metrics["loss_ot"],
+            "train/loss_ce_u": ep_metrics["loss_ce_u"],
+            "train/loss_ce_a": ep_metrics["loss_ce_a"],
+            "train/loss_task": ep_metrics["loss_task"],
+            "train/loss_inv": ep_metrics["loss_inv"],
+            "train/loss_var": ep_metrics["loss_var"],
+            "train/loss_cov": ep_metrics["loss_cov"],
+            "train/loss_geom": ep_metrics["loss_geom"],
             "train/loss_total": ep_metrics["loss_total"],
             "train/accuracy": ep_metrics["accuracy"],
             "test/accuracy": te_acc,
@@ -803,8 +843,10 @@ def main(argv=None):
         })
 
         print(f"  Epoch {ep+1}/{jot_cfg.epochs}"
-              f"  CE {ep_metrics['loss_ce']:.4f}"
-              f"  OT {ep_metrics['loss_ot']:.6f}"
+              f"  task {ep_metrics['loss_task']:.4f}"
+              f"  inv {ep_metrics['loss_inv']:.6f}"
+              f"  var {ep_metrics['loss_var']:.4f}"
+              f"  cov {ep_metrics['loss_cov']:.4f}"
               f"  train_acc {ep_metrics['accuracy']:.4f}"
               f"  test_acc {te_acc:.4f}"
               f"  ({time.time()-t0:.2f}s)")

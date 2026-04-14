@@ -1,8 +1,8 @@
-# JEPA-OT Tuning Plan
+# VICReg-OT Tuning Plan
 
 ## Method
 
-JEPA-OT: Action-Conditioned JEPA with Latent Counterfactuals via Sinkhorn Alignment.
+VICReg-OT: Counterfactual Optimal Transport with VICReg Collapse Prevention.
 Entrypoint: `jepa_ot.py`.
 
 Configs:
@@ -10,16 +10,17 @@ Configs:
 - cCIFAR-10: `config/ccifar10/jepa_ot.yaml` (ResNet-18 encoder, z_dim=512)
 
 References:
-- Assran et al. 2023, "Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture", CVPR (arXiv:2301.08243)
+- Bardes, Ponce & LeCun 2022, "VICReg: Variance-Invariance-Covariance Regularization for Self-Supervised Learning", ICLR (arXiv:2105.04906)
 - Feydy et al. 2019, "Interpolating between Optimal Transport and MMD using Sinkhorn Divergences", AISTATS (arXiv:1810.08278)
-- Tarvainen & Valpola 2017, "Mean teachers are better role models", NeurIPS (arXiv:1703.01780)
 - Perez et al. 2018, "FiLM: Visual Reasoning with a General Conditioning Layer" (arXiv:1709.07871)
 
 ## Architecture
 
 Configurable encoder (`jepa_ot.encoder`):
 - `"mlp"` — 2-layer MLP (flatten → Dense(100) → ReLU → Dense(z_dim) → ReLU). For cMNIST.
-- `"resnet18"` — ResNet-18 with cifar_mode stem (3×3, no maxpool). Returns 512-d GAP features. Has BatchNorm (batch_stats tracked via EMA alongside params). For cCIFAR-10.
+- `"resnet18"` — ResNet-18 with cifar_mode stem (3×3, no maxpool). Returns 512-d GAP features. Has BatchNorm. For cCIFAR-10.
+
+Single shared encoder for both anchor and bias-conflicting samples (concatenated forward pass for correct BN statistics). No EMA target encoder — VICReg regularization prevents collapse.
 
 Predictor: FiLM + residual MLP.
 - FiLM conditioning: `gamma(s) * z + beta(s)` — dimension-wise gating of spurious information.
@@ -28,36 +29,42 @@ Predictor: FiLM + residual MLP.
 
 Training:
 - Augmentation: automatic per dataset (pad+crop+hflip+normalize for cCIFAR-10, none for cMNIST).
-- Stop-gradient: encoder learns from CE only; predictor learns from OT only.
-- Class-conditional Sinkhorn with L2 normalization and debiased divergence.
-- EMA target encoder (both params and batch_stats).
+- End-to-end: all parameters (encoder, predictor, classifier) receive gradients from all losses.
+- Geometry: class-conditional Sinkhorn (L2-normalized, debiased) + VICReg (variance hinge + covariance decorrelation) on both z_hat_trans and z_c.
+- Task: 50/50 mix of CE on hallucinated debiased representations and CE on raw anchor representations.
 
-## Diagnosed Problems and Fixes (all implemented)
+## Diagnosed Problems and Fixes (from JEPA-OT phase)
 
-1. **Epsilon scaling catastrophe** — L2-normalize point clouds, eps=1.0.
-2. **Weak predictor** — FiLM + residual MLP (was single linear layer).
-3. **Cross-class OT contamination** — class-conditional Sinkhorn with fixed-size per-class buffers.
-4. **Encoder/predictor gradient race** — stop-gradient encoder from OT path.
+1. **Epsilon scaling catastrophe** — L2-normalize point clouds inside Sinkhorn, eps=1.0. (kept)
+2. **Weak predictor** — FiLM + residual MLP (was single linear layer). (kept)
+3. **Cross-class OT contamination** — class-conditional Sinkhorn with fixed-size per-class buffers. (kept)
+4. ~~**Encoder/predictor gradient race** — stop-gradient encoder from OT path.~~ Replaced by VICReg: variance and covariance regularization prevent collapse without requiring stop-gradient.
 
-## cMNIST Results
+## VICReg-OT architectural change (2026-04-14)
 
-Sweep over lambda_ot and ema_tau with all 4 fixes active.
+Replaced EMA target encoder with VICReg regularization. Motivation: under extreme confounding (p_train=0.95), the EMA target absorbs spurious correlations as "slow features" — the target drifts toward color-biased representations, providing poor OT anchors.
 
-Best: **0.8787** (lambda_ot=0.1, ema_tau=0.996, eps=1.0).
-Plateau: all configurations converge to ~0.87–0.88 regardless of hyperparameters.
-This ceiling appears structural — the method works but doesn't match CCDB's 96.37% on cMNIST.
+Key changes:
+- Single shared encoder (no EMA target, no target_params, no target_batch_stats)
+- VICReg variance hinge + covariance decorrelation on z_hat_trans and z_c
+- End-to-end gradient flow (no stop-gradient on encoder from OT path)
+- Mixed CE: 50% hallucinated + 50% raw anchor
+- Loss: L = L_task + L_geom, where L_geom = λ_inv * L_inv + λ_var * L_var + λ_cov * L_cov
 
-Paused cMNIST tuning due to uncertainty about whether CCDB's cMNIST numbers are valid (possible architecture discrepancy: Zhao, Li, Zhang 2025, arXiv:2504.17314 claims 3-layer MLP; FG-CCDB code uses CNN + oracle labels).
+## EMA-JEPA Results (prior to VICReg transition)
 
-## cCIFAR-10 (current focus)
+Best cMNIST: **0.8787** (lambda_ot=0.1, ema_tau=0.996, eps=1.0).
+Plateau: all configurations converged to ~0.87–0.88 regardless of hyperparameters.
 
-Moved to cCIFAR-10 for a cleaner comparison — both CCDB and uLA use ResNet-18 on this benchmark.
+## VICReg-OT Results
 
-### Setup
-- ResNet-18 cifar_mode (11.17M encoder params, 399K predictor, 5K classifier)
-- Standard CIFAR augmentation (pad 4 + random crop 32×32 + hflip + CIFAR-10 normalize)
-- p_train=0.95 (5% bias-conflicting)
-- ~30s/epoch after JIT warmup
+### cMNIST
+
+TBD — initial smoke test (2 epochs): 0.54 test_acc, all losses finite, VICReg terms trending down.
+
+### cCIFAR-10
+
+TBD.
 
 ### Comparison targets (cCIFAR-10, p_corr=0.95)
 
@@ -65,9 +72,11 @@ Moved to cCIFAR-10 for a cleaner comparison — both CCDB and uLA use ResNet-18 
 |--------|----------|-------------|--------|
 | CCDB | TBD | ResNet-18 | Zhao et al. 2025, arXiv:2504.17314 |
 | uLA | TBD | ResNet-18 | - |
-| **JEPA-OT** | **TBD** | ResNet-18 | This work |
+| **VICReg-OT** | **TBD** | ResNet-18 | This work |
 
 ### Next steps
-1. Run full 50-epoch baseline with default config
-2. Tune lambda_ot (0.05, 0.1, 0.3, 0.5)
-3. Compare against CCDB/uLA numbers on cCIFAR-10
+1. Run full 100-epoch cMNIST baseline with default VICReg-OT config
+2. Compare against EMA-JEPA 0.8787 baseline
+3. Tune lambda_inv, lambda_var, lambda_cov
+4. Run cCIFAR-10 50-epoch baseline
+5. Compare against CCDB/uLA numbers on cCIFAR-10

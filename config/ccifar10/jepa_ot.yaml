@@ -1,6 +1,6 @@
-# JEPA-OT on cCIFAR-10 with ResNet-18 encoder.
+# VICReg-OT on cCIFAR-10 with ResNet-18 encoder.
 # Usage: python jepa_ot.py config/ccifar10/jepa_ot.yaml [overrides...]
-# Example: python jepa_ot.py config/ccifar10/jepa_ot.yaml jepa_ot.lambda_ot=0.5
+# Example: python jepa_ot.py config/ccifar10/jepa_ot.yaml jepa_ot.lambda_inv=0.5
 
 wandb:
   entity: "prebenness-crl"
@@ -26,8 +26,10 @@ jepa_ot:
   num_colors: 10
   z_dim: 512
   predictor_hidden_dim: 256
-  lambda_ot: 0.1
-  ema_tau: 0.996
+  lambda_inv: 0.1
+  lambda_var: 25.0
+  lambda_cov: 1.0
+  vicreg_gamma: 1.0
   sinkhorn_eps: 1.0
   sinkhorn_iters: 10
   epochs: 50

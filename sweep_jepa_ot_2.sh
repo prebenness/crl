@@ -1,6 +1,6 @@
 #!/bin/bash
-# JEPA-OT sweep part 2 — 60 minute budget
-# Focus: ema_tau crosses at best lambda, probe lower lambda, LR for stability
+# VICReg-OT sweep — 60 minute budget
+# Focus: lambda_inv crosses with lambda_var, probe lower lambda_inv, LR for stability
 set -e
 
 START=$(date +%s)
@@ -50,28 +50,27 @@ run_experiment() {
     return 0
 }
 
-echo "JEPA-OT sweep part 2 started at $(date)"
+echo "VICReg-OT sweep started at $(date)"
 echo "Deadline: $(date -d @${DEADLINE})"
 echo ""
 
-# --- EMA crosses at lambda=0.1 (sweep 1 winner) ---
-run_experiment "lam=0.1,tau=0.99"   jepa_ot.lambda_ot=0.1 jepa_ot.ema_tau=0.99   || true
-run_experiment "lam=0.1,tau=0.999"  jepa_ot.lambda_ot=0.1 jepa_ot.ema_tau=0.999  || true
+# --- Lambda_inv sweep ---
+run_experiment "inv=0.1"             jepa_ot.lambda_inv=0.1                         || true
+run_experiment "inv=0.3"             jepa_ot.lambda_inv=0.3                         || true
+run_experiment "inv=0.5"             jepa_ot.lambda_inv=0.5                         || true
+run_experiment "inv=0.05"            jepa_ot.lambda_inv=0.05                        || true
 
-# --- Probe lower lambda ---
-run_experiment "lam=0.05"           jepa_ot.lambda_ot=0.05                        || true
+# --- Lambda_var sweep at best lambda_inv ---
+run_experiment "inv=0.1,var=10"      jepa_ot.lambda_inv=0.1 jepa_ot.lambda_var=10.0 || true
+run_experiment "inv=0.1,var=50"      jepa_ot.lambda_inv=0.1 jepa_ot.lambda_var=50.0 || true
 
-# --- Lower LR to address instability spikes ---
-run_experiment "lam=0.1,lr=5e-4"    jepa_ot.lambda_ot=0.1 training.lr=5e-4       || true
+# --- Lambda_cov sweep ---
+run_experiment "inv=0.1,cov=0.1"     jepa_ot.lambda_inv=0.1 jepa_ot.lambda_cov=0.1  || true
+run_experiment "inv=0.1,cov=5.0"     jepa_ot.lambda_inv=0.1 jepa_ot.lambda_cov=5.0  || true
 
-# --- Cross: best lambda × best tau from above ---
-run_experiment "lam=0.05,tau=0.99"  jepa_ot.lambda_ot=0.05 jepa_ot.ema_tau=0.99  || true
-run_experiment "lam=0.05,tau=0.999" jepa_ot.lambda_ot=0.05 jepa_ot.ema_tau=0.999 || true
-
-# --- EMA crosses at lambda=0.3 (second best) ---
-run_experiment "lam=0.3,tau=0.99"   jepa_ot.lambda_ot=0.3 jepa_ot.ema_tau=0.99   || true
-run_experiment "lam=0.3,tau=0.999"  jepa_ot.lambda_ot=0.3 jepa_ot.ema_tau=0.999  || true
+# --- Lower LR for stability ---
+run_experiment "inv=0.1,lr=5e-4"     jepa_ot.lambda_inv=0.1 training.lr=5e-4        || true
 
 TOTAL=$(($(date +%s) - START))
 echo ""
-echo "########## SWEEP 2 DONE: ${RUN_COUNT} runs in ${TOTAL}s ##########"
+echo "########## SWEEP DONE: ${RUN_COUNT} runs in ${TOTAL}s ##########"
