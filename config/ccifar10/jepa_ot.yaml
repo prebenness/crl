@@ -16,9 +16,9 @@ model:
   num_classes: 10
 
 training:
-  lr: 1.0e-3
+  lr: 2.0e-3
   weight_decay_inner: 1.0e-4
-  batch_size: 128
+  batch_size: 512
   seed: 0
 
 jepa_ot:
@@ -28,7 +28,7 @@ jepa_ot:
   predictor_hidden_dim: 256
   lambda_inv: 0.1
   lambda_var: 25.0
-  lambda_cov: 1.0
+  lambda_cov: 5.0
   vicreg_gamma: 1.0
   sinkhorn_eps: 1.0
   sinkhorn_iters: 10

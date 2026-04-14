@@ -60,15 +60,15 @@ from src.utils.checkpointing import (
 class JEPAOTConfig:
     encoder: str = "mlp"
     num_colors: int = 10
-    z_dim: int = 100
+    z_dim: int = 32
     predictor_hidden_dim: int = 128
-    lambda_inv: float = 1.0
-    lambda_var: float = 25.0
-    lambda_cov: float = 1.0
+    lambda_inv: float = 0.7
+    lambda_var: float = 0.0
+    lambda_cov: float = 0.0
     vicreg_gamma: float = 1.0
     sinkhorn_eps: float = 1.0
     sinkhorn_iters: int = 10
-    epochs: int = 100
+    epochs: int = 200
 
 
 def parse_jepa_ot_config(yaml_path, overrides):

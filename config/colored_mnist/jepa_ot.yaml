@@ -23,11 +23,11 @@ training:
 
 jepa_ot:
   num_colors: 10
-  z_dim: 100
-  lambda_inv: 1.0
-  lambda_var: 25.0
-  lambda_cov: 1.0
+  z_dim: 32
+  lambda_inv: 0.7
+  lambda_var: 0.0
+  lambda_cov: 0.0
   vicreg_gamma: 1.0
   sinkhorn_eps: 1.0
   sinkhorn_iters: 10
-  epochs: 100
+  epochs: 200
