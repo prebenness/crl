@@ -279,6 +279,21 @@ def _sinkhorn_cost_weighted(C, log_a, log_b, eps, n_iters):
     return jnp.sum(jnp.exp(log_P) * C)
 
 
+def _sinkhorn_debiased_weighted(C_xy, C_xx, C_yy, log_a, log_b, eps, n_iters):
+    """Debiased Sinkhorn (OT_xy - 0.5*OT_xx - 0.5*OT_yy) with the three OT
+    problems solved in parallel via vmap over a stacked leading axis.
+
+    All three cost matrices must share shape [n, m].  Used by
+    class_cond_sinkhorn_divergence to batch the three OT solves per class
+    — exposes 3x parallelism to the GPU instead of sequencing them.
+    """
+    Cs = jnp.stack([C_xy, C_xx, C_yy], axis=0)  # [3, n, m]
+    ots = jax.vmap(
+        lambda C: _sinkhorn_cost_weighted(C, log_a, log_b, eps, n_iters),
+    )(Cs)
+    return ots[0] - 0.5 * ots[1] - 0.5 * ots[2]
+
+
 def sinkhorn_divergence(x, y, eps=1.0, n_iters=50):
     """Debiased Sinkhorn divergence with L2-normalized point clouds.
 
@@ -357,17 +372,14 @@ def class_cond_sinkhorn_divergence(z_pred, z_target, y, num_classes,
             -30.0,
         )
 
-        # Debiased Sinkhorn on this class
-        ot_xy = _sinkhorn_cost_weighted(
-            _cost_matrix(z_p, z_t), log_w, log_w, eps, n_iters,
+        # Debiased Sinkhorn on this class: vmap the three OT solves
+        # (xy, xx, yy) to expose parallelism to the GPU.
+        s_c = _sinkhorn_debiased_weighted(
+            _cost_matrix(z_p, z_t),
+            _cost_matrix(z_p, z_p),
+            _cost_matrix(z_t, z_t),
+            log_w, log_w, eps, n_iters,
         )
-        ot_xx = _sinkhorn_cost_weighted(
-            _cost_matrix(z_p, z_p), log_w, log_w, eps, n_iters,
-        )
-        ot_yy = _sinkhorn_cost_weighted(
-            _cost_matrix(z_t, z_t), log_w, log_w, eps, n_iters,
-        )
-        s_c = ot_xy - 0.5 * ot_xx - 0.5 * ot_yy
 
         # Skip empty classes (shouldn't happen with balanced MNIST)
         w_c = (n_c > 0).astype(jnp.float32)
@@ -672,7 +684,6 @@ def main(argv=None):
     lambda_cov = jot_cfg.lambda_cov
     vicreg_gamma = jot_cfg.vicreg_gamma
 
-    @jax.jit
     def train_step(params, batch_stats, opt_state, x_a, y_a, x_c, s_c, rng):
         rng, rng_s = jrandom.split(rng)
         s_rand = jrandom.randint(rng_s, y_a.shape, 0, num_colors)
@@ -697,11 +708,17 @@ def main(argv=None):
 
             # -- Geometry: OT invariance + VICReg --
 
-            # Counterfactual translation: predict z_a as if it had color s_c
+            # Batch the two predictor calls:
+            # [z_hat_trans; z_hat_u] = predictor([z_a; z_a], [s_c; s_rand])
+            # s_c drives OT alignment, s_rand drives the hallucinated CE.
             s_c_oh = jax.nn.one_hot(s_c, num_colors)
-            z_hat_trans = predictor.apply(
-                {"params": params["predictor"]}, z_a, s_c_oh,
+            s_rand_oh = jax.nn.one_hot(s_rand, num_colors)
+            z_a_2x = jnp.concatenate([z_a, z_a], axis=0)
+            s_both = jnp.concatenate([s_c_oh, s_rand_oh], axis=0)
+            z_hat_both = predictor.apply(
+                {"params": params["predictor"]}, z_a_2x, s_both,
             )
+            z_hat_trans, z_hat_u = jnp.split(z_hat_both, 2, axis=0)
 
             # Sinkhorn alignment (class-conditional, L2-normalized inside)
             l_inv = class_cond_sinkhorn_divergence(
@@ -719,10 +736,6 @@ def main(argv=None):
             # -- Task: mixed CE on hallucinated + raw representations --
 
             # Hallucinated CE (debiased: random color)
-            s_rand_oh = jax.nn.one_hot(s_rand, num_colors)
-            z_hat_u = predictor.apply(
-                {"params": params["predictor"]}, z_a, s_rand_oh,
-            )
             logits_u = classifier.apply(
                 {"params": params["classifier"]}, z_hat_u,
             )
@@ -761,6 +774,32 @@ def main(argv=None):
 
         return new_params, new_batch_stats, new_opt_state, metrics
 
+    @jax.jit
+    def run_epoch(params, batch_stats, opt_state, xb, yb, xb_c, sb_c,
+                  rng_keys):
+        """Run one epoch of training inside a single jax.lax.scan.
+
+        Collapses the Python batch loop into one JIT kernel: eliminates
+        per-batch dispatch overhead and keeps all metrics on device until
+        the end of the epoch (no host sync per batch).
+        """
+        def step_fn(carry, inputs):
+            params, batch_stats, opt_state = carry
+            x_a, y_a, x_c, s_c, rng_k = inputs
+            new_params, new_bs, new_opt_state, metrics = train_step(
+                params, batch_stats, opt_state,
+                x_a, y_a, x_c, s_c, rng_k,
+            )
+            return (new_params, new_bs, new_opt_state), metrics
+
+        (params, batch_stats, opt_state), metrics_stack = jax.lax.scan(
+            step_fn, (params, batch_stats, opt_state),
+            (xb, yb, xb_c, sb_c, rng_keys),
+        )
+        # Mean across the batch axis while still on device
+        ep_means = {k: v.mean() for k, v in metrics_stack.items()}
+        return params, batch_stats, opt_state, ep_means
+
     eval_accuracy = make_eval_fn(
         encoder, predictor, classifier, num_colors, num_classes,
         eval_transform_fn,
@@ -777,8 +816,6 @@ def main(argv=None):
     best = {"test_acc": -1.0, "params": None,
             "batch_stats": None, "epoch": 0}
     np_rng = np.random.RandomState(cfg.training.seed + 42)
-    early_patience = cfg.checkpointing.early_stopping_patience
-    epochs_since_best = 0
 
     for ep in range(jot_cfg.epochs):
         t0 = time.time()
@@ -788,26 +825,17 @@ def main(argv=None):
         # Pre-sample BC matches for the whole epoch (vectorized)
         xb_c, sb_c = pool.sample_epoch(yb, np_rng)
 
-        ep_metrics = {
-            "loss_ce_u": 0.0, "loss_ce_a": 0.0, "loss_task": 0.0,
-            "loss_inv": 0.0, "loss_var": 0.0, "loss_cov": 0.0,
-            "loss_geom": 0.0, "loss_total": 0.0, "accuracy": 0.0,
-        }
+        # Pre-split RNG keys for every batch; run the whole epoch in one
+        # JIT kernel (jax.lax.scan) — no per-batch Python dispatch, no
+        # host sync for metrics.
         n_batches = xb.shape[0]
-
-        for i in range(n_batches):
-
-            rng, rng_step = jrandom.split(rng)
-            params, batch_stats, opt_state, metrics = train_step(
-                params, batch_stats, opt_state,
-                xb[i], yb[i], xb_c[i], sb_c[i], rng_step,
-            )
-
-            for k in ep_metrics:
-                ep_metrics[k] += float(metrics[k])
-
-        for k in ep_metrics:
-            ep_metrics[k] /= n_batches
+        rng, rng_epoch = jrandom.split(rng)
+        rng_keys = jrandom.split(rng_epoch, n_batches)
+        params, batch_stats, opt_state, ep_means = run_epoch(
+            params, batch_stats, opt_state,
+            xb, yb, xb_c, sb_c, rng_keys,
+        )
+        ep_metrics = {k: float(v) for k, v in ep_means.items()}
 
         te_acc = eval_accuracy(params, batch_stats, x_test, y_test, batch_size)
 
@@ -816,7 +844,6 @@ def main(argv=None):
             best["params"] = jax.tree.map(jnp.copy, params)
             best["batch_stats"] = jax.tree.map(jnp.copy, batch_stats)
             best["epoch"] = ep + 1
-            epochs_since_best = 0
             save_checkpoint(
                 best["params"], checkpoint_path(run_dir, "best.npz"),
             )
@@ -824,8 +851,6 @@ def main(argv=None):
                 run_dir, ep + 1, best["test_acc"], best["epoch"],
             )
             print(f"    >>> NEW BEST test_acc={te_acc:.4f} (epoch {ep+1})")
-        else:
-            epochs_since_best += 1
 
         wandb_run.log({
             "train/loss_ce_u": ep_metrics["loss_ce_u"],
@@ -850,11 +875,6 @@ def main(argv=None):
               f"  train_acc {ep_metrics['accuracy']:.4f}"
               f"  test_acc {te_acc:.4f}"
               f"  ({time.time()-t0:.2f}s)")
-
-        if early_patience > 0 and epochs_since_best >= early_patience:
-            print(f"  Early stopping at epoch {ep+1} "
-                  f"(no improvement for {early_patience} epochs)")
-            break
 
     # ---- Save final state ----
     save_checkpoint(params, checkpoint_path(run_dir, "final.npz"))
